@@ -1,0 +1,230 @@
+From 32b1c35cf7f4dcd99fd751ce0e36b8f88bf1d791 Mon Sep 17 00:00:00 2001
+From: smit1237 <smit1237@gmail.com>
+Date: Wed, 9 Sep 2026 18:06:39 +0300
+Subject: [PATCH 21/21] =?UTF-8?q?portal:=20Time=20&=20Clock=20settings=20?=
+ =?UTF-8?q?=E2=80=94=20sync=20clock=20to=20browser=20+=20NTP=20servers?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add a Time & Clock card to the Settings page for a box with no RTC:
+
+- Sync to browser: POST /settings/time/browser sets the system clock from
+  the admin's browser time (date -s @<epoch>), guarded by a 2020-2100
+  plausibility check. rnsd tolerates the forward clock step without a
+  restart, so setting the clock this way needs no service bounce.
+- NTP servers: a minimal editor (store.read/write_ntp_servers) that edits
+  only the 'server' lines in /etc/ntp.conf, preserving restrict/comment
+  lines and dropping invalid entries; POST /settings/ntp saves and
+  /settings/ntp/restart bounces ntpd (S49ntp) to apply.
+- The card shows current system time with a synced / not-synced badge and
+  a live browser clock.
+
+All three routes are login-gated; the epoch is int-validated (incl.
+OverflowError for 'inf') before use, and NTP server names are character-
+validated before they reach the config file.
+---
+ .../rnsbox-portal/src/rnsbox_portal/app.py    | 62 ++++++++++++++++++-
+ .../src/rnsbox_portal/static/style.css        |  6 ++
+ .../rnsbox-portal/src/rnsbox_portal/store.py  | 36 +++++++++++
+ .../src/rnsbox_portal/templates/settings.html | 46 ++++++++++++++
+ 4 files changed, 149 insertions(+), 1 deletion(-)
+
+diff --git a/buildroot/package/rnsbox-portal/src/rnsbox_portal/app.py b/buildroot/package/rnsbox-portal/src/rnsbox_portal/app.py
+index 2c1ab14f3..d98a876b5 100644
+--- a/buildroot/package/rnsbox-portal/src/rnsbox_portal/app.py
++++ b/buildroot/package/rnsbox-portal/src/rnsbox_portal/app.py
+@@ -351,7 +351,67 @@ def create_app():
+     @app.route("/settings")
+     @login_required
+     def settings():
+-        return render_template("settings.html", wan=store.read_wan())
++        now = time.time()
++        return render_template(
++            "settings.html",
++            wan=store.read_wan(),
++            sys_time=time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now)),
++            time_synced=(now > 1600000000),   # > 2020-09 => the clock has been set
++            ntp_servers="\n".join(store.read_ntp_servers()),
++        )
++
++    @app.route("/settings/time/browser", methods=["POST"])
++    @login_required
++    def settings_time_browser():
++        # Set the system clock from the admin's browser (no RTC on the board).
++        # The browser posts its current UTC epoch; we sanity-check it's in a
++        # plausible window before stepping the clock. rnsd tolerates the jump.
++        try:
++            # OverflowError guards int(float("inf")) — float() accepts "inf"
++            # without raising, and int(inf) then raises OverflowError.
++            epoch = int(float(request.form.get("epoch", "")))
++        except (TypeError, ValueError, OverflowError):
++            flash("Could not read the browser time.", "error")
++            return redirect(url_for("settings"))
++        if not (1577836800 <= epoch <= 4102444800):   # 2020-01-01 .. 2100-01-01
++            flash("Browser time looks implausible; clock not changed.", "error")
++            return redirect(url_for("settings"))
++        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(epoch))
++        try:
++            # @epoch is an absolute instant (no timezone/format ambiguity);
++            # busybox 1.36 date and GNU date both accept it.
++            subprocess.run(["date", "-s", "@%d" % epoch], check=False, timeout=5)
++            flash("Clock set to %s UTC (from your browser). rnsd picks up the "
++                  "new time on its own." % stamp, "success")
++        except Exception as e:
++            flash(f"Error setting clock: {e}", "error")
++        return redirect(url_for("settings"))
++
++    @app.route("/settings/ntp", methods=["POST"])
++    @login_required
++    def settings_ntp():
++        raw = request.form.get("servers", "")
++        servers = raw.replace(",", " ").split()
++        saved = store.write_ntp_servers(servers)
++        dropped = len(servers) - len(saved)
++        msg = "Saved %d NTP server%s." % (len(saved), "" if len(saved) == 1 else "s")
++        if dropped:
++            msg += " %d invalid entr%s ignored." % (
++                dropped, "y" if dropped == 1 else "ies")
++        msg += " Restart NTP to apply."
++        flash(msg, "success")
++        return redirect(url_for("settings"))
++
++    @app.route("/settings/ntp/restart", methods=["POST"])
++    @login_required
++    def settings_ntp_restart():
++        try:
++            subprocess.run(["/etc/init.d/S49ntp", "restart"], check=False, timeout=15)
++            flash("ntpd restarted — it will step the clock once it reaches a "
++                  "server.", "success")
++        except Exception as e:
++            flash(f"Error: {e}", "error")
++        return redirect(url_for("settings"))
+ 
+     @app.route("/settings/password", methods=["POST"])
+     @login_required
+diff --git a/buildroot/package/rnsbox-portal/src/rnsbox_portal/static/style.css b/buildroot/package/rnsbox-portal/src/rnsbox_portal/static/style.css
+index 7c0266ec4..32a29cbfe 100644
+--- a/buildroot/package/rnsbox-portal/src/rnsbox_portal/static/style.css
++++ b/buildroot/package/rnsbox-portal/src/rnsbox_portal/static/style.css
+@@ -365,3 +365,9 @@ img.qr {
+ .wallet-actions { display: flex; gap: 8px; width: 100%; }
+ .wallet-actions .btn { flex: 1; text-align: center; }
+ .copy-btn.copied { background: var(--ok); color: #fff; border-color: var(--ok); }
++
++/* ---- Time & Clock (Settings) ---- */
++.timeval { font-family: var(--mono); font-size: 15px; font-weight: 600; }
++textarea.ntp-servers { min-height: 64px; max-width: 360px; }
++.time-actions { display: flex; gap: 8px; flex-wrap: wrap; }
++form.ntp-restart { margin-top: 8px; }
+diff --git a/buildroot/package/rnsbox-portal/src/rnsbox_portal/store.py b/buildroot/package/rnsbox-portal/src/rnsbox_portal/store.py
+index 483b2dad8..69f2259e0 100644
+--- a/buildroot/package/rnsbox-portal/src/rnsbox_portal/store.py
++++ b/buildroot/package/rnsbox-portal/src/rnsbox_portal/store.py
+@@ -11,6 +11,7 @@ PF_FILE = f"{CONF_DIR}/portforward.conf"
+ OP_FILE = f"{CONF_DIR}/openports.conf"
+ WAN_FILE = f"{CONF_DIR}/wan.conf"
+ CRON_FILE = f"{CONF_DIR}/cron.conf"
++NTP_FILE = "/etc/ntp.conf"          # ntp package's config; we edit its `server` lines
+ 
+ 
+ def _read_lines(path):
+@@ -299,3 +300,38 @@ def write_update_check(enabled):
+     d = read_cron_conf()
+     d["update_check"] = "yes" if enabled else "no"
+     write_cron_conf(d)
++
++
++# ---- NTP servers (edit the `server` lines in /etc/ntp.conf) ----
++
++def _valid_ntp_server(s):
++    """A hostname or IPv4/IPv6 literal: letters, digits, dot, colon, hyphen."""
++    return bool(s) and len(s) <= 255 and all(
++        c.isalnum() or c in ".:-" for c in s)
++
++
++def read_ntp_servers():
++    """Configured NTP server addresses, parsed from /etc/ntp.conf."""
++    out = []
++    for ln in _read_lines(NTP_FILE):
++        parts = ln.strip().split()
++        if len(parts) >= 2 and parts[0] in ("server", "pool"):
++            out.append(parts[1])
++    return out
++
++
++def write_ntp_servers(servers):
++    """Replace the `server`/`pool` lines in /etc/ntp.conf with these servers,
++    keeping every other line (restrict, driftfile, comments) intact. Invalid
++    entries are dropped; an empty list leaves ntpd with no upstream servers.
++    Returns the list actually written."""
++    clean = [s for s in servers if _valid_ntp_server(s)]
++    kept = [ln for ln in _read_lines(NTP_FILE)
++            if ln.strip().split()[:1] not in (["server"], ["pool"])]
++    while kept and kept[0].strip() == "":      # keep the server block at the top
++        kept.pop(0)
++    new = ["server %s iburst" % s for s in clean]
++    if new and kept:
++        new.append("")
++    _write_lines(NTP_FILE, new + kept)
++    return clean
+diff --git a/buildroot/package/rnsbox-portal/src/rnsbox_portal/templates/settings.html b/buildroot/package/rnsbox-portal/src/rnsbox_portal/templates/settings.html
+index ba2c4023f..3f6d2e20f 100644
+--- a/buildroot/package/rnsbox-portal/src/rnsbox_portal/templates/settings.html
++++ b/buildroot/package/rnsbox-portal/src/rnsbox_portal/templates/settings.html
+@@ -3,6 +3,52 @@
+ {% block content %}
+ <h2>Settings</h2>
+ 
++<section class="card">
++  <h3>Time &amp; Clock</h3>
++  <table class="kv">
++    <tr><th>System time</th><td>
++      <span class="timeval">{{ sys_time }}</span> <span class="muted">UTC</span>
++      {% if time_synced %}<span class="badge ok">synced</span>{% else %}<span class="badge warn">not synced</span>{% endif %}
++    </td></tr>
++  </table>
++
++  <h4>Sync to browser</h4>
++  <p class="muted">The board has no real-time clock, so it boots at 1970. Set the
++  clock to this device's time — the quickest way to get a correct clock on a box
++  with no internet. rnsd picks up the new time on its own.</p>
++  <p>This browser reads <strong id="browser-time">…</strong> UTC</p>
++  <form method="post" action="{{ url_for('settings_time_browser') }}"
++        onsubmit="this.epoch.value = Math.floor(Date.now()/1000)">
++    <input type="hidden" name="epoch" value="">
++    <button type="submit" class="btn-primary">Sync clock to browser</button>
++  </form>
++
++  <h4>NTP servers</h4>
++  <form method="post" action="{{ url_for('settings_ntp') }}">
++    <label>Upstream time servers — one per line; leave blank to run without NTP
++      <textarea name="servers" class="ntp-servers" rows="3" spellcheck="false">{{ ntp_servers }}</textarea>
++    </label>
++    <div class="time-actions">
++      <button type="submit" class="btn-primary">Save servers</button>
++    </div>
++  </form>
++  <form method="post" action="{{ url_for('settings_ntp_restart') }}" class="ntp-restart">
++    <button type="submit" class="btn">Restart NTP</button>
++    <span class="muted">ntpd runs with <code>-g</code>, so it steps the clock even from 1970 once it can reach a server.</span>
++  </form>
++
++  <script>
++  (function(){
++    function p(n){ return String(n).padStart(2,'0'); }
++    function fmt(d){ return d.getUTCFullYear()+'-'+p(d.getUTCMonth()+1)+'-'+p(d.getUTCDate())+' '
++                          +p(d.getUTCHours())+':'+p(d.getUTCMinutes())+':'+p(d.getUTCSeconds()); }
++    var el = document.getElementById('browser-time');
++    function tick(){ el.textContent = fmt(new Date()); }
++    tick(); setInterval(tick, 1000);
++  })();
++  </script>
++</section>
++
+ <section class="card">
+   <h3>Change admin password</h3>
+   <form method="post" action="{{ url_for('settings_password') }}">
+-- 
+2.47.3
+
