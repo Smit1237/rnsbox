@@ -10,7 +10,13 @@ Linux kernel, Buildroot and the CVITEK/Sipeed BSP themselves come from
 upstream and are fetched at build time.
 
 - **Upstream base:** [`sipeed/LicheeRV-Nano-Build`](https://github.com/sipeed/LicheeRV-Nano-Build) at commit `d4003f15b`
-- **The delta:** 20 patches in [`patches/`](patches), MIT-licensed
+- **The delta:** 21 patches in [`patches/`](patches) — the 20 from `main` plus one offline patch (see [Offline branch](#offline-branch)), MIT-licensed
+
+> **You are on the `offline` branch.** It builds the same image as `main`, except
+> Reticulum starts immediately at boot without waiting for an NTP time-sync (the
+> board has no RTC, so the clock starts at 1970), and the shipped config carries no
+> internet uplinks. See [Offline branch](#offline-branch) below. For the standard
+> time-synced build, use `main`.
 
 ## Quick start
 
@@ -56,6 +62,30 @@ genimage's `mkdosfs`; it handles this itself.
 The design goal throughout is a minimal OS: the camera / display / audio / NPU
 / codec middleware of the stock BSP is stripped so nearly all of the 256 MB
 DDR is available to Linux and the router data plane.
+
+## Offline branch
+
+This `offline` branch is for boxes that boot with **no internet** and shouldn't
+wait for a clock they can't set. It differs from `main` by one extra patch
+(`patches/0021-…`):
+
+- **rnsd starts immediately** — `S45ntpsync` asserts the clock-ready flag at boot
+  instead of waiting up to ~90 s for a default route + NTP step, so `rnsd` (and
+  NomadNet, if enabled) come up right away on the board's 1970 clock.
+- **`ntpd` still runs** (started with `-g`). Offline it simply retries; if the box
+  ever reaches the internet it steps the clock to real time. `rnsd` tolerates that
+  forward jump **without a restart** — it re-establishes links and re-learns paths
+  once, then runs with correct timestamps.
+- **No internet uplinks** — the two RNS-testnet `TCPClientInterface` entries are
+  removed from the shipped `/etc/reticulum/config`, so an offline box makes no
+  outbound connections on boot. The local `usb0` AutoInterface + TCP listener are
+  unchanged, and a commented example shows how to re-add an uplink later.
+
+Reticulum transport and routing work fine on a 1970 clock (it uses time deltas)
+over the local interfaces; only a peer with a correct clock would treat our
+announcements as stale, which doesn't matter on an offline mesh. LXMF / NomadNet
+message timestamps read 1970 until `ntpd` corrects the clock (NomadNet is off by
+default). Build it exactly like `main` — `./build.sh lite` (or `dvd`).
 
 ## Repository layout
 
