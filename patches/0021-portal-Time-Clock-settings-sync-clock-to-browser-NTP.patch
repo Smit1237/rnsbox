@@ -1,4 +1,4 @@
-From 32b1c35cf7f4dcd99fd751ce0e36b8f88bf1d791 Mon Sep 17 00:00:00 2001
+From cd04e4dcb769459c93dc6481a5e872fb75f9f17a Mon Sep 17 00:00:00 2001
 From: smit1237 <smit1237@gmail.com>
 Date: Wed, 9 Sep 2026 18:06:39 +0300
 Subject: [PATCH 21/21] =?UTF-8?q?portal:=20Time=20&=20Clock=20settings=20?=
@@ -31,7 +31,7 @@ validated before they reach the config file.
  4 files changed, 149 insertions(+), 1 deletion(-)
 
 diff --git a/buildroot/package/rnsbox-portal/src/rnsbox_portal/app.py b/buildroot/package/rnsbox-portal/src/rnsbox_portal/app.py
-index 2c1ab14f3..d98a876b5 100644
+index bba1f5136..4aef9e280 100644
 --- a/buildroot/package/rnsbox-portal/src/rnsbox_portal/app.py
 +++ b/buildroot/package/rnsbox-portal/src/rnsbox_portal/app.py
 @@ -351,7 +351,67 @@ def create_app():

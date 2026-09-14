@@ -1,7 +1,7 @@
-From 8443356baaa3a9a76683a0bd746e528f703625e5 Mon Sep 17 00:00:00 2001
+From 3d5dd73d822e1f9452f2b52273a6662824f7d2f8 Mon Sep 17 00:00:00 2001
 From: smit1237 <smit1237@gmail.com>
 Date: Wed, 9 Sep 2026 01:14:22 +0300
-Subject: [PATCH 17/20] portal: check for a newer rnsd and show it in the web
+Subject: [PATCH 17/21] portal: check for a newer rnsd and show it in the web
  UI
 
 Adds a notify-only update checker. rnsbox_portal.updatecheck queries PyPI for
@@ -25,11 +25,11 @@ reflashing the image) -- this only notifies.
  .../package/rnsbox-portal/rnsbox-portal.mk    |   2 +
  .../rnsbox-portal/src/bin/rnsbox-update-check |   5 +
  .../rnsbox-portal/src/rnsbox_portal/app.py    |  42 +++++-
- .../rnsbox-portal/src/rnsbox_portal/store.py  |  72 ++++++++---
- .../rnsbox_portal/templates/dashboard.html    |   3 +
+ .../rnsbox-portal/src/rnsbox_portal/store.py  |  72 +++++++---
+ .../rnsbox_portal/templates/dashboard.html    |   5 +
  .../rnsbox_portal/templates/reticulum.html    |  19 +++
- .../src/rnsbox_portal/updatecheck.py          | 120 ++++++++++++++++++
- 9 files changed, 266 insertions(+), 19 deletions(-)
+ .../src/rnsbox_portal/updatecheck.py          | 134 ++++++++++++++++++
+ 9 files changed, 282 insertions(+), 19 deletions(-)
  create mode 100755 buildroot/package/rnsbox-portal/src/bin/rnsbox-update-check
  create mode 100644 buildroot/package/rnsbox-portal/src/rnsbox_portal/updatecheck.py
 
@@ -117,7 +117,7 @@ index 000000000..04fa914b3
 +# portal to display. Notify-only; offline-safe (exits 0 even with no network).
 +exec env PYTHONPATH=/usr/lib/rnsbox-portal python3 -m rnsbox_portal.updatecheck "$@"
 diff --git a/buildroot/package/rnsbox-portal/src/rnsbox_portal/app.py b/buildroot/package/rnsbox-portal/src/rnsbox_portal/app.py
-index 970d1ca2c..1fef4b5e4 100644
+index 970d1ca2c..dde2a9559 100644
 --- a/buildroot/package/rnsbox-portal/src/rnsbox_portal/app.py
 +++ b/buildroot/package/rnsbox-portal/src/rnsbox_portal/app.py
 @@ -2,13 +2,14 @@
@@ -140,7 +140,7 @@ index 970d1ca2c..1fef4b5e4 100644
              rnsd=sysinfo.rnsd_status(),
              net=sysinfo.network_summary(),
              wan=store.read_wan(),
-+            update=updatecheck.read_state(),
++            update=updatecheck.display_state(),
          )
  
      # ---- network ----
@@ -148,7 +148,7 @@ index 970d1ca2c..1fef4b5e4 100644
          # instantly. The expensive `rnstatus -a` block (a ~5 s cold-start of
          # the RNS stack) is fetched separately by the page via /reticulum/status
          # and dropped in once it arrives — see reticulum.html.
-+        upd = updatecheck.read_state()
++        upd = updatecheck.display_state()
 +        if upd.get("checked_at"):
 +            upd["checked_human"] = time.strftime(
 +                "%Y-%m-%d %H:%M UTC", time.gmtime(upd["checked_at"]))
@@ -294,16 +294,18 @@ index e35f1024b..483b2dad8 100644
 +    d["update_check"] = "yes" if enabled else "no"
 +    write_cron_conf(d)
 diff --git a/buildroot/package/rnsbox-portal/src/rnsbox_portal/templates/dashboard.html b/buildroot/package/rnsbox-portal/src/rnsbox_portal/templates/dashboard.html
-index ec61a7019..fe3599ac2 100644
+index ec61a7019..795f3bf80 100644
 --- a/buildroot/package/rnsbox-portal/src/rnsbox_portal/templates/dashboard.html
 +++ b/buildroot/package/rnsbox-portal/src/rnsbox_portal/templates/dashboard.html
-@@ -68,6 +68,9 @@
+@@ -68,6 +68,11 @@
        {% if rnsd.running and rnsd.rss_mb %}
        <tr><th>rnsd RAM</th><td>{{ rnsd.rss_mb }} MB RSS</td></tr>
        {% endif %}
-+      {% if update and update.update_available %}
-+      <tr><th>Update</th><td><span class="badge warn">rnsd {{ update.latest }} available</span></td></tr>
-+      {% endif %}
++      <tr><th>Version</th><td>
++        Reticulum (rnsd) <strong>{{ update.installed or 'unknown' }}</strong>
++        {% if update.update_available %}<span class="badge warn">update available: {{ update.latest }}</span>
++        {% elif update.latest and not update.error %}<span class="badge ok">up to date</span>{% endif %}
++      </td></tr>
      </table>
      <p><a class="btn" href="{{ url_for('reticulum') }}">Manage →</a></p>
    </section>
@@ -344,10 +346,10 @@ index 5e32f8a16..dc51858d0 100644
      <label for="rnsd_days" style="margin:0">Auto-restart rnsd</label>
 diff --git a/buildroot/package/rnsbox-portal/src/rnsbox_portal/updatecheck.py b/buildroot/package/rnsbox-portal/src/rnsbox_portal/updatecheck.py
 new file mode 100644
-index 000000000..b04c855cb
+index 000000000..cab7d4c71
 --- /dev/null
 +++ b/buildroot/package/rnsbox-portal/src/rnsbox_portal/updatecheck.py
-@@ -0,0 +1,120 @@
+@@ -0,0 +1,134 @@
 +"""Check whether a newer rnsd (the Reticulum 'rns' package) is available.
 +
 +Runs periodically from cron (and once, best-effort, at boot); it queries PyPI
@@ -427,6 +429,20 @@ index 000000000..b04c855cb
 +            return json.load(f)
 +    except Exception:
 +        return {}
++
++
++def display_state(pkg=PKG):
++    """State for the web UI. Keeps the last check's `latest`/`checked_at`/
++    `error`, but recomputes `installed` and `update_available` against the
++    version installed RIGHT NOW. Otherwise an update applied out of band —
++    a manual `pip install -U rns`, or apply_update itself — still shows a
++    stale 'update available' until the next periodic check rewrites the file."""
++    state = read_state()
++    installed = installed_version(pkg)
++    state["installed"] = installed
++    latest = state.get("latest")
++    state["update_available"] = bool(latest) and _newer(latest, installed)
++    return state
 +
 +
 +def _write_state(state):

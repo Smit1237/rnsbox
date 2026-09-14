@@ -1,7 +1,7 @@
 From ba2489b762416e3ae436a840eead0ee2ad322448 Mon Sep 17 00:00:00 2001
 From: smit1237 <smit1237@gmail.com>
 Date: Tue, 8 Sep 2026 22:47:50 +0300
-Subject: [PATCH 14/20] kernel: set LOCALVERSION to -rnsbox
+Subject: [PATCH 14/21] kernel: set LOCALVERSION to -rnsbox
 
 Pin the kernel LOCALVERSION to -rnsbox (uname -r = 5.10.4-rnsbox) instead of
 the git-describe default. MODVERSIONS is off, so module vermagic is an exact

@@ -1,7 +1,7 @@
 From a6060559a28e1baa1ad45f1a4f08ccfcf77a2cdd Mon Sep 17 00:00:00 2001
 From: smit1237 <smit1237@gmail.com>
 Date: Tue, 8 Sep 2026 22:47:49 +0300
-Subject: [PATCH 13/20] clients: latest-tracking read-only client disc +
+Subject: [PATCH 13/21] clients: latest-tracking read-only client disc +
  dvd/lite variants
 
 fetch-clients.sh resolves each Reticulum client's latest stable GitHub release

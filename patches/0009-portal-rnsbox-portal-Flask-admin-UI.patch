@@ -1,7 +1,7 @@
 From a283778fc8e7200d875a102fff3a2d687fde3412 Mon Sep 17 00:00:00 2001
 From: smit1237 <smit1237@gmail.com>
 Date: Tue, 8 Sep 2026 22:47:49 +0300
-Subject: [PATCH 09/20] portal: rnsbox-portal Flask admin UI
+Subject: [PATCH 09/21] portal: rnsbox-portal Flask admin UI
 
 Add the rnsbox-portal Buildroot package: an OpenWrt-style Flask web UI on
 0.0.0.0:80 for network, Reticulum, WiFi and system settings. It owns the

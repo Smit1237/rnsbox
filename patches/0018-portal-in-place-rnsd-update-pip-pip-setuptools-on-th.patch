@@ -1,7 +1,7 @@
-From 7c643089e2ecb2f9c0d7504c63e794efb51a8f51 Mon Sep 17 00:00:00 2001
+From fa8fd7a03dd28828dd1d2e434d4dd64f0923204a Mon Sep 17 00:00:00 2001
 From: smit1237 <smit1237@gmail.com>
 Date: Wed, 9 Sep 2026 01:39:58 +0300
-Subject: [PATCH 18/20] portal: in-place rnsd update (pip) + pip/setuptools on
+Subject: [PATCH 18/21] portal: in-place rnsd update (pip) + pip/setuptools on
  the rootfs
 
 Builds on the update-check notifier with an actual in-place update, since the
@@ -24,8 +24,8 @@ and for general package management.
  .../cvitek_SG200X_musl_riscv64_defconfig      |   7 +-
  .../rnsbox-portal/src/rnsbox_portal/app.py    |  17 ++
  .../rnsbox_portal/templates/reticulum.html    |   8 +-
- .../src/rnsbox_portal/updatecheck.py          | 163 ++++++++++++++++++
- 4 files changed, 192 insertions(+), 3 deletions(-)
+ .../src/rnsbox_portal/updatecheck.py          | 175 ++++++++++++++++++
+ 4 files changed, 204 insertions(+), 3 deletions(-)
 
 diff --git a/buildroot/configs/cvitek_SG200X_musl_riscv64_defconfig b/buildroot/configs/cvitek_SG200X_musl_riscv64_defconfig
 index 6abe7c9f8..6791defee 100644
@@ -53,7 +53,7 @@ index 6abe7c9f8..6791defee 100644
  # BR2_PACKAGE_PYTHON_SHUTILWHICH is not set
  # BR2_PACKAGE_PYTHON_SIMPLEAUDIO is not set
 diff --git a/buildroot/package/rnsbox-portal/src/rnsbox_portal/app.py b/buildroot/package/rnsbox-portal/src/rnsbox_portal/app.py
-index 1fef4b5e4..dfc0be53e 100644
+index dde2a9559..b8119fcc8 100644
 --- a/buildroot/package/rnsbox-portal/src/rnsbox_portal/app.py
 +++ b/buildroot/package/rnsbox-portal/src/rnsbox_portal/app.py
 @@ -283,6 +283,23 @@ def create_app():
@@ -105,7 +105,7 @@ index dc51858d0..0202f8a1a 100644
  
    <form method="post" action="{{ url_for('reticulum_autorestart') }}" class="row-form" style="margin-top:10px">
 diff --git a/buildroot/package/rnsbox-portal/src/rnsbox_portal/updatecheck.py b/buildroot/package/rnsbox-portal/src/rnsbox_portal/updatecheck.py
-index b04c855cb..8b7de40c9 100644
+index cab7d4c71..43d0bc56a 100644
 --- a/buildroot/package/rnsbox-portal/src/rnsbox_portal/updatecheck.py
 +++ b/buildroot/package/rnsbox-portal/src/rnsbox_portal/updatecheck.py
 @@ -10,15 +10,23 @@ Deliberately a *notifier only*:
@@ -132,7 +132,7 @@ index b04c855cb..8b7de40c9 100644
  TIMEOUT = 8
  
  
-@@ -107,6 +115,161 @@ def check(pkg=PKG):
+@@ -121,6 +129,173 @@ def check(pkg=PKG):
      return state
  
  
@@ -259,11 +259,23 @@ index b04c855cb..8b7de40c9 100644
 +        # --no-deps + wheel-only so the compiled deps (cryptography/pyserial) are
 +        # never rebuilt; buildroot's rootfs is not PEP-668 externally-managed, so
 +        # pip installs into the system site-packages as root without extra flags.
-+        cp = subprocess.run(
-+            [sys.executable, "-m", "pip", "install", "--no-deps",
-+             "--only-binary=:all:", "--no-input", "--disable-pip-version-check",
-+             "%s==%s" % (pkg, ver)],
-+            capture_output=True, text=True, timeout=180)
++        # pip's temp/download dir defaults to /tmp, which is a tiny (512 KB)
++        # tmpfs on the box — a wheel download overflows it (ENOSPC) even with
++        # tens of GB free on the rootfs. Point TMPDIR at the rootfs (and skip
++        # the HTTP cache) so the download has room.
++        piptmp = os.path.join(STATE_DIR, "piptmp")
++        os.makedirs(piptmp, exist_ok=True)
++        env = dict(os.environ, TMPDIR=piptmp)
++        try:
++            cp = subprocess.run(
++                [sys.executable, "-m", "pip", "install", "--no-deps",
++                 "--only-binary=:all:", "--no-cache-dir", "--no-input",
++                 "--disable-pip-version-check", "%s==%s" % (pkg, ver)],
++                capture_output=True, text=True, timeout=180, env=env)
++        finally:
++            # remove piptmp on EVERY exit path -- a pip timeout (or any raise)
++            # would otherwise leave partial downloads on the persistent rootfs.
++            shutil.rmtree(piptmp, ignore_errors=True)
 +        if cp.returncode != 0:
 +            raise RuntimeError("pip install failed: "
 +                               + (cp.stderr or cp.stdout or "")[-300:].strip())

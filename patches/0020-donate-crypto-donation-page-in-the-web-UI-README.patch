@@ -1,7 +1,7 @@
-From 8d38ecf391053d675101a09f372d400adcd311bb Mon Sep 17 00:00:00 2001
+From 7527a06b785e8074618b6e0cdc3b6509a7a7b1b7 Mon Sep 17 00:00:00 2001
 From: smit1237 <smit1237@gmail.com>
 Date: Wed, 9 Sep 2026 04:07:38 +0300
-Subject: [PATCH 20/20] donate: crypto donation page in the web UI + README
+Subject: [PATCH 20/21] donate: crypto donation page in the web UI + README
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -88,7 +88,7 @@ index 8d0b6dc69..bd9988ccd 100644
  		$(TARGET_DIR)/usr/sbin/rnsbox-portal
  	$(INSTALL) -D -m 0755 $(@D)/bin/rnsbox-update-check \
 diff --git a/buildroot/package/rnsbox-portal/src/rnsbox_portal/app.py b/buildroot/package/rnsbox-portal/src/rnsbox_portal/app.py
-index dfc0be53e..2c1ab14f3 100644
+index b8119fcc8..bba1f5136 100644
 --- a/buildroot/package/rnsbox-portal/src/rnsbox_portal/app.py
 +++ b/buildroot/package/rnsbox-portal/src/rnsbox_portal/app.py
 @@ -9,7 +9,7 @@ from flask import (
