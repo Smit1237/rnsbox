@@ -1,4 +1,4 @@
-From ce05c4d451e721cc6e2fe769278b920b4ca0fc73 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: smit1237 <smit1237@gmail.com>
 Date: Wed, 9 Sep 2026 01:39:58 +0300
 Subject: [PATCH 18/22] portal: in-place rnsd update (pip) + pip/setuptools on

@@ -1,4 +1,4 @@
-From d6734997e5cc3fcdcd71a7dc2e58e7eb45bf78be Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: smit1237 <smit1237@gmail.com>
 Date: Tue, 8 Sep 2026 22:47:49 +0300
 Subject: [PATCH 12/22] cron: optional rnsd auto-restart

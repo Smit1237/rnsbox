@@ -1,4 +1,4 @@
-From e21b5539c8a0eeb612cde2c9b73e0e096522b0d4 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: smit1237 <smit1237@gmail.com>
 Date: Tue, 8 Sep 2026 22:47:48 +0300
 Subject: [PATCH 05/22] router: NAT data plane, LAN services and operator

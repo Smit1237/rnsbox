@@ -1,4 +1,4 @@
-From 2ff053c9ac681daaf8914b168a1c7698043e198c Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: smit1237 <smit1237@gmail.com>
 Date: Tue, 15 Sep 2026 04:55:01 +0300
 Subject: [PATCH 22/22] slip: optional SLIP-over-UART link to an external HaLow

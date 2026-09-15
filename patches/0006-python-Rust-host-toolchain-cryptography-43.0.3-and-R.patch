@@ -1,4 +1,4 @@
-From e323b1c864ac6e8b5b4b05fff6efb66e5f877f99 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: smit1237 <smit1237@gmail.com>
 Date: Tue, 8 Sep 2026 22:47:48 +0300
 Subject: [PATCH 06/22] python: Rust host toolchain, cryptography 43.0.3 and

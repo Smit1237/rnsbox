@@ -1,4 +1,4 @@
-From e2bd84f3a836f3b5fe11c851ffbd79ed26787b3f Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: smit1237 <smit1237@gmail.com>
 Date: Wed, 9 Sep 2026 17:03:36 +0300
 Subject: [PATCH] offline: run Reticulum without waiting for NTP time-sync

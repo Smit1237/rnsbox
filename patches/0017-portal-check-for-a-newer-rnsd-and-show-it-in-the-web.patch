@@ -1,4 +1,4 @@
-From 20b177e1b6fd655b36b35e76a4f68e2f7682e5ea Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: smit1237 <smit1237@gmail.com>
 Date: Wed, 9 Sep 2026 01:14:22 +0300
 Subject: [PATCH 17/22] portal: check for a newer rnsd and show it in the web
