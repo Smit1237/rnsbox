@@ -10,7 +10,7 @@ Linux kernel, Buildroot and the CVITEK/Sipeed BSP themselves come from
 upstream and are fetched at build time.
 
 - **Upstream base:** [`sipeed/LicheeRV-Nano-Build`](https://github.com/sipeed/LicheeRV-Nano-Build) at commit `d4003f15b`
-- **The delta:** 22 patches in [`patches/`](patches) — the 21 from `main` plus one offline patch (see [Offline branch](#offline-branch)), MIT-licensed
+- **The delta:** 23 patches in [`patches/`](patches) — the 22 from `main` plus one offline patch (see [Offline branch](#offline-branch)), MIT-licensed
 
 > **You are on the `offline` branch.** It builds the same image as `main`, except
 > Reticulum starts immediately at boot without waiting for an NTP time-sync (the
@@ -60,6 +60,10 @@ genimage's `mkdosfs`; it handles this itself.
   live-apply both call the same module).
 - Optional **NomadNet** LXMF / pages node (off by default) and **AIC8800 WiFi**
   STA/AP support for the *W* board variant.
+- Optional **SLIP-over-UART link to an external WiFi-HaLow (RNode) modem** — a
+  [RNode_Halow_Firmware](https://github.com/I-AM-ENGINEER/RNode_Halow_Firmware)
+  bridge — for long-range sub-GHz Reticulum over a 3-wire serial link, with the
+  modem's own web UI reverse-proxied through the portal login. Off by default.
 
 The design goal throughout is a minimal OS: the camera / display / audio / NPU
 / codec middleware of the stock BSP is stripped so nearly all of the 256 MB
@@ -69,7 +73,7 @@ DDR is available to Linux and the router data plane.
 
 This `offline` branch is for boxes that boot with **no internet** and shouldn't
 wait for a clock they can't set. It differs from `main` by one extra patch
-(`patches/0022-…`):
+(`patches/0023-…`):
 
 - **rnsd starts immediately** — `S45ntpsync` asserts the clock-ready flag at boot
   instead of waiting up to ~90 s for a default route + NTP step, so `rnsd` (and
@@ -92,7 +96,7 @@ default). Build it exactly like `main` — `./build.sh lite` (or `dvd`).
 ## Repository layout
 
 ```
-patches/          the 22-patch RNSBox series (git am-able onto d4003f15b)
+patches/          the 23-patch RNSBox series (git am-able onto d4003f15b)
 build.sh          one-command: clone upstream -> apply patches -> build
 LICENSE           MIT (the RNSBox delta)
 README.md         this file

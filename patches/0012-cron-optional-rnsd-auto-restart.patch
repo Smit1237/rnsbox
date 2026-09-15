@@ -1,7 +1,7 @@
 From 61452ab4945e0a6b76c1ad4d7de6566384738513 Mon Sep 17 00:00:00 2001
 From: smit1237 <smit1237@gmail.com>
 Date: Tue, 8 Sep 2026 22:47:49 +0300
-Subject: [PATCH 12/21] cron: optional rnsd auto-restart
+Subject: [PATCH 12/22] cron: optional rnsd auto-restart
 
 S84cron regenerates the root crontab from /etc/rnsbox/cron.conf at boot (the
 spool is on tmpfs) and starts crond. The only task is an optional rnsd restart

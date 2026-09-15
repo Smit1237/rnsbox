@@ -1,7 +1,7 @@
 From 5a6144d629450325e246a0271d3355eb734934fb Mon Sep 17 00:00:00 2001
 From: smit1237 <smit1237@gmail.com>
 Date: Tue, 8 Sep 2026 22:47:49 +0300
-Subject: [PATCH 11/21] wifi: AIC8800 STA/AP support for the W variant
+Subject: [PATCH 11/22] wifi: AIC8800 STA/AP support for the W variant
 
 Build the out-of-tree AIC8800 fullmac driver from osdrv (Bluetooth disabled,
 Cvitek cross-build, other wireless vendors gated off in the M= pass) and

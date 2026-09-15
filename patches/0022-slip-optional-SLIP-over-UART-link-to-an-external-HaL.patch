@@ -1,0 +1,597 @@
+From c5011d4fcec844f6cfa74ece0a9ba6ea74ce932e Mon Sep 17 00:00:00 2001
+From: smit1237 <smit1237@gmail.com>
+Date: Tue, 15 Sep 2026 04:55:01 +0300
+Subject: [PATCH 22/22] slip: optional SLIP-over-UART link to an external HaLow
+ (RNode) modem
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Lets RNSBox use an external WiFi-HaLow RNode modem as a long-range sub-GHz
+Reticulum interface over a 3-wire UART, using SLIP (IP-over-serial). rnsd
+reaches the modem as a normal TCPClientInterface. Opt-in, OFF by default.
+
+- kernel: CONFIG_SLIP=y (SLIP is under NETDEVICES, outside NET_CORE, depends
+  only on TTY).
+- buildroot: BR2_PACKAGE_UTIL_LINUX_BINARIES=y for ldattach (attaches the
+  N_SLIP line discipline). busybox stty sets the non-standard 1.5 Mbaud first,
+  since musl's ldattach -s cannot.
+- S31slip init + /etc/rnsbox/slip.conf: when enabled, set the line speed with
+  stty then ldattach SLIP on the UART and bring up a point-to-point sl0
+  (local_ip peer peer_ip). No-op when disabled, the device is absent, or the
+  modem isn't wired. Does not touch eth0/usb0.
+- portal (Reticulum tab): a 'HaLow modem (SLIP)' card — enable/disable, UART
+  device, baud, local/peer IP, live sl0 status; store.read/write_slip_conf,
+  sysinfo.slip_status, applied live via S31slip reload.
+- portal: reverse-proxy the modem's own web UI through the portal, behind
+  @login_required, at /modem/ — it serves the modem's self-contained config
+  page with its /api/ fetches rewritten to /modem/api/ and proxies those over
+  sl0. An 'Open modem web UI' button sits on the card. This reuses the portal
+  login to gate the modem instead of exposing it via an unauthenticated LAN
+  DNAT. (OTA upload through the proxy can exceed MAX_CONTENT_LENGTH; flash the
+  modem over its own Ethernet UI.)
+- portal: carrierless interfaces (sl0, tun) report operstate 'unknown' even
+  when fully up, which the UI flagged as a scary badge. sysinfo now resolves
+  an admin-up 'unknown' interface that has carrier to 'up', so the
+  All-interfaces table shows UP rather than a false alarm.
+- docs: README.RNSBox.md 'Connecting a WiFi-HaLow modem' section.
+
+Wiring (Nano-e): UART1 GPIOA28 TX / A29 RX (/dev/ttyS1), 3.3 V. The Nano UART
+maxes at 1,562,500 baud (25 MHz/16), so the modem must be set to 1.5 Mbaud.
+---
+ README.RNSBox.md                              |  74 ++++++++++++
+ .../linux/sg2002_licheervnano_sd_defconfig    |   1 +
+ .../cvitek/SG200X/overlay/etc/init.d/S31slip  |  81 +++++++++++++
+ .../SG200X/overlay/etc/rnsbox/slip.conf       |  26 ++++
+ .../cvitek_SG200X_musl_riscv64_defconfig      |   2 +-
+ .../rnsbox-portal/src/rnsbox_portal/app.py    | 111 +++++++++++++++++-
+ .../rnsbox-portal/src/rnsbox_portal/store.py  |  57 +++++++++
+ .../src/rnsbox_portal/sysinfo.py              |  25 +++-
+ .../rnsbox_portal/templates/reticulum.html    |  45 +++++++
+ 9 files changed, 419 insertions(+), 3 deletions(-)
+ create mode 100755 buildroot/board/cvitek/SG200X/overlay/etc/init.d/S31slip
+ create mode 100644 buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/slip.conf
+
+diff --git a/README.RNSBox.md b/README.RNSBox.md
+index faec044cb..f09049cfe 100644
+--- a/README.RNSBox.md
++++ b/README.RNSBox.md
+@@ -79,6 +79,80 @@ See [APPLYING.md](APPLYING.md) for the full flow.
+   `build/clients-stick/`. Treat the clients disc as optional and review that
+   directory before relying on it. The `lite` build does not need it.
+ 
++## Connecting a WiFi-HaLow (RNode) modem over SLIP
++
++RNSBox can use an external **WiFi-HaLow** RNode modem — a Taixin TXW-series
++HaLow bridge running I-AM-ENGINEER's
++[RNode_Halow_Firmware](https://github.com/I-AM-ENGINEER/RNode_Halow_Firmware) —
++as a long-range sub-GHz Reticulum interface, connected over a 3-wire UART using
++**SLIP** (IP-over-serial). Optional and **off by default**.
++
++### Wiring
++
++Wire the modem to **UART1** = `/dev/ttyS1` — **not** `ttyS0`, which is the
++serial console. UART1 comes out on pads `A28` (TX) and `A29` (RX); use the GND
++pin next to them (right-hand header). Both sides are **3.3 V TTL** — do not
++connect a 5 V or RS-232 line. Cross TX↔RX:
++
++```
++  LicheeRV Nano-e (UART1 / ttyS1)          HaLow RNode modem
++  ───────────────────────────────          ─────────────────
++   A28  TX  ─────────────────────────────►  RX
++   A29  RX  ◄─────────────────────────────  TX
++   GND      ─────────────────────────────   GND    (required)
++```
++
++Keep the leads short — at 1.5 Mbaud, long unshielded jumpers invite frame errors.
++
++### Baud
++
++Both ends must run the **same baud**. The Nano-e's UART is clocked from 25 MHz,
++so its ceiling is **1,562,500** (25 MHz / 16) — it cannot reach the modem's
++2,000,000 default. Use **1500000** on both sides:
++
++- **Modem**: set SLIP baud to `1500000` over its Ethernet web UI (or `POST
++  /api/slip_cfg`). Runtime-settable and persisted — no reflash.
++- **RNSBox**: `baud=1500000` in the *HaLow modem (SLIP)* card (or
++  `/etc/rnsbox/slip.conf`).
++
++If `rx_over_errors` climbs under load (`ip -s link show sl0`), drop both ends to
++`1000000` or `921600`.
++
++### Bring it up
++
++1. **Configure + wire** the modem as above; note its SLIP IPs (defaults: modem
++   `192.168.7.2`, host `192.168.7.1`).
++2. **Enable it**: portal → Reticulum tab → *HaLow modem (SLIP)* → tick *Enable*,
++   set device/baud/IPs to match, *Save & apply*. This sets the line speed
++   (`stty`), attaches SLIP (`ldattach`), and brings up a point-to-point `sl0` to
++   the modem — equivalent to editing `/etc/rnsbox/slip.conf` (applied by
++   `S31slip`). `ping 192.168.7.2` should now answer.
++3. **Add the Reticulum interface** in the config editor, then Restart rnsd:
++
++   ```
++   [[HaLow]]
++     type = TCPClientInterface
++     enabled = yes
++     target_host = 192.168.7.2
++     target_port = 8001
++   ```
++
++   RNode_Halow_Firmware serves its RNode TCP endpoint on **port 8001** (not the
++   `4242` the standalone Reticulum docs use). Confirm the port with
++   `curl http://192.168.7.2/api/tcp_server_cfg`.
++
++### Managing the modem from the portal
++
++With SLIP up, the modem's own web UI is reachable only from the box. The portal
++reverse-proxies it behind the login — *Reticulum tab → Open modem web UI* (or
++browse to `/modem/`) opens the modem's full config/stats page through your
++portal session, so nothing is exposed unauthenticated on the LAN. (Firmware OTA
++is the exception: flash the modem over its own Ethernet UI.)
++
++The SLIP link is a point-to-point host route to the modem only; it doesn't touch
++the `eth0` WAN or `usb0` LAN. Requires `CONFIG_SLIP` (kernel) and `ldattach`
++(util-linux) — both shipped.
++
+ ## Support RNSBox
+ 
+ RNSBox is free and open source (MIT). If it's useful to you, you can support
+diff --git a/build/boards/sg200x/sg2002_licheervnano_sd/linux/sg2002_licheervnano_sd_defconfig b/build/boards/sg200x/sg2002_licheervnano_sd/linux/sg2002_licheervnano_sd_defconfig
+index 52c3d1bbb..c7ae88c20 100644
+--- a/build/boards/sg200x/sg2002_licheervnano_sd/linux/sg2002_licheervnano_sd_defconfig
++++ b/build/boards/sg200x/sg2002_licheervnano_sd/linux/sg2002_licheervnano_sd_defconfig
+@@ -64,6 +64,7 @@ CONFIG_MTD_UBI=y
+ CONFIG_MTD_UBI_BLOCK=y
+ CONFIG_NETDEVICES=y
+ # CONFIG_NET_CORE is not set
++CONFIG_SLIP=y
+ # CONFIG_NET_VENDOR_ALACRITECH is not set
+ # CONFIG_NET_VENDOR_AMAZON is not set
+ # CONFIG_NET_VENDOR_AQUANTIA is not set
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S31slip b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S31slip
+new file mode 100755
+index 000000000..6f220d562
+--- /dev/null
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S31slip
+@@ -0,0 +1,81 @@
++#!/bin/sh
++# S31slip - optional SLIP-over-UART link to an external WiFi-HaLow (RNode)
++# modem. Reads /etc/rnsbox/slip.conf; when enabled, attaches the SLIP line
++# discipline to the configured UART (ldattach) and brings up a point-to-point
++# sl0 interface to the modem. rnsd then reaches the modem as a normal
++# Reticulum interface via a TCPClientInterface to peer_ip:4242 (added to
++# /etc/reticulum/config by the operator).
++#
++# OFF by default. Harmless no-op when disabled, when the UART device is
++# absent, or when the modem simply isn't wired (sl0 just never comes up).
++
++CONF=/etc/rnsbox/slip.conf
++LOG=/var/log/slip.log
++
++# read one key=value from the conf (single value, no shell sourcing)
++cfg() {
++	sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$CONF" 2>/dev/null \
++	  | tail -1 | tr -d '"' | tr -d "'" | awk '{print $1}'
++}
++
++start() {
++	[ -r "$CONF" ] || { echo "S31slip: no $CONF; skipping"; return 0; }
++	enabled=$(cfg enabled)
++	case "$enabled" in yes|true|1|on) ;; *) echo "S31slip: disabled"; return 0 ;; esac
++
++	device=$(cfg device);     [ -n "$device" ]   || device=/dev/ttyS1
++	baud=$(cfg baud);         [ -n "$baud" ]     || baud=1500000
++	local_ip=$(cfg local_ip); [ -n "$local_ip" ] || local_ip=192.168.7.1
++	peer_ip=$(cfg peer_ip);   [ -n "$peer_ip" ]  || peer_ip=192.168.7.2
++
++	if [ ! -e "$device" ]; then
++		echo "S31slip: $device not present; skipping"
++		return 1
++	fi
++
++	printf "Starting SLIP (%s @ %s baud) -> sl0: " "$device" "$baud"
++	# Set the line speed with busybox stty (it maps a decimal baud to the right
++	# Bxxxx constant). util-linux ldattach's own `-s <baud>` can NOT do this on
++	# a musl target - musl's cfsetspeed rejects a raw decimal and ldattach's
++	# BOTHER fallback is compiled out - so we set the speed here and attach
++	# without -s. ldattach's cfmakeraw preserves the speed bits.
++	if ! stty -F "$device" "$baud" raw -echo >>"$LOG" 2>&1; then
++		echo "FAIL (stty could not set $baud on $device; see $LOG)"
++		return 1
++	fi
++	# ldattach daemonizes and holds the tty open, keeping N_SLIP loaded so the
++	# kernel slip driver's sl0 netdev stays registered.
++	ldattach SLIP "$device" >>"$LOG" 2>&1
++
++	i=0
++	while [ $i -lt 20 ]; do
++		ip link show sl0 >/dev/null 2>&1 && break
++		i=$((i + 1)); sleep 0.2
++	done
++	if ! ip link show sl0 >/dev/null 2>&1; then
++		echo "FAIL (sl0 not created)"
++		killall ldattach 2>/dev/null
++		return 1
++	fi
++
++	# point-to-point: our end = local_ip, the modem = peer_ip. A host route to
++	# peer_ip goes out sl0; nothing else is affected (no default route change).
++	ip addr flush dev sl0 2>/dev/null
++	ip addr add "$local_ip" peer "$peer_ip" dev sl0 2>/dev/null
++	ip link set sl0 up 2>/dev/null
++	echo "OK ($local_ip -> $peer_ip)"
++}
++
++stop() {
++	killall ldattach 2>/dev/null
++	ip link set sl0 down 2>/dev/null
++	ip addr flush dev sl0 2>/dev/null
++	echo "S31slip: stopped"
++}
++
++case "${1:-start}" in
++	start)          start ;;
++	stop)           stop ;;
++	restart|reload) stop; sleep 1; start ;;
++	*) echo "Usage: $0 {start|stop|restart|reload}" >&2; exit 1 ;;
++esac
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/slip.conf b/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/slip.conf
+new file mode 100644
+index 000000000..207320d47
+--- /dev/null
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/slip.conf
+@@ -0,0 +1,26 @@
++# SLIP-over-UART link to an external WiFi-HaLow (RNode) modem.
++#
++# Optional, OFF by default. When enabled, S31slip attaches the SLIP line
++# discipline to the UART and brings up a point-to-point interface (sl0) to
++# the modem. rnsd then reaches the modem as a normal Reticulum interface by
++# adding, in /etc/reticulum/config:
++#
++#     [[HaLow]]
++#       type = TCPClientInterface
++#       target_host = 192.168.7.2      # = peer_ip below
++#       target_port = 4242
++#
++# Wiring (LicheeRV Nano-e): UART1 on GPIOA28 (TX) / GPIOA29 (RX), 3.3 V,
++# common ground — device = /dev/ttyS1. Do NOT use ttyS0 (console).
++#
++# baud MUST match the modem's SLIP baud. The Nano's UART tops out at
++# 1,562,500 (25 MHz/16); the modem defaults to 2,000,000 which the Nano
++# cannot reach, so set the modem to 1500000 (via its web UI) and match it
++# here. local_ip/peer_ip must match the modem's SLIP config (defaults
++# 192.168.7.2 device / 192.168.7.1 host).
++
++enabled=no
++device=/dev/ttyS1
++baud=1500000
++local_ip=192.168.7.1
++peer_ip=192.168.7.2
+diff --git a/buildroot/configs/cvitek_SG200X_musl_riscv64_defconfig b/buildroot/configs/cvitek_SG200X_musl_riscv64_defconfig
+index 6791defee..2dadfe45c 100644
+--- a/buildroot/configs/cvitek_SG200X_musl_riscv64_defconfig
++++ b/buildroot/configs/cvitek_SG200X_musl_riscv64_defconfig
+@@ -3640,7 +3640,7 @@ BR2_PACKAGE_UTIL_LINUX_LIBBLKID=y
+ # BR2_PACKAGE_UTIL_LINUX_LIBMOUNT is not set
+ BR2_PACKAGE_UTIL_LINUX_LIBSMARTCOLS=y
+ BR2_PACKAGE_UTIL_LINUX_LIBUUID=y
+-# BR2_PACKAGE_UTIL_LINUX_BINARIES is not set
++BR2_PACKAGE_UTIL_LINUX_BINARIES=y
+ # BR2_PACKAGE_UTIL_LINUX_AGETTY is not set
+ # BR2_PACKAGE_UTIL_LINUX_BFS is not set
+ # BR2_PACKAGE_UTIL_LINUX_CAL is not set
+diff --git a/buildroot/package/rnsbox-portal/src/rnsbox_portal/app.py b/buildroot/package/rnsbox-portal/src/rnsbox_portal/app.py
+index 4aef9e280..6b93e7078 100644
+--- a/buildroot/package/rnsbox-portal/src/rnsbox_portal/app.py
++++ b/buildroot/package/rnsbox-portal/src/rnsbox_portal/app.py
+@@ -1,12 +1,16 @@
+ """Flask app for the RNSBox admin UI."""
++import gzip
+ import os
+ import secrets
+ import subprocess
+ import time
++import urllib.error
++import urllib.request
+ from functools import wraps
+ 
+ from flask import (
+-    Flask, flash, redirect, render_template, request, session, url_for,
++    Flask, Response, flash, redirect, render_template, request, session,
++    url_for,
+ )
+ 
+ from . import auth, donate, store, sysinfo, updatecheck, wifi
+@@ -244,8 +248,44 @@ def create_app():
+             rns_version=updatecheck.installed_version(),
+             update=upd,
+             auto_update=store.read_update_check(),
++            slip=store.read_slip_conf(),
++            slip_status=sysinfo.slip_status(),
+         )
+ 
++    @app.route("/reticulum/slip", methods=["POST"])
++    @login_required
++    def reticulum_slip():
++        # SLIP-over-UART link to an external HaLow (RNode) modem. Save the
++        # config and (re)apply it live via S31slip.
++        cfg = {
++            "enabled": "yes" if request.form.get("enabled") == "on" else "no",
++            "device": request.form.get("device", "").strip(),
++            "baud": request.form.get("baud", "").strip(),
++            "local_ip": request.form.get("local_ip", "").strip(),
++            "peer_ip": request.form.get("peer_ip", "").strip(),
++        }
++        try:
++            ok, err = store.write_slip_conf(cfg)
++        except Exception as e:
++            flash(f"SLIP: could not save config: {e}", "error")
++            return redirect(url_for("reticulum"))
++        if not ok:
++            flash("SLIP: %s." % err, "error")
++            return redirect(url_for("reticulum"))
++        try:
++            subprocess.run(["/etc/init.d/S31slip", "reload"],
++                           check=False, timeout=15)
++        except Exception as e:
++            flash(f"SLIP saved, but reload failed: {e}", "error")
++            return redirect(url_for("reticulum"))
++        if cfg["enabled"] == "yes":
++            flash("SLIP link enabled on %s @ %s baud. Add a TCPClientInterface "
++                  "to %s:4242 in the config below to use it." %
++                  (cfg["device"], cfg["baud"], cfg["peer_ip"]), "success")
++        else:
++            flash("SLIP link disabled.", "success")
++        return redirect(url_for("reticulum"))
++
+     @app.route("/reticulum/autorestart", methods=["POST"])
+     @login_required
+     def reticulum_autorestart():
+@@ -552,4 +592,73 @@ def create_app():
+         flash(f"WiFi mode set to {mode}", "success")
+         return redirect(url_for("wifi_page"))
+ 
++    # --- HaLow modem web UI passthrough -------------------------------------
++    # The external WiFi-HaLow (RNode) modem serves one self-contained config
++    # page at http://<peer_ip>/ plus a JSON API under /api/*, reachable only
++    # from this box over the SLIP link (sl0). We reverse-proxy it here, behind
++    # @login_required, so the modem's whole UI is usable through the portal and
++    # gated by the portal login -- rather than exposed unauthenticated on the
++    # LAN via a raw DNAT. The page's fetch('/api/..') calls are rewritten to
++    # '/modem/api/..' so everything stays under /modem and never collides with
++    # the portal's own routes. (OTA firmware upload through the proxy can hit
++    # MAX_CONTENT_LENGTH; flash the modem over its own Ethernet UI instead.)
++    MODEM_TIMEOUT = 8
++
++    def _modem_base():
++        try:
++            peer = (store.read_slip_conf().get("peer_ip") or "").strip()
++        except Exception:
++            peer = ""
++        return "http://" + (peer or "192.168.7.2")
++
++    def _modem_request(path, method="GET", body=None, ctype=None, query=""):
++        url = _modem_base() + path
++        if query:
++            url += "?" + query
++        headers = {"Accept-Encoding": "identity"}
++        if ctype:
++            headers["Content-Type"] = ctype
++        req = urllib.request.Request(url, data=body, method=method, headers=headers)
++        with urllib.request.urlopen(req, timeout=MODEM_TIMEOUT) as resp:
++            data = resp.read()
++            if "gzip" in (resp.headers.get("Content-Encoding") or "").lower():
++                data = gzip.decompress(data)
++            return data, resp.headers.get("Content-Type", "application/octet-stream")
++
++    @app.route("/modem/")
++    @app.route("/modem")
++    @login_required
++    def modem_ui():
++        try:
++            data, ctype = _modem_request("/")
++        except Exception as exc:  # noqa: BLE001 - surface any failure to the UI
++            return Response(
++                "HaLow modem not reachable at %s (%s).\n\n"
++                "Enable the SLIP link, wire the modem, and confirm sl0 is up, "
++                "then retry." % (_modem_base(), exc),
++                status=502, mimetype="text/plain")
++        if "html" in ctype.lower():
++            html = data.decode("utf-8", "replace").replace("/api/", "/modem/api/")
++            return Response(html, mimetype="text/html")
++        return Response(data, mimetype=ctype)
++
++    @app.route("/modem/api/<path:endpoint>", methods=["GET", "POST"])
++    @login_required
++    def modem_api(endpoint):
++        body = request.get_data() if request.method == "POST" else None
++        ctype = request.headers.get("Content-Type") if body else None
++        query = request.query_string.decode("latin-1") if request.query_string else ""
++        try:
++            data, rct = _modem_request(
++                "/api/" + endpoint, method=request.method,
++                body=body, ctype=ctype, query=query)
++        except urllib.error.HTTPError as exc:
++            return Response(
++                exc.read(), status=exc.code,
++                mimetype=exc.headers.get("Content-Type", "application/json"))
++        except Exception:  # noqa: BLE001 - modem down / SLIP not up
++            return Response('{"error":"modem unreachable over SLIP","rc":-502}',
++                            status=502, mimetype="application/json")
++        return Response(data, mimetype=rct)
++
+     return app
+diff --git a/buildroot/package/rnsbox-portal/src/rnsbox_portal/store.py b/buildroot/package/rnsbox-portal/src/rnsbox_portal/store.py
+index 69f2259e0..dd5661357 100644
+--- a/buildroot/package/rnsbox-portal/src/rnsbox_portal/store.py
++++ b/buildroot/package/rnsbox-portal/src/rnsbox_portal/store.py
+@@ -12,6 +12,7 @@ OP_FILE = f"{CONF_DIR}/openports.conf"
+ WAN_FILE = f"{CONF_DIR}/wan.conf"
+ CRON_FILE = f"{CONF_DIR}/cron.conf"
+ NTP_FILE = "/etc/ntp.conf"          # ntp package's config; we edit its `server` lines
++SLIP_FILE = f"{CONF_DIR}/slip.conf"
+ 
+ 
+ def _read_lines(path):
+@@ -335,3 +336,59 @@ def write_ntp_servers(servers):
+         new.append("")
+     _write_lines(NTP_FILE, new + kept)
+     return clean
++
++
++# ---- SLIP link to an external HaLow (RNode) modem ----
++
++def read_slip_conf():
++    """slip.conf as a dict, with defaults filled in (+ enabled_bool)."""
++    d = {"enabled": "no", "device": "/dev/ttyS1", "baud": "1500000",
++         "local_ip": "192.168.7.1", "peer_ip": "192.168.7.2"}
++    for ln in _read_lines(SLIP_FILE):
++        s = ln.strip()
++        if s.startswith("#") or "=" not in s:
++            continue
++        k, _, v = s.partition("=")
++        k = k.strip()
++        if k in d:
++            d[k] = v.split("#", 1)[0].strip()
++    d["enabled_bool"] = _truthy(d["enabled"])
++    return d
++
++
++def _valid_tty(s):
++    # reject the serial console: attaching SLIP to it kills the console/login.
++    if s in ("/dev/ttyS0", "/dev/console"):
++        return False
++    return (s.startswith("/dev/") and len(s) <= 64
++            and all(c.isalnum() or c in "/_-" for c in s))
++
++
++def write_slip_conf(d):
++    """Rewrite slip.conf from a dict (validated). Returns (ok, error)."""
++    enabled = "yes" if _truthy(d.get("enabled", "no")) else "no"
++    device = (d.get("device") or "/dev/ttyS1").strip()
++    if not _valid_tty(device):
++        return False, "bad device path"
++    try:
++        baud = int(d.get("baud", 1500000))
++    except (TypeError, ValueError):
++        return False, "baud must be a number"
++    if not (1 <= baud <= 4000000):
++        return False, "baud out of range (1-4000000)"
++    local_ip = (d.get("local_ip") or "192.168.7.1").strip()
++    peer_ip = (d.get("peer_ip") or "192.168.7.2").strip()
++    if not (_valid_ipv4(local_ip) and _valid_ipv4(peer_ip)):
++        return False, "bad IP address"
++    _write_lines(SLIP_FILE, [
++        "# SLIP-over-UART link to an external WiFi-HaLow (RNode) modem.",
++        "# Managed by the rnsbox-portal Reticulum tab; applied by S31slip. OFF",
++        "# by default. baud must match the modem (Nano max 1562500);",
++        "# local_ip/peer_ip must match the modem's SLIP config.",
++        f"enabled={enabled}",
++        f"device={device}",
++        f"baud={baud}",
++        f"local_ip={local_ip}",
++        f"peer_ip={peer_ip}",
++    ])
++    return True, ""
+diff --git a/buildroot/package/rnsbox-portal/src/rnsbox_portal/sysinfo.py b/buildroot/package/rnsbox-portal/src/rnsbox_portal/sysinfo.py
+index 9471b6de5..5a295678a 100644
+--- a/buildroot/package/rnsbox-portal/src/rnsbox_portal/sysinfo.py
++++ b/buildroot/package/rnsbox-portal/src/rnsbox_portal/sysinfo.py
+@@ -117,9 +117,23 @@ def network_summary():
+         dev_list = []
+     for d in dev_list:
+         base = f"/sys/class/net/{d}"
++        state = _slurp(f"{base}/operstate").strip()
++        # Carrierless-by-design interfaces (SLIP, tun/tap) report operstate
++        # 'unknown' even when fully up and passing traffic, which the UI would
++        # otherwise flag as a scary orange UNKNOWN. Treat an admin-up 'unknown'
++        # interface that has carrier as 'up'. flags bit0 = IFF_UP; the carrier
++        # file reads 1 only when the link layer is actually up (and the /sys
++        # flags value doesn't reliably expose LOWER_UP/RUNNING, so use carrier).
++        if state == "unknown":
++            try:
++                _iff_up = int(_slurp(f"{base}/flags").strip() or "0", 16) & 0x1
++            except ValueError:
++                _iff_up = 0
++            if _iff_up and _slurp(f"{base}/carrier").strip() == "1":
++                state = "up"
+         ifaces[d] = {
+             "addrs": _ip_addrs(d),
+-            "state": _slurp(f"{base}/operstate").strip(),
++            "state": state,
+             "mac": _slurp(f"{base}/address").strip(),
+             "mtu": _slurp(f"{base}/mtu").strip(),
+             "rx": _human_bytes(_slurp(f"{base}/statistics/rx_bytes").strip()),
+@@ -221,3 +235,12 @@ def dnsmasq_leases():
+         except FileNotFoundError:
+             continue
+     return out
++
++
++def slip_status():
++    """Status of the sl0 SLIP interface: present + up (best-effort). SLIP has
++    no carrier, so when brought up it reports 'unknown' rather than 'up'."""
++    if not os.path.isdir("/sys/class/net/sl0"):
++        return {"present": False, "up": False}
++    state = _slurp("/sys/class/net/sl0/operstate").strip()
++    return {"present": True, "up": state not in ("down", "")}
+diff --git a/buildroot/package/rnsbox-portal/src/rnsbox_portal/templates/reticulum.html b/buildroot/package/rnsbox-portal/src/rnsbox_portal/templates/reticulum.html
+index 0202f8a1a..172532174 100644
+--- a/buildroot/package/rnsbox-portal/src/rnsbox_portal/templates/reticulum.html
++++ b/buildroot/package/rnsbox-portal/src/rnsbox_portal/templates/reticulum.html
+@@ -56,6 +56,51 @@
+   <pre class="log" id="rnstatus"><span class="muted">loading… (querying the rnsd instance, can take a few seconds)</span></pre>
+ </section>
+ 
++<section class="card">
++  <h3>HaLow modem (SLIP)</h3>
++  <p class="muted">Optional point-to-point serial link (<code>sl0</code>) to an external
++  WiFi-HaLow RNode modem over a UART. When it's up, add a <code>TCPClientInterface</code>
++  to the modem (peer address, port 4242) in the config editor below to use it as a
++  Reticulum interface. Off by default.</p>
++
++  <table class="kv">
++    <tr><th>Link (sl0)</th><td>
++      {% if slip_status.up %}<span class="badge ok">UP</span> {{ slip.local_ip }} &rarr; {{ slip.peer_ip }}
++      {% elif slip_status.present %}<span class="badge warn">DOWN</span> (attached, no address)
++      {% elif slip.enabled_bool %}<span class="badge warn">not attached</span> (modem wired?)
++      {% else %}<span class="badge">disabled</span>{% endif %}
++    </td></tr>
++  </table>
++
++  {% if slip.enabled_bool %}
++  <p style="margin:10px 0 0">
++    <a class="btn" href="{{ url_for('modem_ui') }}" target="_blank" rel="noopener">Open modem web UI &rarr;</a>
++    <span class="muted">the modem's own config page, proxied through this portal login</span>
++  </p>
++  {% endif %}
++
++  <form method="post" action="{{ url_for('reticulum_slip') }}">
++    <label style="margin:8px 0 0"><input type="checkbox" name="enabled"
++      {{ 'checked' if slip.enabled_bool else '' }}> Enable SLIP link at boot</label>
++    <div class="row-form" style="margin-top:10px">
++      <label style="margin:0">UART device
++        <input type="text" name="device" value="{{ slip.device }}"></label>
++      <label style="margin:0">Baud
++        <input type="number" name="baud" value="{{ slip.baud }}" min="1" max="4000000"></label>
++      <label style="margin:0">This box (local IP)
++        <input type="text" name="local_ip" value="{{ slip.local_ip }}"></label>
++      <label style="margin:0">Modem (peer IP)
++        <input type="text" name="peer_ip" value="{{ slip.peer_ip }}"></label>
++    </div>
++    <button type="submit" class="btn-primary" style="margin-top:10px">Save &amp; apply</button>
++    <p class="muted">Wire UART1 (<code>GPIOA28</code> TX / <code>A29</code> RX, 3.3&nbsp;V) to the modem,
++    cross TX&harr;RX, common ground &mdash; device <code>/dev/ttyS1</code> (not <code>ttyS0</code>, the console).
++    <strong>Baud must match the modem.</strong> The Nano's UART maxes at 1,562,500, so set the modem to
++    1.5&nbsp;Mbaud (over its Ethernet web UI) and match it here. The IPs must match the modem's SLIP config
++    (defaults <code>192.168.7.2</code> modem / <code>192.168.7.1</code> box).</p>
++  </form>
++</section>
++
+ <section class="card">
+   <h3>/etc/reticulum/config</h3>
+   <p class="muted">Hand-edit the rnsd configuration. Comments and interface declarations are passed verbatim to Reticulum. Click <em>Save</em> then <em>Restart rnsd</em> to apply.</p>
+-- 
+2.47.3
+

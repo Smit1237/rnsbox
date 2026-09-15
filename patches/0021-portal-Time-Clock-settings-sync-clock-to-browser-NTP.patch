@@ -1,7 +1,7 @@
 From cd04e4dcb769459c93dc6481a5e872fb75f9f17a Mon Sep 17 00:00:00 2001
 From: smit1237 <smit1237@gmail.com>
 Date: Wed, 9 Sep 2026 18:06:39 +0300
-Subject: [PATCH 21/21] =?UTF-8?q?portal:=20Time=20&=20Clock=20settings=20?=
+Subject: [PATCH 21/22] =?UTF-8?q?portal:=20Time=20&=20Clock=20settings=20?=
  =?UTF-8?q?=E2=80=94=20sync=20clock=20to=20browser=20+=20NTP=20servers?=
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
