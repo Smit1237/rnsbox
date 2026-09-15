@@ -1,4 +1,4 @@
-From 5a6144d629450325e246a0271d3355eb734934fb Mon Sep 17 00:00:00 2001
+From 744da24019748fe75ff55b00bf4f52c1882b4cc5 Mon Sep 17 00:00:00 2001
 From: smit1237 <smit1237@gmail.com>
 Date: Tue, 8 Sep 2026 22:47:49 +0300
 Subject: [PATCH 11/22] wifi: AIC8800 STA/AP support for the W variant
@@ -11,12 +11,12 @@ a clean no-op on the radio-less board. The board defconfig also disables the
 MIPI panel and camera sensors.
 ---
  .../sg2002_licheervnano_sd_defconfig          |  21 +-
- .../cvitek/SG200X/overlay/etc/init.d/S35wifi  | 292 ++++++++++++++++++
+ .../cvitek/SG200X/overlay/etc/init.d/S35wifi  | 295 ++++++++++++++++++
  .../SG200X/overlay/etc/rnsbox/wifi.conf       |  57 ++++
  osdrv/extdrv/wireless/Makefile                |  23 +-
  osdrv/extdrv/wireless/aic8800/Makefile        |   8 +-
  .../wireless/aic8800/aic8800_fdrv/Makefile    |   2 +-
- 6 files changed, 385 insertions(+), 18 deletions(-)
+ 6 files changed, 388 insertions(+), 18 deletions(-)
  create mode 100755 buildroot/board/cvitek/SG200X/overlay/etc/init.d/S35wifi
  create mode 100644 buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/wifi.conf
 
@@ -60,10 +60,10 @@ index aa1ebfb00..b8405ed67 100644
  # CONFIG_TARGET_PACKAGE_GATORD is not set
 diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S35wifi b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S35wifi
 new file mode 100755
-index 000000000..48c23ad92
+index 000000000..4033fbaf9
 --- /dev/null
 +++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S35wifi
-@@ -0,0 +1,292 @@
+@@ -0,0 +1,295 @@
 +#!/bin/sh
 +# S35wifi — AIC8800 WiFi bring-up for the LicheeRV Nano-e W variant.
 +#
@@ -103,7 +103,10 @@ index 000000000..48c23ad92
 +	fi
 +	grep -q '^aic8800_bsp ' /proc/modules 2>/dev/null  || { K=$(find "$KO3RD" -name 'aic8800_bsp.ko' 2>/dev/null | head -1);  [ -n "$K" ] && insmod "$K" 2>/dev/null; }
 +	sleep 1
-+	grep -q '^aic8800_fdrv ' /proc/modules 2>/dev/null || { K=$(find "$KO3RD" -name 'aic8800_fdrv.ko' 2>/dev/null | head -1); [ -n "$K" ] && insmod "$K" 2>/dev/null; }
++	# aicwf_dbg_level=1 (LOGERROR only): the driver default
++	# (LOGERROR|LOGINFO|LOGDEBUG|LOGTRACE|LOGFW=1039) logs every RX packet,
++	# flooding dmesg/syslog and filling the small /var/log tmpfs.
++	grep -q '^aic8800_fdrv ' /proc/modules 2>/dev/null || { K=$(find "$KO3RD" -name 'aic8800_fdrv.ko' 2>/dev/null | head -1); [ -n "$K" ] && insmod "$K" aicwf_dbg_level=1 2>/dev/null; }
 +}
 +
 +wait_for_iface() {

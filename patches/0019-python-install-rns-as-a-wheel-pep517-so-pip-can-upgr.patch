@@ -1,4 +1,4 @@
-From be524809a4f7529613fa72a383a122fd61951341 Mon Sep 17 00:00:00 2001
+From 3ecc38a602665f05014b47242d0c3b73ea6c3790 Mon Sep 17 00:00:00 2001
 From: smit1237 <smit1237@gmail.com>
 Date: Wed, 9 Sep 2026 01:58:01 +0300
 Subject: [PATCH 19/22] python: install rns as a wheel (pep517) so pip can
