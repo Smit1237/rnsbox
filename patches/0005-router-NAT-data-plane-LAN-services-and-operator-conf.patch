@@ -17,10 +17,10 @@ fallback/fstab configuration and the wan/portforward/openports operator files.
  .../SG200X/overlay/etc/init.d/S60routing      | 167 ++++++++++++++++++
  .../board/cvitek/SG200X/overlay/etc/inittab   |  10 +-
  .../cvitek/SG200X/overlay/etc/nftables.conf   |  46 +++++
- .../SG200X/overlay/etc/rnsbox/openports.conf  |  11 ++
+ .../SG200X/overlay/etc/rnsbox/openports.conf  |  14 ++
  .../overlay/etc/rnsbox/portforward.conf       |  12 ++
  .../cvitek/SG200X/overlay/etc/rnsbox/wan.conf |  24 +++
- 10 files changed, 416 insertions(+), 24 deletions(-)
+ 10 files changed, 419 insertions(+), 24 deletions(-)
  create mode 100644 buildroot/board/cvitek/SG200X/overlay/etc/dhcpcd.conf
  create mode 100644 buildroot/board/cvitek/SG200X/overlay/etc/dnsmasq.conf
  create mode 100644 buildroot/board/cvitek/SG200X/overlay/etc/fstab
@@ -490,21 +490,24 @@ index 000000000..44f06e3f0
 +}
 diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/openports.conf b/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/openports.conf
 new file mode 100644
-index 000000000..786abfaa5
+index 000000000..2d017be09
 --- /dev/null
 +++ b/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/openports.conf
-@@ -0,0 +1,11 @@
+@@ -0,0 +1,14 @@
 +# Open ports on this device's WAN-facing interface.
 +#
 +# One rule per line:
 +#   <proto>  <port>   [# comment]
 +#
-+# Examples:
-+#   tcp  4242   # rnsd TCPServerInterface for external Reticulum peers
-+#   udp  4242   # rnsd UDPInterface
++# SSH (22) and the web UI (80) ship as default entries so the box is reachable
++# on the WAN out of the box. Remove them here (or in the portal: Network ->
++# Open ports) to close WAN access — the LAN side (usb0) always stays open.
 +#
-+# SSH (tcp/22) is allowed unconditionally and does NOT need an entry here.
-+# Managed by the rnsbox-portal UI (Network → Open ports).
++# Add rnsd's TCPServerInterface port (default 4242) if you want external
++# Reticulum peers to reach you.
++# Managed by the rnsbox-portal UI (Network -> Open ports).
++tcp 22  # SSH
++tcp 80  # web admin UI
 diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/portforward.conf b/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/portforward.conf
 new file mode 100644
 index 000000000..3826c60fb

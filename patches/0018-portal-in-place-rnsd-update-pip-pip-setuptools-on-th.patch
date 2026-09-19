@@ -24,8 +24,8 @@ and for general package management.
  .../cvitek_SG200X_musl_riscv64_defconfig      |   7 +-
  .../rnsbox-portal/src/rnsbox_portal/app.py    |  17 ++
  .../rnsbox_portal/templates/reticulum.html    |   8 +-
- .../src/rnsbox_portal/updatecheck.py          | 175 ++++++++++++++++++
- 4 files changed, 204 insertions(+), 3 deletions(-)
+ .../src/rnsbox_portal/updatecheck.py          | 212 +++++++++++++++++-
+ 4 files changed, 232 insertions(+), 12 deletions(-)
 
 diff --git a/buildroot/configs/cvitek_SG200X_musl_riscv64_defconfig b/buildroot/configs/cvitek_SG200X_musl_riscv64_defconfig
 index 6abe7c9f8..6791defee 100644
@@ -105,23 +105,22 @@ index dc51858d0..0202f8a1a 100644
  
    <form method="post" action="{{ url_for('reticulum_autorestart') }}" class="row-form" style="margin-top:10px">
 diff --git a/buildroot/package/rnsbox-portal/src/rnsbox_portal/updatecheck.py b/buildroot/package/rnsbox-portal/src/rnsbox_portal/updatecheck.py
-index cab7d4c71..43d0bc56a 100644
+index cab7d4c71..046c53451 100644
 --- a/buildroot/package/rnsbox-portal/src/rnsbox_portal/updatecheck.py
 +++ b/buildroot/package/rnsbox-portal/src/rnsbox_portal/updatecheck.py
-@@ -10,15 +10,23 @@ Deliberately a *notifier only*:
-   * network failures are non-fatal (the box may be offline) -- check() never
-     raises and preserves the last known result.
+@@ -12,29 +12,51 @@ Deliberately a *notifier only*:
  """
-+import glob
  import json
  import os
-+import shutil
 +import subprocess
 +import sys
-+import tarfile
  import time
  import urllib.request
  
++# glob / shutil / tarfile are imported lazily inside the update-apply path
++# (_pkg_paths / apply_update) so the portal's steady state — which only ever
++# calls installed_version() + display_state() — never pays their import RAM.
++
  PKG = "rns"                       # rnsd is provided by the Reticulum 'rns' pkg
  STATE_DIR = "/var/lib/rnsbox"
  STATE_FILE = STATE_DIR + "/update.json"
@@ -132,7 +131,45 @@ index cab7d4c71..43d0bc56a 100644
  TIMEOUT = 8
  
  
-@@ -121,6 +129,173 @@ def check(pkg=PKG):
++_ver_cache = {}
++
++
+ def installed_version(pkg=PKG):
+-    """Installed version string, or None. Cheap: reads package metadata
+-    (no heavy `import RNS`), with RNS._version as a fallback."""
++    """Installed version string, or None. Memoised per process.
++
++    importlib.metadata.version() scans site-packages (~0.1-0.5 s on the C906)
++    and the answer only changes when a package is (re)installed — apply_update()
++    refreshes this cache, and a reflash restarts the process — so we compute it
++    once and serve it from a dict thereafter. This is the single biggest win for
++    the dashboard + Reticulum page load, which used to pay the scan every render
++    (twice, on /reticulum). No heavy `import RNS`; RNS._version is the fallback."""
++    if pkg in _ver_cache:
++        return _ver_cache[pkg]
++    v = None
+     try:
+         import importlib.metadata as md
+-        return md.version(pkg)
++        v = md.version(pkg)
+     except Exception:
+-        pass
+-    try:                          # fallback: RNS ships _version.py
+-        import RNS
+-        return getattr(RNS, "__version__", None)
+-    except Exception:
+-        return None
++        try:                          # fallback: RNS ships _version.py
++            import RNS
++            v = getattr(RNS, "__version__", None)
++        except Exception:
++            v = None
++    _ver_cache[pkg] = v
++    return v
+ 
+ 
+ def _vtuple(v):
+@@ -121,6 +143,178 @@ def check(pkg=PKG):
      return state
  
  
@@ -198,6 +235,7 @@ index cab7d4c71..43d0bc56a 100644
 +
 +def _pkg_paths(site, pkg):
 +    """Package dirs + metadata for `pkg` under site-packages (best-effort)."""
++    import glob
 +    import importlib.metadata as md
 +    tops = set()
 +    try:
@@ -231,6 +269,8 @@ index cab7d4c71..43d0bc56a 100644
 +    """Update `pkg` in place from its PyPI wheel. Returns a result dict; never
 +    raises. On any failure after the tree is touched, restores the rollback
 +    tarball and restarts rnsd."""
++    import shutil
++    import tarfile
 +    res = {"ok": False, "from": installed_version(pkg), "to": None,
 +           "error": "", "rolled_back": False}
 +    site = None
@@ -283,6 +323,7 @@ index cab7d4c71..43d0bc56a 100644
 +        if not _rnsd_up(15):
 +            raise RuntimeError("rnsd did not come back after the update")
 +        res["ok"] = True
++        _ver_cache[pkg] = ver          # keep the memoised version in step
 +        _write_state({"package": pkg, "installed": ver, "latest": ver,
 +                      "update_available": False, "error": "",
 +                      "checked_at": int(time.time())})
@@ -298,6 +339,7 @@ index cab7d4c71..43d0bc56a 100644
 +                    tf.extractall(site)
 +                subprocess.run([RNSD_INIT, "restart"], check=False, timeout=25)
 +                res["rolled_back"] = True
++                _ver_cache[pkg] = res["from"]   # restored the old version
 +            except Exception:
 +                pass
 +        return res

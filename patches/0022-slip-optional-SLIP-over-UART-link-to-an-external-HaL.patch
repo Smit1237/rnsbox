@@ -39,24 +39,26 @@ reaches the modem as a normal TCPClientInterface. Opt-in, OFF by default.
 Wiring (Nano-e): UART1 GPIOA28 TX / A29 RX (/dev/ttyS1), 3.3 V. The Nano UART
 maxes at 1,562,500 baud (25 MHz/16), so the modem must be set to 1.5 Mbaud.
 ---
- README.RNSBox.md                              |  74 ++++++++++++
+ README.RNSBox.md                              |  84 +++++++
  .../linux/sg2002_licheervnano_sd_defconfig    |   1 +
- .../cvitek/SG200X/overlay/etc/init.d/S31slip  |  81 +++++++++++++
- .../SG200X/overlay/etc/rnsbox/slip.conf       |  26 ++++
+ .../cvitek/SG200X/overlay/etc/init.d/S31slip  |  81 +++++++
+ .../SG200X/overlay/etc/rnsbox/slip.conf       |  26 +++
  .../cvitek_SG200X_musl_riscv64_defconfig      |   2 +-
- .../rnsbox-portal/src/rnsbox_portal/app.py    | 111 +++++++++++++++++-
- .../rnsbox-portal/src/rnsbox_portal/store.py  |  57 +++++++++
- .../src/rnsbox_portal/sysinfo.py              |  25 +++-
- .../rnsbox_portal/templates/reticulum.html    |  45 +++++++
- 9 files changed, 419 insertions(+), 3 deletions(-)
+ .../rnsbox-portal/src/rnsbox_portal/app.py    | 208 +++++++++++++++++-
+ .../src/rnsbox_portal/static/style.css        |  80 +++++++
+ .../rnsbox-portal/src/rnsbox_portal/store.py  | 155 +++++++++++++
+ .../src/rnsbox_portal/sysinfo.py              | 140 +++++++++++-
+ .../rnsbox_portal/templates/dashboard.html    | 183 +++++++++++++--
+ .../rnsbox_portal/templates/reticulum.html    | 124 +++++++++++
+ 11 files changed, 1049 insertions(+), 35 deletions(-)
  create mode 100755 buildroot/board/cvitek/SG200X/overlay/etc/init.d/S31slip
  create mode 100644 buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/slip.conf
 
 diff --git a/README.RNSBox.md b/README.RNSBox.md
-index faec044cb..f09049cfe 100644
+index faec044cb..987ebeeae 100644
 --- a/README.RNSBox.md
 +++ b/README.RNSBox.md
-@@ -79,6 +79,80 @@ See [APPLYING.md](APPLYING.md) for the full flow.
+@@ -79,6 +79,90 @@ See [APPLYING.md](APPLYING.md) for the full flow.
    `build/clients-stick/`. Treat the clients disc as optional and review that
    directory before relying on it. The `lite` build does not need it.
  
@@ -68,20 +70,30 @@ index faec044cb..f09049cfe 100644
 +as a long-range sub-GHz Reticulum interface, connected over a 3-wire UART using
 +**SLIP** (IP-over-serial). Optional and **off by default**.
 +
-+### Wiring
++### Wiring — pinout
 +
-+Wire the modem to **UART1** = `/dev/ttyS1` — **not** `ttyS0`, which is the
-+serial console. UART1 comes out on pads `A28` (TX) and `A29` (RX); use the GND
-+pin next to them (right-hand header). Both sides are **3.3 V TTL** — do not
-+connect a 5 V or RS-232 line. Cross TX↔RX:
++Use **UART1** = `/dev/ttyS1` — **not** `ttyS0`, which is the Linux serial
++console. On the LicheeRV Nano-e, UART1 is the two pads labelled **`GPIOA28`**
++(SoC function `UART1_TX`) and **`GPIOA29`** (`UART1_RX`) on Sipeed's pinout
++diagram; take **GND** from any ground pad on the same header. All three lines are
++**3.3 V TTL** — never wire a 5 V or RS-232 level.
++
++TX and RX must **cross over** — the box's TX goes to the modem's RX and vice
++versa:
 +
 +```
-+  LicheeRV Nano-e (UART1 / ttyS1)          HaLow RNode modem
-+  ───────────────────────────────          ─────────────────
-+   A28  TX  ─────────────────────────────►  RX
-+   A29  RX  ◄─────────────────────────────  TX
-+   GND      ─────────────────────────────   GND    (required)
++  LicheeRV Nano-e (UART1 / ttyS1)                  HaLow RNode modem
++  ─────────────────────────────────                ─────────────────
++   GPIOA28  ·  UART1_TX  ─────────────────────────►  RX
++   GPIOA29  ·  UART1_RX  ◄─────────────────────────  TX
++   GND                   ────────────────────────── GND   (required)
 +```
++
++| Nano-e pad | Function | Wire to modem |
++|------------|----------|---------------|
++| `GPIOA28`  | UART1_TX | RX            |
++| `GPIOA29`  | UART1_RX | TX            |
++| `GND`      | ground   | GND           |
 +
 +Keep the leads short — at 1.5 Mbaud, long unshielded jumpers invite frame errors.
 +
@@ -282,7 +294,7 @@ index 6791defee..2dadfe45c 100644
  # BR2_PACKAGE_UTIL_LINUX_BFS is not set
  # BR2_PACKAGE_UTIL_LINUX_CAL is not set
 diff --git a/buildroot/package/rnsbox-portal/src/rnsbox_portal/app.py b/buildroot/package/rnsbox-portal/src/rnsbox_portal/app.py
-index 4aef9e280..6b93e7078 100644
+index 4aef9e280..8f58d5648 100644
 --- a/buildroot/package/rnsbox-portal/src/rnsbox_portal/app.py
 +++ b/buildroot/package/rnsbox-portal/src/rnsbox_portal/app.py
 @@ -1,12 +1,16 @@
@@ -303,12 +315,70 @@ index 4aef9e280..6b93e7078 100644
  )
  
  from . import auth, donate, store, sysinfo, updatecheck, wifi
-@@ -244,8 +248,44 @@ def create_app():
+@@ -52,6 +56,13 @@ def _apply_routing():
+ 
+ def create_app():
+     app = Flask(__name__, template_folder="templates", static_folder="static")
++    # /var/log is a small (512 KB) tmpfs on this board. Werkzeug logs every
++    # request; a client that polls the portal (e.g. the proxied modem web UI
++    # refreshing ~1/s via /modem/api/*) would flood that log and fill the
++    # tmpfs, taking the portal down. Quiet the per-request access log — real
++    # errors and warnings still surface.
++    import logging
++    logging.getLogger("werkzeug").setLevel(logging.WARNING)
+     app.config["SECRET_KEY"] = _load_or_create_secret()
+     app.config["SESSION_COOKIE_HTTPONLY"] = True
+     app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+@@ -93,8 +104,30 @@ def create_app():
+             net=sysinfo.network_summary(),
+             wan=store.read_wan(),
+             update=updatecheck.display_state(),
++            slip_on=store.read_slip_conf().get("enabled_bool"),
+         )
+ 
++    @app.route("/dashboard/data")
++    @login_required
++    def dashboard_data():
++        # Compact JSON of just the VOLATILE dashboard fields, for the client-side
++        # auto-refresh. Far cheaper than re-rendering the whole page: no Jinja, no
++        # static re-fetch, and it reuses the now-memoised installed_version() +
++        # single-`ip`-call network_summary(). The HaLow card refreshes itself via
++        # its own /reticulum/halow fetch.
++        from flask import jsonify
++        net = sysinfo.network_summary()
++        wan = store.read_wan()
++        return jsonify({
++            "sys": sysinfo.summary(),
++            "rnsd": sysinfo.rnsd_status(),
++            "wan_if": net["ifaces"].get(wan, {}),
++            "lan_if": net["ifaces"].get("usb0", {}),
++            "gateway": net["default_gateway"],
++            "dns": net["dns"],
++            "update": updatecheck.display_state(),
++        })
++
+     # ---- network ----
+ 
+     @app.route("/network")
+@@ -236,6 +269,11 @@ def create_app():
+         if upd.get("checked_at"):
+             upd["checked_human"] = time.strftime(
+                 "%Y-%m-%d %H:%M UTC", time.gmtime(upd["checked_at"]))
++        slip_conf = store.read_slip_conf()
++        # Does the config already route through the modem? Gates the card's
++        # "Add to rnsd config" quick-add button (shown only when it's absent).
++        halow_in_config = store.reticulum_has_tcp_client(
++            slip_conf.get("peer_ip") or "192.168.7.2", 8001)
+         return render_template(
+             "reticulum.html",
+             rnsd=sysinfo.rnsd_status(),
+@@ -244,8 +282,47 @@ def create_app():
              rns_version=updatecheck.installed_version(),
              update=upd,
              auto_update=store.read_update_check(),
-+            slip=store.read_slip_conf(),
++            slip=slip_conf,
 +            slip_status=sysinfo.slip_status(),
++            halow_in_config=halow_in_config,
          )
  
 +    @app.route("/reticulum/slip", methods=["POST"])
@@ -338,8 +408,10 @@ index 4aef9e280..6b93e7078 100644
 +            flash(f"SLIP saved, but reload failed: {e}", "error")
 +            return redirect(url_for("reticulum"))
 +        if cfg["enabled"] == "yes":
-+            flash("SLIP link enabled on %s @ %s baud. Add a TCPClientInterface "
-+                  "to %s:4242 in the config below to use it." %
++            flash("SLIP link enabled on %s @ %s baud. Once the modem is "
++                  "reachable, use “Add to rnsd config” on the HaLow "
++                  "card below to route Reticulum through it "
++                  "(TCPClientInterface → %s:8001)." %
 +                  (cfg["device"], cfg["baud"], cfg["peer_ip"]), "success")
 +        else:
 +            flash("SLIP link disabled.", "success")
@@ -348,7 +420,57 @@ index 4aef9e280..6b93e7078 100644
      @app.route("/reticulum/autorestart", methods=["POST"])
      @login_required
      def reticulum_autorestart():
-@@ -552,4 +592,73 @@ def create_app():
+@@ -321,6 +398,49 @@ def create_app():
+         from flask import jsonify
+         return jsonify(sysinfo.rnsd_status(with_raw=True))
+ 
++    @app.route("/reticulum/halow")
++    @login_required
++    def reticulum_halow():
++        # AJAX endpoint: live HaLow-modem stats pulled over SLIP. Fetched
++        # async by both the dashboard summary card and the Reticulum-tab SLIP
++        # card so a slow/absent modem never blocks a page render.
++        from flask import jsonify
++        return jsonify(sysinfo.halow_status(store.read_slip_conf()))
++
++    @app.route("/reticulum/halow/add", methods=["POST"])
++    @login_required
++    def reticulum_halow_add():
++        # One-click: add the HaLow RNode modem to the Reticulum config as a
++        # TCPClientInterface named after the modem's own hostname, then restart
++        # rnsd. The card shows this only when the modem is reachable over SLIP
++        # but no such interface is configured yet.
++        slip = store.read_slip_conf()
++        peer = (slip.get("peer_ip") or "192.168.7.2").strip()
++        name = request.form.get("iface_name", "").strip()
++        try:
++            port = int(request.form.get("iface_port") or "8001")
++        except ValueError:
++            port = 8001
++        if not (1 <= port <= 65535):
++            port = 8001
++        # Fall back to querying the modem for its hostname if the browser
++        # didn't supply it (JS disabled), then to a sensible default in store.
++        if not name:
++            info = sysinfo.halow_status(slip)
++            name = ((info.get("device") or {}).get("hostname") or "").strip()
++        ok, msg = store.add_halow_interface(name, peer, port)
++        if ok:
++            subprocess.run([RNSD_INIT, "restart"], check=False, timeout=10)
++            flash("Added HaLow interface “%s” (TCPClientInterface "
++                  "→ %s:%d) and restarted rnsd." % (msg, peer, port),
++                  "success")
++        elif msg == "already":
++            flash("That HaLow interface is already in the Reticulum config.",
++                  "success")
++        else:
++            flash("Couldn't add the HaLow interface: %s." % msg, "error")
++        return redirect(url_for("reticulum"))
++
+     @app.route("/reticulum/config", methods=["POST"])
+     @login_required
+     def reticulum_config_save():
+@@ -552,4 +672,90 @@ def create_app():
          flash(f"WiFi mode set to {mode}", "success")
          return redirect(url_for("wifi_page"))
  
@@ -421,20 +543,140 @@ index 4aef9e280..6b93e7078 100644
 +                            status=502, mimetype="application/json")
 +        return Response(data, mimetype=rct)
 +
++    # Pre-compile the page templates at startup (boot) so the FIRST visit to a
++    # page never pays Jinja's one-time compile cost (~0.5 s per template on the
++    # C906). Best-effort — a template that isn't found just isn't pre-warmed.
++    for _t in ("base.html", "login.html", "dashboard.html", "network.html",
++               "reticulum.html", "settings.html", "wifi.html", "donate.html"):
++        try:
++            app.jinja_env.get_template(_t)
++        except Exception:
++            pass
++
++    # Startup objects (interpreter, Flask, compiled templates) live for the whole
++    # process and never become garbage — move them out of GC's scan set so the
++    # periodic generational collections during request handling stay cheap.
++    import gc
++    gc.collect()
++    gc.freeze()
++
      return app
+diff --git a/buildroot/package/rnsbox-portal/src/rnsbox_portal/static/style.css b/buildroot/package/rnsbox-portal/src/rnsbox_portal/static/style.css
+index 32a29cbfe..599bcf43e 100644
+--- a/buildroot/package/rnsbox-portal/src/rnsbox_portal/static/style.css
++++ b/buildroot/package/rnsbox-portal/src/rnsbox_portal/static/style.css
+@@ -94,6 +94,13 @@ strong { font-weight: 600; }
+   padding: 18px 20px;
+   margin-bottom: 18px;
+ }
++.dash-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin: 0 0 6px; }
++.dash-head h2 { margin: 0; }
++.autoref { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--muted); }
++.autoref label { display: flex; align-items: center; gap: 6px; margin: 0; }
++.autoref select { padding: 3px 6px; }
++#autoref-status { font-variant-numeric: tabular-nums; }
++
+ .cards {
+   display: grid;
+   grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+@@ -214,6 +221,11 @@ button:hover, .btn:hover { background: #f1f5f9; text-decoration: none; }
+   border-color: var(--err);
+ }
+ .btn-danger:hover { background: var(--err); color: #fff; }
++/* The `hidden` attribute must always win — even over author display rules
++   like form.inline below. Without this reset, a JS-toggled hidden form (e.g.
++   the HaLow "Add to rnsd config" button) stays visible because form.inline's
++   `display: inline` outranks the browser's built-in [hidden] { display:none }. */
++[hidden] { display: none !important; }
+ form.inline { display: inline; }
+ 
+ .row-form {
+@@ -371,3 +383,71 @@ img.qr {
+ textarea.ntp-servers { min-height: 64px; max-width: 360px; }
+ .time-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+ form.ntp-restart { margin-top: 8px; }
++
++/* ---- HaLow modem (dashboard summary + Reticulum live block) ---- */
++.cardhead { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
++.cardhead h3 { margin: 0; }
++.cardfoot { margin-top: 12px; margin-bottom: 0; }
++.val { font-family: var(--mono); font-size: 12.5px; }
++.mono { font-family: var(--mono); font-size: 11.5px; }
++.dim { color: var(--muted); }
++.sig-g { color: var(--ok);   font-weight: 600; }
++.sig-a { color: var(--warn); font-weight: 600; }
++.sig-r { color: var(--err);  font-weight: 600; }
++.halow-live {
++  background: #f6fbf9;
++  border: 1px solid #cdeee2;
++  border-radius: 4px;
++  padding: 10px 12px;
++  margin: 10px 0;
++  font-size: 13px;
++  line-height: 1.7;
++}
++.halow-live .hrow { display: flex; flex-wrap: wrap; gap: 4px 16px; }
++.halow-live .k { color: var(--muted); }
++/* Clean single-column key/value layout for the live modem card. */
++.halow-live table.halow-kv { background: transparent; }
++.halow-live table.halow-kv th { width: 128px; font-weight: 600; color: var(--muted); white-space: nowrap; }
++.halow-live table.halow-kv td { color: var(--text); }
++.halow-live table.halow-kv tr + tr th,
++.halow-live table.halow-kv tr + tr td { border-top: 1px solid #d9ece4; }
++/* Airtime / channel-utilisation mini bar. */
++.hbar { display: inline-block; width: 90px; height: 7px; border-radius: 4px;
++  background: #dfeee7; overflow: hidden; vertical-align: middle; }
++.hbar > span { display: block; height: 100%; background: var(--ok); }
++/* Card action row: "Open modem web UI" + the quick-add form (side by side). */
++.halow-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 12px 0 0; }
++.halow-actions form.inline { margin: 0; }
++.halow-actions .btn, .halow-actions .btn-primary { margin: 0; }
++
++/* Full-width dashboard card: spans every column of the .cards auto-fit grid
++   so the HaLow modem becomes a horizontal stats strip below the square cards. */
++.card-wide { grid-column: 1 / -1; }
++/* Responsive metric-tile strip. auto-fit reflows the tiles from ~8 across on a
++   wide screen down to 1 on a phone; min-width:0 + overflow-wrap keep long values
++   (IPs, hostnames) inside their tile so the page never scrolls sideways. */
++.hstats { display: grid; grid-template-columns: repeat(auto-fit, minmax(155px, 1fr)); gap: 10px 12px; margin: 4px 0 2px; }
++.hstat { min-width: 0; padding: 9px 11px; background: #f6fbf9; border: 1px solid #cdeee2; border-radius: 5px; }
++.hstat-k { font-size: 10.5px; letter-spacing: .04em; text-transform: uppercase; color: var(--muted);
++  margin-bottom: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
++.hstat-v { font-size: 12.5px; line-height: 1.45; color: var(--text); overflow-wrap: anywhere; }
++.hstat-v .hbar { margin-bottom: 2px; }
++details.neigh { border: 1px solid var(--border); border-radius: 4px; margin: 0 0 10px; }
++details.neigh > summary {
++  cursor: pointer;
++  padding: 8px 12px;
++  font-weight: 600;
++  font-size: 13px;
++  color: var(--primary);
++  list-style: none;
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  user-select: none;
++}
++details.neigh > summary::-webkit-details-marker { display: none; }
++details.neigh > summary::after { content: "\25BE"; color: var(--muted); font-weight: 400; }
++details.neigh[open] > summary::after { content: "\25B4"; }
++details.neigh > summary:hover { background: #fafbfc; }
++details.neigh .body { border-top: 1px solid var(--border); }
++details.neigh .data { margin: 0; }
 diff --git a/buildroot/package/rnsbox-portal/src/rnsbox_portal/store.py b/buildroot/package/rnsbox-portal/src/rnsbox_portal/store.py
-index 69f2259e0..dd5661357 100644
+index 69f2259e0..33df6ca3e 100644
 --- a/buildroot/package/rnsbox-portal/src/rnsbox_portal/store.py
 +++ b/buildroot/package/rnsbox-portal/src/rnsbox_portal/store.py
-@@ -12,6 +12,7 @@ OP_FILE = f"{CONF_DIR}/openports.conf"
+@@ -12,6 +12,8 @@ OP_FILE = f"{CONF_DIR}/openports.conf"
  WAN_FILE = f"{CONF_DIR}/wan.conf"
  CRON_FILE = f"{CONF_DIR}/cron.conf"
  NTP_FILE = "/etc/ntp.conf"          # ntp package's config; we edit its `server` lines
 +SLIP_FILE = f"{CONF_DIR}/slip.conf"
++RETICULUM_FILE = "/etc/reticulum/config"
  
  
  def _read_lines(path):
-@@ -335,3 +336,59 @@ def write_ntp_servers(servers):
+@@ -335,3 +337,156 @@ def write_ntp_servers(servers):
          new.append("")
      _write_lines(NTP_FILE, new + kept)
      return clean
@@ -494,12 +736,140 @@ index 69f2259e0..dd5661357 100644
 +        f"peer_ip={peer_ip}",
 +    ])
 +    return True, ""
++
++
++# ---- Reticulum config (add the HaLow RNode modem as a TCPClientInterface) ----
++#
++# The modem runs an RNode TCP server (default :8001) reachable over the SLIP
++# link. To route Reticulum through it, rnsd needs a TCPClientInterface pointing
++# at the modem. The "Add to rnsd config" button on the Reticulum tab drops that
++# block in for the operator instead of making them hand-edit the config.
++
++def _sanitize_iface_name(name):
++    """A Reticulum section header [[name]] can hold spaces but not brackets or
++    newlines. Strip those, collapse whitespace, and cap the length."""
++    name = (name or "").replace("[", "").replace("]", "")
++    name = " ".join(name.split())
++    return name[:48]
++
++
++def _reticulum_iface_names():
++    """The [[interface]] section names present in the reticulum config."""
++    names = []
++    for ln in _read_lines(RETICULUM_FILE):
++        s = ln.strip()
++        if s.startswith("[[") and not s.startswith("[[[") and s.endswith("]]"):
++            names.append(s[2:-2].strip())
++    return names
++
++
++def reticulum_has_tcp_client(target_host, target_port):
++    """True if the reticulum config already declares a TCPClientInterface
++    pointing at target_host:target_port (so we never add a duplicate)."""
++    host, port = str(target_host).strip(), str(target_port).strip()
++    is_tcp = False
++    cur_host = cur_port = None
++    for ln in _read_lines(RETICULUM_FILE):
++        s = ln.strip()
++        if s.startswith("["):            # any section header ends the current block
++            is_tcp = False
++            cur_host = cur_port = None
++            continue
++        if not s or s.startswith("#") or "=" not in s:
++            continue
++        k, _, v = s.partition("=")
++        k = k.strip().lower()
++        v = v.split("#", 1)[0].strip()
++        if k == "type":
++            is_tcp = (v == "TCPClientInterface")
++        elif k == "target_host":
++            cur_host = v
++        elif k == "target_port":
++            cur_port = v
++        if is_tcp and cur_host == host and cur_port == port:
++            return True
++    return False
++
++
++def add_halow_interface(name, target_host, target_port=8001):
++    """Append a TCPClientInterface for the HaLow RNode modem to the reticulum
++    config. Returns (ok, message): message is the interface name on success,
++    "already" if that target is already configured, else an error string.
++    Idempotent on the modem target; the name is made unique if it collides."""
++    host = str(target_host).strip()
++    if not _valid_ipv4(host):
++        return False, "bad modem IP"
++    try:
++        port = int(target_port)
++    except (TypeError, ValueError):
++        return False, "bad port"
++    if not (1 <= port <= 65535):
++        return False, "bad port"
++    lines = _read_lines(RETICULUM_FILE)
++    if not lines:
++        return False, "no reticulum config"
++    if reticulum_has_tcp_client(host, port):
++        return False, "already"
++    name = _sanitize_iface_name(name) or "RNode-Halow"
++    existing = _reticulum_iface_names()
++    if name in existing:
++        base, i = name, 2
++        while name in existing:
++            name = f"{base} {i}"
++            i += 1
++    while lines and lines[-1].strip() == "":   # trim trailing blanks
++        lines.pop()
++    # Appended at end-of-file, so it nests under the last top-level section
++    # ([interfaces] in the shipped config). 2-space header / 4-space keys match
++    # the existing indentation style.
++    block = [
++        "",
++        "  # HaLow RNode modem over the SLIP link — added from the portal.",
++        f"  [[{name}]]",
++        "    type = TCPClientInterface",
++        "    enabled = yes",
++        f"    target_host = {host}",
++        f"    target_port = {port}",
++    ]
++    _write_lines(RETICULUM_FILE, lines + block)
++    return True, name
 diff --git a/buildroot/package/rnsbox-portal/src/rnsbox_portal/sysinfo.py b/buildroot/package/rnsbox-portal/src/rnsbox_portal/sysinfo.py
-index 9471b6de5..5a295678a 100644
+index 9471b6de5..0791a7e2b 100644
 --- a/buildroot/package/rnsbox-portal/src/rnsbox_portal/sysinfo.py
 +++ b/buildroot/package/rnsbox-portal/src/rnsbox_portal/sysinfo.py
-@@ -117,9 +117,23 @@ def network_summary():
+@@ -87,14 +87,19 @@ def _run(cmd, timeout=2):
+         return ""
+ 
+ 
+-def _ip_addrs(dev):
+-    out = _run(["ip", "-4", "addr", "show", "dev", dev])
+-    addrs = []
+-    for ln in out.splitlines():
+-        ln = ln.strip()
+-        if ln.startswith("inet "):
+-            addrs.append(ln.split()[1])
+-    return addrs
++def _all_ipv4_addrs():
++    """Map iface -> ['addr/prefix', ...] from ONE `ip -o -4 addr` call.
++
++    A subprocess spawn costs ~30-40 ms on the C906, so gathering every
++    interface's address in a single call (instead of one `ip addr show dev X`
++    per interface) is the bulk of network_summary()'s speedup."""
++    m = {}
++    for ln in _run(["ip", "-o", "-4", "addr", "show"]).splitlines():
++        parts = ln.split()
++        # "2: eth0    inet 192.168.3.83/24 brd 192.168.3.255 scope global ..."
++        if len(parts) >= 4 and parts[2] == "inet":
++            m.setdefault(parts[1], []).append(parts[3])
++    return m
+ 
+ 
+ def _human_bytes(s):
+@@ -115,11 +120,26 @@ def network_summary():
+         dev_list = sorted(d for d in os.listdir("/sys/class/net") if d != "lo")
+     except FileNotFoundError:
          dev_list = []
++    addr_map = _all_ipv4_addrs()          # one subprocess for every interface
      for d in dev_list:
          base = f"/sys/class/net/{d}"
 +        state = _slurp(f"{base}/operstate").strip()
@@ -517,13 +887,14 @@ index 9471b6de5..5a295678a 100644
 +            if _iff_up and _slurp(f"{base}/carrier").strip() == "1":
 +                state = "up"
          ifaces[d] = {
-             "addrs": _ip_addrs(d),
+-            "addrs": _ip_addrs(d),
 -            "state": _slurp(f"{base}/operstate").strip(),
++            "addrs": addr_map.get(d, []),
 +            "state": state,
              "mac": _slurp(f"{base}/address").strip(),
              "mtu": _slurp(f"{base}/mtu").strip(),
              "rx": _human_bytes(_slurp(f"{base}/statistics/rx_bytes").strip()),
-@@ -221,3 +235,12 @@ def dnsmasq_leases():
+@@ -221,3 +241,103 @@ def dnsmasq_leases():
          except FileNotFoundError:
              continue
      return out
@@ -536,20 +907,351 @@ index 9471b6de5..5a295678a 100644
 +        return {"present": False, "up": False}
 +    state = _slurp("/sys/class/net/sl0/operstate").strip()
 +    return {"present": True, "up": state not in ("down", "")}
++
++
++def _oper_up(dev):
++    """True if a netdev is operationally up. Carrierless-by-design interfaces
++    (SLIP, tun) sit at operstate 'unknown' even when up, so treat an admin-up
++    'unknown' interface that has carrier as up (see network_summary)."""
++    base = "/sys/class/net/" + dev
++    if not os.path.isdir(base):
++        return False
++    st = _slurp(base + "/operstate").strip()
++    if st == "up":
++        return True
++    if st == "unknown":
++        try:
++            iff_up = int(_slurp(base + "/flags", "0").strip() or "0", 16) & 0x1
++        except ValueError:
++            iff_up = 0
++        return bool(iff_up) and _slurp(base + "/carrier", "").strip() == "1"
++    return False
++
++
++def _modem_api(peer, name, timeout=2.5):
++    """GET one JSON endpoint from the HaLow modem's HTTP API over SLIP.
++    Returns the parsed dict, or None on any error/timeout (fails soft)."""
++    import json
++    import urllib.request
++    try:
++        req = urllib.request.Request(
++            "http://%s/api/%s" % (peer, name),
++            headers={"Accept-Encoding": "identity"})
++        with urllib.request.urlopen(req, timeout=timeout) as r:
++            return json.loads(r.read().decode("utf-8", "replace"))
++    except Exception:  # noqa: BLE001 - modem down / SLIP not up / bad json
++        return None
++
++
++def halow_status(slip):
++    """Live stats for an external WiFi-HaLow (RNode) modem, pulled over the
++    SLIP link. Never raises. `slip` is the store.read_slip_conf() dict. The
++    dashboard summary card and the Reticulum-tab live block both render this
++    (fetched async so a slow/absent modem never blocks a page)."""
++    peer = (slip.get("peer_ip") or "192.168.7.2").strip()
++    out = {
++        "enabled": bool(slip.get("enabled_bool")),
++        "peer": peer,
++        "local": (slip.get("local_ip") or "").strip(),
++        "sl0_up": _oper_up("sl0"),
++        "reachable": False,
++        "neighbours": [],
++    }
++    if not out["enabled"] or not out["sl0_up"]:
++        return out
++
++    stat = _modem_api(peer, "get_stat")
++    allc = _modem_api(peer, "get_all")
++    near = _modem_api(peer, "get_nearby_modems")
++    if stat is None and allc is None:
++        return out                      # sl0 up but modem not answering
++    out["reachable"] = True
++
++    h = (allc or {}).get("halow", {})
++    out["radio"] = {"freq": h.get("central_freq"), "bw": h.get("bandwidth"),
++                    "mcs": h.get("mcs_index"), "power": h.get("power_dbm")}
++    tcp = (allc or {}).get("tcp", {})
++    conn = tcp.get("connected")
++    out["tcp_port"] = tcp.get("port")
++    out["rnsd_up"] = bool(conn and conn != "no connection")
++    out["connected"] = conn
++
++    d = (stat or {}).get("device", {})
++    r = (stat or {}).get("radio", {})
++    out["device"] = {"temp": d.get("chip_temp"), "fw": d.get("ver"),
++                     "uptime": d.get("uptime"), "hostname": d.get("hostname")}
++    out["stats"] = {"airtime": r.get("airtime"), "ch_util": r.get("ch_util"),
++                    "noise": r.get("bg_pwr_dbm"), "rx_speed": r.get("rx_speed"),
++                    "tx_speed": r.get("tx_speed"), "rx_bytes": r.get("rx_bytes"),
++                    "tx_bytes": r.get("tx_bytes")}
++
++    peers = []
++    for n in ((near or {}).get("d") or []):
++        peers.append({"mac": n.get("mac"), "rssi": n.get("rx_rssi"),
++                      "snr": n.get("rx_snr"), "rx_mcs": n.get("rx_mcs"),
++                      "tx_mcs": n.get("tx_mcs"), "tx_acked": n.get("tx_acked"),
++                      "tx_frames": n.get("tx_frames"), "tx_loss": n.get("tx_loss_pct"),
++                      "age": n.get("rx_last_age")})
++    out["neighbours"] = peers
++    if peers:
++        out["best"] = max(
++            peers,
++            key=lambda p: p["rssi"] if isinstance(p["rssi"], (int, float)) else -9999)
++    return out
+diff --git a/buildroot/package/rnsbox-portal/src/rnsbox_portal/templates/dashboard.html b/buildroot/package/rnsbox-portal/src/rnsbox_portal/templates/dashboard.html
+index 795f3bf80..396f2cc2f 100644
+--- a/buildroot/package/rnsbox-portal/src/rnsbox_portal/templates/dashboard.html
++++ b/buildroot/package/rnsbox-portal/src/rnsbox_portal/templates/dashboard.html
+@@ -1,7 +1,20 @@
+ {% extends "base.html" %}
+ {% block title %}Dashboard{% endblock %}
+ {% block content %}
+-<h2>Dashboard</h2>
++<div class="dash-head">
++  <h2>Dashboard</h2>
++  <div class="autoref">
++    <span class="muted" id="autoref-status"></span>
++    <label>Auto-refresh
++      <select id="autoref">
++        <option value="0">Off</option>
++        <option value="5">5s</option>
++        <option value="10">10s</option>
++        <option value="15">15s</option>
++      </select>
++    </label>
++  </div>
++</div>
+ 
+ <div class="cards">
+ 
+@@ -10,21 +23,21 @@
+     <table class="kv">
+       <tr><th>Hostname</th><td>{{ hostname }}</td></tr>
+       <tr><th>Kernel</th><td>{{ sys.kernel }}</td></tr>
+-      <tr><th>Uptime</th><td>{{ sys.uptime }}</td></tr>
+-      <tr><th>Load avg</th><td>{{ sys.load|join(' / ') }}</td></tr>
++      <tr><th>Uptime</th><td id="d-uptime">{{ sys.uptime }}</td></tr>
++      <tr><th>Load avg</th><td id="d-load">{{ sys.load|join(' / ') }}</td></tr>
+     </table>
+     {% set m = sys.mem %}
+     {% if m.get('total_mb') %}
+     {% set pct = m.get('used_pct', 0) %}
+     <div class="meter-label">
+       <span>RAM</span>
+-      <span>{{ m.used_mb }} / {{ m.total_mb }} MB &middot; {{ m.avail_mb }} MB free</span>
++      <span id="d-ram-label">{{ m.used_mb }} / {{ m.total_mb }} MB &middot; {{ m.avail_mb }} MB free</span>
+     </div>
+     <div class="meter">
+       <div class="meter-fill {{ 'crit' if pct >= 90 else 'warn' if pct >= 75 else 'ok' }}"
+-           style="width: {{ pct }}%"></div>
++           id="d-ram-fill" style="width: {{ pct }}%"></div>
+     </div>
+-    <p class="muted" style="margin-top:4px">
++    <p class="muted" id="d-ram-note" style="margin-top:4px">
+       {{ pct }}% used &middot; {{ m.buffcache_mb }} MB buff/cache (reclaimable)
+     </p>
+     {% else %}
+@@ -36,39 +49,38 @@
+     <h3>WAN ({{ wan }})</h3>
+     {% set wif = net.ifaces.get(wan, {}) %}
+     <table class="kv">
+-      <tr><th>State</th><td>
++      <tr><th>State</th><td id="d-wan-state">
+         {% if wif.state == 'up' %}<span class="badge ok">UP</span>{% else %}<span class="badge err">{{ wif.state or 'DOWN' }}</span>{% endif %}
+       </td></tr>
+-      <tr><th>Address</th><td>{{ wif.addrs|join(', ') if wif.addrs else '(none)' }}</td></tr>
+-      <tr><th>Gateway</th><td>{{ net.default_gateway or '(none)' }}</td></tr>
+-      <tr><th>DNS</th><td>{{ net.dns|join(', ') if net.dns else '(none)' }}</td></tr>
+-      <tr><th>RX / TX</th><td>{{ wif.rx or '0' }} / {{ wif.tx or '0' }}</td></tr>
++      <tr><th>Address</th><td id="d-wan-addr">{{ wif.addrs|join(', ') if wif.addrs else '(none)' }}</td></tr>
++      <tr><th>Gateway</th><td id="d-wan-gw">{{ net.default_gateway or '(none)' }}</td></tr>
++      <tr><th>DNS</th><td id="d-wan-dns">{{ net.dns|join(', ') if net.dns else '(none)' }}</td></tr>
++      <tr><th>RX / TX</th><td id="d-wan-rxtx">{{ wif.rx or '0' }} / {{ wif.tx or '0' }}</td></tr>
+     </table>
+   </section>
+ 
++  {% set lif = net.ifaces.get('usb0', {}) %}
++  {% if lif.state == 'up' %}
++  {# Only shown when a USB host is actually tethered. On a WiFi-only (W) box or
++     an untethered unit usb0 has no carrier, and the card isn't worth showing. #}
+   <section class="card">
+     <h3>LAN (usb0)</h3>
+-    {% set lif = net.ifaces.get('usb0', {}) %}
+     <table class="kv">
+-      <tr><th>State</th><td>
+-        {% if lif.state == 'up' %}<span class="badge ok">UP</span>{% else %}<span class="badge warn">{{ lif.state or 'DOWN' }}</span>{% endif %}
+-      </td></tr>
+-      <tr><th>Address</th><td>{{ lif.addrs|join(', ') if lif.addrs else '(none)' }}</td></tr>
++      <tr><th>State</th><td id="d-lan-state"><span class="badge ok">UP</span></td></tr>
++      <tr><th>Address</th><td id="d-lan-addr">{{ lif.addrs|join(', ') if lif.addrs else '(none)' }}</td></tr>
+       <tr><th>MAC</th><td>{{ lif.mac }}</td></tr>
+-      <tr><th>RX / TX</th><td>{{ lif.rx or '0' }} / {{ lif.tx or '0' }}</td></tr>
++      <tr><th>RX / TX</th><td id="d-lan-rxtx">{{ lif.rx or '0' }} / {{ lif.tx or '0' }}</td></tr>
+     </table>
+   </section>
++  {% endif %}
+ 
+   <section class="card">
+     <h3>Reticulum</h3>
+     <table class="kv">
+-      <tr><th>Status</th><td>
+-        {% if rnsd.running %}<span class="badge ok">RUNNING</span> (pid {{ rnsd.pid }}){% else %}<span class="badge err">STOPPED</span>{% endif %}
++      <tr><th>Status</th><td id="d-rnsd-status">
++        {% if rnsd.running %}<span class="badge ok">RUNNING</span> (pid {{ rnsd.pid }}){% if rnsd.rss_mb %} &middot; {{ rnsd.rss_mb }} MB RSS{% endif %}{% else %}<span class="badge err">STOPPED</span>{% endif %}
+       </td></tr>
+-      {% if rnsd.running and rnsd.rss_mb %}
+-      <tr><th>rnsd RAM</th><td>{{ rnsd.rss_mb }} MB RSS</td></tr>
+-      {% endif %}
+-      <tr><th>Version</th><td>
++      <tr><th>Version</th><td id="d-rnsd-version">
+         Reticulum (rnsd) <strong>{{ update.installed or 'unknown' }}</strong>
+         {% if update.update_available %}<span class="badge warn">update available: {{ update.latest }}</span>
+         {% elif update.latest and not update.error %}<span class="badge ok">up to date</span>{% endif %}
+@@ -77,5 +89,130 @@
+     <p><a class="btn" href="{{ url_for('reticulum') }}">Manage →</a></p>
+   </section>
+ 
++  {% if slip_on %}
++  <section class="card card-wide" id="halow-card">
++    <div class="cardhead"><h3>HaLow modem</h3><span class="badge" id="halow-badge">…</span></div>
++    <div id="halow-body"><p class="muted">Loading modem status…</p></div>
++    <p class="cardfoot"><a class="btn" href="/modem/" target="_blank" rel="noopener">Open modem web UI →</a></p>
++  </section>
++  {% endif %}
++
+ </div>
++
++{% if slip_on %}
++<script>
++(function(){
++  function esc(s){ return (''+(s==null?'':s)).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];}); }
++  function num(v){ if(v==null) return null; var m=(''+v).match(/-?\d+(\.\d+)?/); return m?parseFloat(m[0]):null; }
++  function unit(v,u){ if(v==null||v==='') return '?'; return /^-?\d+(\.\d+)?$/.test(''+v)? v+' '+u : esc(v); }
++  function sig(v,u,g,a){ if(v==null) return '<span class="muted">—</span>'; var c=v>=g?'sig-g':(v>=a?'sig-a':'sig-r'); return '<span class="'+c+'">'+v+' '+u+'</span>'; }
++  function noise(v){ var n=num(v); if(n==null) return '<span class="muted">—</span>'; var c=n<=-80?'sig-g':(n<=-70?'sig-a':'sig-r'); return '<span class="'+c+'">'+n+' dBm</span>'; }
++  function tile(k,v){ return '<div class="hstat"><div class="hstat-k">'+k+'</div><div class="hstat-v">'+v+'</div></div>'; }
++  function load(){
++    var badge=document.getElementById('halow-badge'), body=document.getElementById('halow-body');
++    if(!badge) return;
++    return fetch('/reticulum/halow').then(function(r){return r.json();}).then(function(d){
++      if(!d.enabled){ var c=document.getElementById('halow-card'); if(c) c.hidden=true; return; }
++      if(!d.reachable){
++        badge.className='badge '+(d.sl0_up?'err':'warn');
++        badge.textContent=d.sl0_up?'unreachable':'sl0 down';
++        body.innerHTML='<p class="muted">'+(d.sl0_up?'Modem not answering over SLIP.':'SLIP link (sl0) is down.')+'</p>';
++        return;
++      }
++      badge.className='badge ok'; badge.textContent='link up';
++      var rd=d.radio||{}, st=d.stats||{}, dv=d.device||{}, b=d.best, ns=d.neighbours||[];
++      var name=(dv.hostname||'RNode-Halow'), port=(d.tcp_port||8001);
++      var air=num(st.airtime);
++      var airbar = air!=null ? '<span class="hbar"><span style="width:'+Math.max(0,Math.min(100,air))+'%"></span></span> ' : '';
++      var mcs = (rd.mcs==null||rd.mcs==='') ? 'MCS?' : 'MCS'+esc((''+rd.mcs).replace(/^mcs\s*/i,''));
++      var fw = (dv.fw ? esc((''+dv.fw).split(' ')[0]) : '?');
++      var tiles=[
++        tile('Link (sl0)','<span class="badge ok">UP</span> <span class="val">'+esc(d.local)+' &rarr; '+esc(d.peer)+'</span>'),
++        tile('rnsd interface', d.rnsd_up
++          ? '<span class="badge ok">UP</span> <span class="val">'+esc(name)+' &rarr; :'+esc(port)+'</span>'
++          : '<span class="badge warn">DOWN</span> <span class="val">'+esc(name)+'</span>'),
++        tile('Radio','<span class="val">'+unit(rd.freq,'MHz')+' · '+unit(rd.bw,'MHz')+' · '+mcs+'</span>'),
++        tile('TX power','<span class="val">'+unit(rd.power,'dBm')+'</span>'),
++        tile('Airtime', airbar+'<span class="val">'+esc(st.airtime||'?')+'</span>'),
++        tile('Ch. util','<span class="val">'+esc(st.ch_util||'?')+'</span>'),
++        tile('Noise floor', noise(st.noise)),
++        tile('Throughput','<span class="val">&darr; '+esc(st.rx_speed||'?')+' · &uarr; '+esc(st.tx_speed||'?')+'</span>'),
++        tile('Traffic','<span class="val">&darr; '+esc(st.rx_bytes||'?')+' · &uarr; '+esc(st.tx_bytes||'?')+'</span>'),
++        tile('Best peer', b?(sig(num(b.rssi),'dBm',-75,-88)+' · '+sig(num(b.snr),'dB',10,5)):'<span class="muted">none heard</span>'),
++        tile('Neighbours','<span class="val">'+ns.length+'</span>'),
++        tile('Modem','<span class="val">'+esc(dv.temp||'?')+' · fw '+fw+' · up '+esc(dv.uptime||'?')+'</span>'),
++      ];
++      body.innerHTML='<div class="hstats">'+tiles.join('')+'</div>';
++    }).catch(function(){ badge.className='badge warn'; badge.textContent='error';
++      body.innerHTML='<p class="muted">Could not read modem status.</p>'; });
++  }
++  window.__loadHalow = load;
++  load();
++})();
++</script>
++{% endif %}
++
++<script>
++(function(){
++  function $(id){ return document.getElementById(id); }
++  function setText(id,t){ var e=$(id); if(e) e.textContent=t; }
++  function setHTML(id,h){ var e=$(id); if(e) e.innerHTML=h; }
++  function patch(d){
++    var s=d.sys||{}, m=s.mem||{}, wif=d.wan_if||{}, lif=d.lan_if||{}, rn=d.rnsd||{}, up=d.update||{};
++    setText('d-uptime', s.uptime||'');
++    setText('d-load', (s.load||[]).join(' / '));
++    if(m.total_mb){
++      var pct=m.used_pct||0;
++      setText('d-ram-label', m.used_mb+' / '+m.total_mb+' MB · '+m.avail_mb+' MB free');
++      var f=$('d-ram-fill'); if(f){ f.style.width=pct+'%'; f.className='meter-fill '+(pct>=90?'crit':pct>=75?'warn':'ok'); }
++      setText('d-ram-note', pct+'% used · '+m.buffcache_mb+' MB buff/cache (reclaimable)');
++    }
++    setHTML('d-wan-state', wif.state==='up'?'<span class="badge ok">UP</span>':'<span class="badge err">'+(wif.state||'DOWN')+'</span>');
++    setText('d-wan-addr', (wif.addrs&&wif.addrs.length)?wif.addrs.join(', '):'(none)');
++    setText('d-wan-gw', d.gateway||'(none)');
++    setText('d-wan-dns', (d.dns&&d.dns.length)?d.dns.join(', '):'(none)');
++    setText('d-wan-rxtx', (wif.rx||'0')+' / '+(wif.tx||'0'));
++    if($('d-lan-state')){
++      setHTML('d-lan-state', lif.state==='up'?'<span class="badge ok">UP</span>':'<span class="badge warn">'+(lif.state||'DOWN')+'</span>');
++      setText('d-lan-addr', (lif.addrs&&lif.addrs.length)?lif.addrs.join(', '):'(none)');
++      setText('d-lan-rxtx', (lif.rx||'0')+' / '+(lif.tx||'0'));
++    }
++    setHTML('d-rnsd-status', rn.running
++      ? '<span class="badge ok">RUNNING</span> (pid '+rn.pid+')'+(rn.rss_mb?' · '+rn.rss_mb+' MB RSS':'')
++      : '<span class="badge err">STOPPED</span>');
++    var vh='Reticulum (rnsd) <strong>'+(up.installed||'unknown')+'</strong>';
++    if(up.update_available) vh+=' <span class="badge warn">update available: '+up.latest+'</span>';
++    else if(up.latest && !up.error) vh+=' <span class="badge ok">up to date</span>';
++    setHTML('d-rnsd-version', vh);
++  }
++  function refreshData(){
++    return fetch('{{ url_for("dashboard_data") }}').then(function(r){return r.json();}).then(patch).catch(function(){});
++  }
++  var sel=$('autoref'), timer=null, KEY='rnsbox-autoref';
++  function tick(){
++    setText('autoref-status','updating…');
++    if(window.__loadHalow) window.__loadHalow();
++    refreshData().then(function(){
++      var t=new Date();
++      setText('autoref-status','updated '+t.toTimeString().slice(0,8));
++    });
++  }
++  function apply(sec){
++    if(timer){ clearInterval(timer); timer=null; }
++    if(sec>0){ timer=setInterval(tick, sec*1000); setText('autoref-status','every '+sec+'s'); }
++    else setText('autoref-status','');
++  }
++  if(sel){
++    var saved=0; try{ saved=parseInt(localStorage.getItem(KEY)||'0',10)||0; }catch(e){}
++    if([0,5,10,15].indexOf(saved)<0) saved=0;
++    sel.value=String(saved);
++    sel.addEventListener('change', function(){
++      var v=parseInt(sel.value,10)||0;
++      try{ localStorage.setItem(KEY, String(v)); }catch(e){}
++      apply(v);
++    });
++    apply(saved);
++  }
++})();
++</script>
+ {% endblock %}
 diff --git a/buildroot/package/rnsbox-portal/src/rnsbox_portal/templates/reticulum.html b/buildroot/package/rnsbox-portal/src/rnsbox_portal/templates/reticulum.html
-index 0202f8a1a..172532174 100644
+index 0202f8a1a..f07abfd39 100644
 --- a/buildroot/package/rnsbox-portal/src/rnsbox_portal/templates/reticulum.html
 +++ b/buildroot/package/rnsbox-portal/src/rnsbox_portal/templates/reticulum.html
-@@ -56,6 +56,51 @@
+@@ -56,6 +56,61 @@
    <pre class="log" id="rnstatus"><span class="muted">loading… (querying the rnsd instance, can take a few seconds)</span></pre>
  </section>
  
 +<section class="card">
 +  <h3>HaLow modem (SLIP)</h3>
 +  <p class="muted">Optional point-to-point serial link (<code>sl0</code>) to an external
-+  WiFi-HaLow RNode modem over a UART. When it's up, add a <code>TCPClientInterface</code>
-+  to the modem (peer address, port 4242) in the config editor below to use it as a
-+  Reticulum interface. Off by default.</p>
++  WiFi-HaLow RNode modem over a UART. When the modem is reachable, the
++  <strong>Add to rnsd config</strong> button below routes Reticulum through it
++  (a <code>TCPClientInterface</code> named after the modem's hostname). Off by default.</p>
 +
 +  <table class="kv">
 +    <tr><th>Link (sl0)</th><td>
@@ -561,10 +1263,20 @@ index 0202f8a1a..172532174 100644
 +  </table>
 +
 +  {% if slip.enabled_bool %}
-+  <p style="margin:10px 0 0">
++  <div id="halow-live" class="halow-live muted">Loading modem status…</div>
++  <details class="neigh" id="halow-neigh" hidden>
++    <summary>Neighbours heard (<span id="halow-ncount">0</span>)</summary>
++    <div class="body"><table class="data" id="halow-ntable"></table></div>
++  </details>
++  <div class="halow-actions">
 +    <a class="btn" href="{{ url_for('modem_ui') }}" target="_blank" rel="noopener">Open modem web UI &rarr;</a>
-+    <span class="muted">the modem's own config page, proxied through this portal login</span>
-+  </p>
++    <form method="post" action="{{ url_for('reticulum_halow_add') }}" class="inline" id="halow-add-form" hidden>
++      <input type="hidden" name="iface_name" id="halow-add-name" value="">
++      <input type="hidden" name="iface_port" id="halow-add-port" value="8001">
++      <button type="submit" class="btn-primary">+ Add to rnsd config</button>
++    </form>
++  </div>
++  <p class="muted" style="margin:6px 0 0">Full stats, graphs &amp; config live in the modem's own web page.</p>
 +  {% endif %}
 +
 +  <form method="post" action="{{ url_for('reticulum_slip') }}">
@@ -592,6 +1304,80 @@ index 0202f8a1a..172532174 100644
  <section class="card">
    <h3>/etc/reticulum/config</h3>
    <p class="muted">Hand-edit the rnsd configuration. Comments and interface declarations are passed verbatim to Reticulum. Click <em>Save</em> then <em>Restart rnsd</em> to apply.</p>
+@@ -85,4 +140,73 @@ function loadRnstatus(){
+ }
+ document.addEventListener('DOMContentLoaded', loadRnstatus);
+ </script>
++{% if slip.enabled_bool %}
++<script>
++(function(){
++  var live=document.getElementById('halow-live'), det=document.getElementById('halow-neigh');
++  var addForm=document.getElementById('halow-add-form');
++  var HALOW_IN_CONFIG = {{ 'true' if halow_in_config else 'false' }};
++  if(!live) return;
++  function esc(s){ return (''+(s==null?'':s)).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];}); }
++  function num(v){ if(v==null) return null; var m=(''+v).match(/-?\d+(\.\d+)?/); return m?parseFloat(m[0]):null; }
++  function unit(v,u){ if(v==null||v==='') return '?'; return /^-?\d+(\.\d+)?$/.test(''+v)? v+' '+u : esc(v); }
++  function sig(v,u,g,a){ if(v==null) return '<span class="muted">—</span>'; var c=v>=g?'sig-g':(v>=a?'sig-a':'sig-r'); return '<span class="'+c+'">'+v+' '+u+'</span>'; }
++  function noise(v){ var n=num(v); if(n==null) return '<span class="muted">—</span>'; var c=n<=-80?'sig-g':(n<=-70?'sig-a':'sig-r'); return '<span class="'+c+'">'+n+' dBm</span>'; }
++  function mac(m){ if(!m) return '?'; m=(''+m).replace(/[:\-]/g,''); return (m.match(/../g)||[m]).join(':').toLowerCase(); }
++  fetch('{{ url_for("reticulum_halow") }}').then(function(r){return r.json();}).then(function(d){
++    if(!d.enabled) return;
++    if(!d.reachable){
++      live.className='halow-live';
++      live.innerHTML=d.sl0_up
++        ? '<span class="badge err">unreachable</span> sl0 is up but the modem isn\'t answering over SLIP.'
++        : '<span class="badge warn">sl0 down</span> the SLIP link isn\'t up.';
++      return;
++    }
++    var rd=d.radio||{}, st=d.stats||{}, dv=d.device||{}, ns=d.neighbours||[];
++    var name=(dv.hostname||'RNode-Halow'), port=(d.tcp_port||8001);
++    var iface = d.rnsd_up
++      ? '<span class="badge ok">UP</span> <span class="val">'+esc(name)+'</span> &rarr; :'+esc(port)
++      : '<span class="badge warn">DOWN</span> '+(HALOW_IN_CONFIG?'not connected':'<span class="dim">not in rnsd config yet</span>');
++    var air=num(st.airtime);
++    var airbar = air!=null ? '<span class="hbar"><span style="width:'+Math.max(0,Math.min(100,air))+'%"></span></span> ' : '';
++    // mcs_index arrives as "MCS0" on this firmware, but strip any leading
++    // "MCS" and re-add it so a bare index renders identically.
++    var mcs = (rd.mcs==null||rd.mcs==='') ? 'MCS?' : 'MCS'+esc((''+rd.mcs).replace(/^mcs\s*/i,''));
++    var fw = (dv.fw ? esc((''+dv.fw).split(' ')[0]) : '?');   // "2.3.0 (build…)" -> "2.3.0"
++    var rows=[
++      ['Link (sl0)','<span class="badge ok">UP</span> <span class="val">'+esc(d.local)+' &rarr; '+esc(d.peer)+'</span>'],
++      ['rnsd interface', iface],
++      ['Radio','<span class="val">'+unit(rd.freq,'MHz')+' · '+unit(rd.bw,'MHz')+' · '+mcs+' · '+unit(rd.power,'dBm')+'</span>'],
++      ['Airtime', airbar+'<span class="val">'+esc(st.airtime||'?')+'</span> <span class="dim">· ch-util '+esc(st.ch_util||'?')+'</span>'],
++      ['Noise floor', noise(st.noise)],
++      ['Throughput','<span class="val">&darr; '+esc(st.rx_speed||'?')+' · &uarr; '+esc(st.tx_speed||'?')+'</span>'+((st.rx_bytes||st.tx_bytes)?' <span class="dim">('+esc(st.rx_bytes||'?')+' / '+esc(st.tx_bytes||'?')+')</span>':'')],
++      ['Modem','<span class="val">'+esc(dv.temp||'?')+' · fw '+fw+' · up '+esc(dv.uptime||'?')+'</span>'],
++    ];
++    live.className='halow-live';
++    live.innerHTML='<table class="kv halow-kv">'+rows.map(function(x){return '<tr><th>'+x[0]+'</th><td>'+x[1]+'</td></tr>';}).join('')+'</table>';
++    // Quick-add: the modem is reachable but no interface routes through it yet.
++    if(addForm && !HALOW_IN_CONFIG){
++      var nf=document.getElementById('halow-add-name'), pf=document.getElementById('halow-add-port');
++      if(nf) nf.value=(dv.hostname||'');   // blank -> server queries the modem
++      if(pf) pf.value=port;
++      addForm.hidden=false;
++    }
++    if(ns.length){
++      document.getElementById('halow-ncount').textContent=ns.length;
++      var head='<tr><th>Node</th><th>RSSI</th><th>SNR</th><th>MCS &darr;/&uarr;</th><th>TX acked</th><th>TX loss</th><th>Last</th></tr>';
++      var body=ns.map(function(p){
++        return '<tr><td class="mono">'+esc(mac(p.mac))+'</td>'+
++          '<td>'+sig(num(p.rssi),'dBm',-75,-88)+'</td><td>'+sig(num(p.snr),'dB',10,5)+'</td>'+
++          '<td class="val">'+esc(p.rx_mcs)+' / '+esc(p.tx_mcs)+'</td>'+
++          '<td class="val">'+esc(p.tx_acked)+' / '+esc(p.tx_frames)+'</td>'+
++          '<td>'+esc(p.tx_loss||0)+'%</td>'+
++          '<td class="val dim">'+(p.age!=null?Math.round(p.age/1000)+' s':'—')+'</td></tr>';
++      }).join('');
++      document.getElementById('halow-ntable').innerHTML=head+body;
++      det.hidden=false;   // reveal the section; it stays collapsed (no `open`)
++    }
++  }).catch(function(){ live.className='halow-live'; live.textContent='Could not read modem status.'; });
++})();
++</script>
++{% endif %}
+ {% endblock %}
 -- 
 2.47.3
 

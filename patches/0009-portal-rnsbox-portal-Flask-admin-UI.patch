@@ -14,10 +14,10 @@ session key at runtime. MIT licensed.
  buildroot/package/rnsbox-portal/src/LICENSE   |  21 +
  .../rnsbox-portal/src/bin/rnsbox-portal       |   6 +
  .../src/rnsbox_portal/__init__.py             |   0
- .../src/rnsbox_portal/__main__.py             |  16 +
+ .../src/rnsbox_portal/__main__.py             |  21 +
  .../rnsbox-portal/src/rnsbox_portal/app.py    | 429 ++++++++++++++++++
- .../rnsbox-portal/src/rnsbox_portal/auth.py   |  57 +++
- .../rnsbox-portal/src/rnsbox_portal/nftgen.py | 136 ++++++
+ .../rnsbox-portal/src/rnsbox_portal/auth.py   |  75 +++
+ .../rnsbox-portal/src/rnsbox_portal/nftgen.py | 138 ++++++
  .../src/rnsbox_portal/static/style.css        | 309 +++++++++++++
  .../rnsbox-portal/src/rnsbox_portal/store.py  | 265 +++++++++++
  .../src/rnsbox_portal/sysinfo.py              | 223 +++++++++
@@ -29,7 +29,7 @@ session key at runtime. MIT licensed.
  .../src/rnsbox_portal/templates/settings.html |  40 ++
  .../src/rnsbox_portal/templates/wifi.html     | 142 ++++++
  .../rnsbox-portal/src/rnsbox_portal/wifi.py   | 167 +++++++
- 20 files changed, 2238 insertions(+)
+ 20 files changed, 2263 insertions(+)
  create mode 100644 buildroot/package/rnsbox-portal/Config.in
  create mode 100644 buildroot/package/rnsbox-portal/rnsbox-portal.mk
  create mode 100644 buildroot/package/rnsbox-portal/src/LICENSE
@@ -160,10 +160,10 @@ new file mode 100644
 index 000000000..e69de29bb
 diff --git a/buildroot/package/rnsbox-portal/src/rnsbox_portal/__main__.py b/buildroot/package/rnsbox-portal/src/rnsbox_portal/__main__.py
 new file mode 100644
-index 000000000..c77677f07
+index 000000000..3b90233bd
 --- /dev/null
 +++ b/buildroot/package/rnsbox-portal/src/rnsbox_portal/__main__.py
-@@ -0,0 +1,16 @@
+@@ -0,0 +1,21 @@
 +import os
 +
 +from .app import create_app
@@ -175,7 +175,12 @@ index 000000000..c77677f07
 +    if not host:
 +        host = "0.0.0.0"
 +    app = create_app()
-+    app.run(host=host, port=int(port), threaded=True, debug=False)
++    # Serve via make_server, not app.run(): app.run()'s startup banner resolves
++    # a display IP (Werkzeug get_interface_ip / hostname lookup) which can hang
++    # on this board's network state and leave the socket unbound. make_server
++    # binds immediately and skips the dev-server banner (unwanted for a daemon).
++    from werkzeug.serving import make_server
++    make_server(host, int(port), app, threaded=True).serve_forever()
 +
 +
 +if __name__ == "__main__":
@@ -617,10 +622,10 @@ index 000000000..970d1ca2c
 +    return app
 diff --git a/buildroot/package/rnsbox-portal/src/rnsbox_portal/auth.py b/buildroot/package/rnsbox-portal/src/rnsbox_portal/auth.py
 new file mode 100644
-index 000000000..38aa8dc49
+index 000000000..159e9015a
 --- /dev/null
 +++ b/buildroot/package/rnsbox-portal/src/rnsbox_portal/auth.py
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,75 @@
 +"""Password hashing + verification.
 +
 +Storage: /etc/rnsbox/auth.json — a flat {username: hash} dict.
@@ -636,6 +641,13 @@ index 000000000..38aa8dc49
 +AUTH_FILE = "/etc/rnsbox/auth.json"
 +DEFAULT_USER = "admin"
 +DEFAULT_PASS = "admin"
++
++# pbkdf2 work factor. Werkzeug's default is 600,000 iterations (OWASP-2023,
++# tuned for server CPUs) — on this board's single T-Head C906 @ 1 GHz that's
++# ~15 s per hash, i.e. a ~16 s login. This is a LAN admin portal whose
++# auth.json never leaves the device, so we trade the huge factor for a usable
++# sub-second login. Tune the iteration count here if you want more headroom.
++HASH_METHOD = "pbkdf2:sha256:25000"
 +
 +
 +def _read():
@@ -661,7 +673,7 @@ index 000000000..38aa8dc49
 +def _ensure():
 +    data = _read()
 +    if not data:
-+        data = {DEFAULT_USER: generate_password_hash(DEFAULT_PASS)}
++        data = {DEFAULT_USER: generate_password_hash(DEFAULT_PASS, method=HASH_METHOD)}
 +        _write(data)
 +    return data
 +
@@ -671,19 +683,30 @@ index 000000000..38aa8dc49
 +    h = data.get(user)
 +    if not h:
 +        return False
-+    return check_password_hash(h, password)
++    if not check_password_hash(h, password):
++        return False
++    # Upgrade a hash made with a heavier work factor (e.g. an older image's
++    # 600k-iteration Werkzeug default) to the current one on a successful
++    # login, so that slow verify happens at most once.
++    if not h.startswith(HASH_METHOD + "$"):
++        try:
++            data[user] = generate_password_hash(password, method=HASH_METHOD)
++            _write(data)
++        except Exception:
++            pass
++    return True
 +
 +
 +def set_password(user, password):
 +    data = _ensure()
-+    data[user] = generate_password_hash(password)
++    data[user] = generate_password_hash(password, method=HASH_METHOD)
 +    _write(data)
 diff --git a/buildroot/package/rnsbox-portal/src/rnsbox_portal/nftgen.py b/buildroot/package/rnsbox-portal/src/rnsbox_portal/nftgen.py
 new file mode 100644
-index 000000000..69043da2e
+index 000000000..6b1fa18d1
 --- /dev/null
 +++ b/buildroot/package/rnsbox-portal/src/rnsbox_portal/nftgen.py
-@@ -0,0 +1,136 @@
+@@ -0,0 +1,138 @@
 +"""Single source of truth for nftables ruleset.
 +
 +Called two ways:
@@ -747,8 +770,10 @@ index 000000000..69043da2e
 +    # IPv6 is disabled at sysctl in S60routing.
 +    L.append("\t\t# LAN: full management surface (HTTP UI on :80, DHCP/DNS, SSH, etc.)")
 +    L.append("\t\tiifname @lan_ifaces accept")
-+    L.append("\t\t# WAN: SSH always allowed (matches the LAN-side convenience).")
-+    L.append(f'\t\tiifname "{wan_iface}" tcp dport 22 accept')
++    # WAN access is entirely driven by the Open Ports list. openports.conf ships
++    # with tcp/22 (SSH) and tcp/80 (web UI) as default entries, so remote SSH +
++    # UI work out of the box; remove them in the UI (Network -> Open ports) to
++    # close WAN access. The LAN side (usb0) always keeps full access regardless.
 +    if forwards:
 +        # Port forwards whose destination is the router ITSELF (e.g.
 +        # 10.42.0.1 or 127.0.0.1): the prerouting DNAT rewrites the dest to a
@@ -1797,7 +1822,7 @@ index 000000000..96634afbf
 +{% endblock %}
 diff --git a/buildroot/package/rnsbox-portal/src/rnsbox_portal/templates/network.html b/buildroot/package/rnsbox-portal/src/rnsbox_portal/templates/network.html
 new file mode 100644
-index 000000000..f2db32c7b
+index 000000000..50c042cc5
 --- /dev/null
 +++ b/buildroot/package/rnsbox-portal/src/rnsbox_portal/templates/network.html
 @@ -0,0 +1,169 @@
@@ -1893,7 +1918,7 @@ index 000000000..f2db32c7b
 +
 +<section class="card">
 +  <h3>Open ports (services on this router exposed on WAN)</h3>
-+  <p class="muted">Allows inbound connections on the WAN to services bound on this device. SSH (tcp/22) is always open. Add rnsd's TCPServerInterface port here if you want external Reticulum peers to reach you.</p>
++  <p class="muted">Allows inbound connections on the WAN to services bound on this device. <strong>SSH (22)</strong> and the <strong>web UI (80)</strong> are open by default &mdash; remove them to close WAN access (the LAN/<code>usb0</code> side always stays open). Add rnsd's TCPServerInterface port (4242) here for external Reticulum peers.</p>
 +  <table class="data">
 +    <thead>
 +      <tr><th>Proto</th><th>Port</th><th>Comment</th><th></th></tr>
@@ -1912,7 +1937,7 @@ index 000000000..f2db32c7b
 +        </td>
 +      </tr>
 +      {% else %}
-+      <tr><td colspan="4" class="muted">No open ports configured (SSH still allowed by default).</td></tr>
++      <tr><td colspan="4" class="muted">No open ports &mdash; WAN access is closed (the LAN/usb0 side stays open).</td></tr>
 +      {% endfor %}
 +    </tbody>
 +  </table>
