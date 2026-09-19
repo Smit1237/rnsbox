@@ -93,6 +93,22 @@ announcements as stale, which doesn't matter on an offline mesh. LXMF / NomadNet
 message timestamps read 1970 until `ntpd` corrects the clock (NomadNet is off by
 default). Build it exactly like `main` — `./build.sh lite` (or `dvd`).
 
+## HaLow modem — SLIP wiring
+
+Wire the RNode HaLow modem to **UART1** (`/dev/ttyS1` — **not** `ttyS0`, the
+serial console) with three 3.3 V-TTL lines; TX and RX cross over:
+
+| Nano-e pad | Function | Wire to modem |
+|------------|----------|---------------|
+| `GPIOA28`  | UART1_TX | RX            |
+| `GPIOA29`  | UART1_RX | TX            |
+| `GND`      | ground   | GND           |
+
+Set **both** ends to `1500000` baud — the Nano-e's UART tops out at 1,562,500,
+below the modem's 2 Mbaud default. Enable the link from the portal (*Reticulum
+tab → HaLow modem (SLIP)*), then point a `TCPClientInterface` at the modem on
+**port 8001**. Full walkthrough in `README.RNSBox.md` (shipped by the patch series).
+
 ## Repository layout
 
 ```
