@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: smit1237 <smit1237@gmail.com>
 Date: Tue, 8 Sep 2026 22:47:50 +0300
-Subject: [PATCH 16/22] docs: MIT license and apply/build guide
+Subject: [PATCH 16/24] docs: MIT license and apply/build guide
 
 Add the MIT LICENSE for the RNSBox code, a project README and an apply/build
 guide describing how to apply this series onto upstream d4003f15b and build the

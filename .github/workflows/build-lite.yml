@@ -161,3 +161,5 @@ jobs:
           path: /mnt/tmp/build.log
           if-no-files-found: warn
           retention-days: 7
+
+# build trigger: A/B foundation (Phase 1+2) — 24 patches

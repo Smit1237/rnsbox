@@ -1,0 +1,181 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: smit1237 <smit1237@gmail.com>
+Date: Tue, 22 Sep 2026 08:39:33 +0300
+Subject: [PATCH 24/24] autoupdater: A/B slot selector + boot-count rollback
+ (Phase 2) + 256 MB swap
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Phase 2 — the initramfs picks the rootfs slot and auto-reverts a bad update:
+- ramdisk/initramfs/musl_riscv64/init: instead of the hardcoded p2, read the
+  active slot (/boot/ab_slot: a=p2/b=p3) and a boot-attempt counter
+  (/boot/ab_tries) from the shared FAT boot partition, increment the counter,
+  and switch_root into that slot. After AB_MAX (3) unconfirmed boots roll back
+  to the other slot; if the chosen slot won't mount, hard-fall-back to the
+  other before recovery. Layout-detecting: with no p3 it boots p2 as before.
+- S98confirm (new): once rnsd is running and the portal is listening on :80,
+  clear /boot/ab_tries so a healthy boot disarms the rollback.
+
+Also: S03data now creates a 256 MB swap file on /data (once the partition has
+been grown — so from the second boot), low swappiness to spare the SD. Doubles
+the ~245 MB RAM ceiling for the portal/rnsd/updater under pressure.
+
+The updater agent that writes the idle slot + flips ab_slot is Phase 3.
+---
+ .../cvitek/SG200X/overlay/etc/init.d/S03data  | 19 +++++++
+ .../SG200X/overlay/etc/init.d/S98confirm      | 36 ++++++++++++
+ ramdisk/initramfs/musl_riscv64/init           | 57 ++++++++++++++-----
+ 3 files changed, 98 insertions(+), 14 deletions(-)
+ create mode 100755 buildroot/board/cvitek/SG200X/overlay/etc/init.d/S98confirm
+
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S03data b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S03data
+index 98f1ef6f4..fc7bbb970 100755
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S03data
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S03data
+@@ -44,6 +44,25 @@ start() {
+ 		mkdir -p "$dir"
+ 		mount --bind "$store" "$dir"
+ 	done
++
++	# 256 MB swap file on the persistent partition — doubles the ~245 MB RAM
++	# ceiling for the portal / rnsd / updater under memory pressure. Created only
++	# once /data has room (i.e. after S99resizefs grows it on the first boot), so
++	# it comes up from the second boot on. Low swappiness keeps SD writes rare.
++	SWAP=/data/swapfile
++	if [ ! -f "$SWAP" ]; then
++		free_mb=$(df -m /data 2>/dev/null | awk 'NR==2{print $4+0}')
++		if [ "${free_mb:-0}" -gt 320 ]; then
++			printf "S03data: creating 256 MB swap ... "
++			dd if=/dev/zero of="$SWAP" bs=1M count=256 2>/dev/null && \
++				chmod 0600 "$SWAP" && mkswap "$SWAP" >/dev/null 2>&1 && echo "OK" || \
++				{ echo "FAILED"; rm -f "$SWAP"; }
++		fi
++	fi
++	if [ -f "$SWAP" ]; then
++		swapon "$SWAP" 2>/dev/null && echo 10 > /proc/sys/vm/swappiness 2>/dev/null
++	fi
++
+ 	echo "S03data: /data mounted; state relocated to the persistent partition"
+ }
+ 
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S98confirm b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S98confirm
+new file mode 100755
+index 000000000..90d55dff1
+--- /dev/null
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S98confirm
+@@ -0,0 +1,36 @@
++#!/bin/sh
++# RNSBox A/B: mark the current rootfs slot "good" once the system is healthy, so
++# the initramfs boot-count rollback (see ramdisk .../init) does not revert a
++# working update. Clears the boot-attempt counter on the shared /boot partition.
++#
++# "Healthy" = rnsd is running AND the admin portal is listening on :80. Runs late
++# (S98, after S81router/S82rnsd) with a short retry. Layout-detecting: a clean
++# no-op on the single-partition (pre-A/B) image (no p3).
++
++[ "$1" = start ] || exit 0
++[ -b /dev/mmcblk0p3 ] || exit 0          # A/B layout only
++[ -f /boot/ab_tries ] || exit 0          # nothing to confirm
++
++healthy() {
++	# rnsd pid alive?
++	[ -f /var/run/rnsd.pid ] || return 1
++	kill -0 "$(cat /var/run/rnsd.pid)" 2>/dev/null || return 1
++	# portal listening on :80 ? (parse /proc/net/tcp: local :0050, state 0A=LISTEN)
++	awk '$2 ~ /:0050$/ && $4 == "0A" { ok = 1 } END { exit !ok }' /proc/net/tcp
++}
++
++i=0
++while [ $i -lt 15 ]; do
++	if healthy; then
++		mount -o remount,rw /boot 2>/dev/null
++		echo 0 > /boot/ab_tries
++		sync
++		mount -o remount,ro /boot 2>/dev/null
++		echo "S98confirm: slot confirmed healthy — boot counter cleared"
++		exit 0
++	fi
++	sleep 2
++	i=$((i + 1))
++done
++echo "S98confirm: not healthy within timeout — leaving boot counter (rollback armed)"
++exit 0
+diff --git a/ramdisk/initramfs/musl_riscv64/init b/ramdisk/initramfs/musl_riscv64/init
+index 684c08a55..bf88499a3 100644
+--- a/ramdisk/initramfs/musl_riscv64/init
++++ b/ramdisk/initramfs/musl_riscv64/init
+@@ -134,27 +134,56 @@ then
+ 	msc
+ fi
+ 
++# --- RNSBox A/B slot selection + boot-count rollback --------------------------
++# Slot state lives on the shared FAT boot partition (mounted ro at /boot above):
++#   /boot/ab_slot  = "a" | "b"   (active rootfs slot; a=mmcblk0p2, b=mmcblk0p3)
++#   /boot/ab_tries = boot-attempt counter. Userspace rnsbox-confirm (S98confirm)
++#                    resets it to 0 once the system is healthy. If a slot is
++#                    booted AB_MAX times without confirming, roll back to the
++#                    other slot. Layout-detecting: pre-A/B images have no p3 and
++#                    boot p2 exactly as before.
++AB_MAX=3
++ab_slot=a
++if [ -b /dev/mmcblk0p3 ]; then
++	mount -o remount,rw /boot 2>/dev/null
++	ab_slot=$(cat /boot/ab_slot 2>/dev/null); [ "$ab_slot" = b ] || ab_slot=a
++	ab_tries=$(cat /boot/ab_tries 2>/dev/null)
++	case "$ab_tries" in ''|*[!0-9]*) ab_tries=0 ;; esac
++	if [ "$ab_tries" -ge "$AB_MAX" ]; then
++		if [ "$ab_slot" = a ]; then ab_slot=b; else ab_slot=a; fi
++		echo "$ab_slot" > /boot/ab_slot
++		ab_tries=0
++		echo "A/B: previous slot did not confirm — rolling back to slot $ab_slot"
++	fi
++	echo $((ab_tries + 1)) > /boot/ab_tries
++	sync
++	echo "A/B: booting slot $ab_slot (try $((ab_tries + 1))/$AB_MAX)"
++fi
++if [ "$ab_slot" = b ]; then rootpart=/dev/mmcblk0p3; else rootpart=/dev/mmcblk0p2; fi
++
+ umount /dev/mmcblk0p1
+ 
+ mkdir /realroot
+-# parted -s /dev/mmcblk0 "resizepart 2 -0"
+-# echo "yes
+-# 100%
+-# " | parted ---pretend-input-tty /dev/mmcblk0 "resizepart 2 100%"
+-# #e2fsck -fvp /dev/mmcblk0p2
+-# resize2fs /dev/mmcblk0p2
+-mount -o rw /dev/mmcblk0p2 /realroot
++mount -o rw "$rootpart" /realroot
+ mfail="$?"
+-
+ if [ "${mfail}" -ne 0 ]
+ then
+-	e2fsck -fvp /dev/mmcblk0p2
+-	mount -o rw /dev/mmcblk0p2 /realroot
++	e2fsck -fvp "$rootpart"
++	mount -o rw "$rootpart" /realroot
+ 	mfail="$?"
+-	if [ "${mfail}" -ne 0 ]
+-	then
+-		msc
+-	fi
++fi
++if [ "${mfail}" -ne 0 ] && [ -b /dev/mmcblk0p3 ]
++then
++	# chosen slot will not mount at all — hard-fall-back to the other slot
++	if [ "$ab_slot" = b ]; then rootpart=/dev/mmcblk0p2; else rootpart=/dev/mmcblk0p3; fi
++	echo "A/B: slot unmountable — trying $rootpart"
++	e2fsck -fvp "$rootpart"
++	mount -o rw "$rootpart" /realroot
++	mfail="$?"
++fi
++if [ "${mfail}" -ne 0 ]
++then
++	msc
+ fi
+ 
+ mount -t proc proc /realroot/proc
+-- 
+2.47.3
+

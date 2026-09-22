@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: smit1237 <smit1237@gmail.com>
 Date: Tue, 8 Sep 2026 22:47:48 +0300
-Subject: [PATCH 04/22] time: NTP clock discipline for the RTC-less board
+Subject: [PATCH 04/24] time: NTP clock discipline for the RTC-less board
 
 The Nano-e has no RTC, so the clock starts in 1970. S45ntpsync steps the clock
 from anycast NTP IPs (no DNS dependency during early boot) and touches

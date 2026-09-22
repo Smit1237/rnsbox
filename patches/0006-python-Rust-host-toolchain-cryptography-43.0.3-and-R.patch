@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: smit1237 <smit1237@gmail.com>
 Date: Tue, 8 Sep 2026 22:47:48 +0300
-Subject: [PATCH 06/22] python: Rust host toolchain, cryptography 43.0.3 and
+Subject: [PATCH 06/24] python: Rust host toolchain, cryptography 43.0.3 and
  Reticulum 1.5.2
 
 Reticulum needs PyCA cryptography, which needs Rust. Enable a source-built

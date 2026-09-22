@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: smit1237 <smit1237@gmail.com>
 Date: Tue, 8 Sep 2026 22:47:49 +0300
-Subject: [PATCH 10/22] nomadnet: LXMF/pages node (opt-in)
+Subject: [PATCH 10/24] nomadnet: LXMF/pages node (opt-in)
 
 Add the python-lxmf and python-nomadnet recipes and bump python-urwid to
 2.6.16 (nomadnet floor), selecting its wcwidth and typing_extensions imports.

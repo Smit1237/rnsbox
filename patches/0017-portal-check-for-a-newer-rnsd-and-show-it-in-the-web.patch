@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: smit1237 <smit1237@gmail.com>
 Date: Wed, 9 Sep 2026 01:14:22 +0300
-Subject: [PATCH 17/22] portal: check for a newer rnsd and show it in the web
+Subject: [PATCH 17/24] portal: check for a newer rnsd and show it in the web
  UI
 
 Adds a notify-only update checker. rnsbox_portal.updatecheck queries PyPI for

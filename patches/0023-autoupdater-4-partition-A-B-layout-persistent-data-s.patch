@@ -1,0 +1,227 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: smit1237 <smit1237@gmail.com>
+Date: Tue, 22 Sep 2026 08:32:18 +0300
+Subject: [PATCH 23/24] autoupdater: 4-partition A/B layout + persistent /data
+ + state migration
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Phase 1 of the A/B whole-OS updater (lite) — the on-card foundation:
+- genimage_rootless_ab.cfg: 4-partition MBR (boot + rootfs_A + rootfs_B + data);
+  ~1 GiB rootfs slots (the ext4 is padded up, spare space is growth headroom),
+  data grown to fill the card. build-rnsbox.sh swaps it in for the lite build
+  (dvd path unchanged; committed tree stays dvd-shaped via the restore trap).
+- S03data (new, early init): mount the persistent /data partition and bind-mount
+  the state that MUST survive a slot swap (Reticulum identity, /etc/rnsbox +
+  auth.json, SSH host keys, updater state), first-boot-seeded from the shipped
+  defaults. Layout-detecting: a clean no-op where there is no p4.
+- S99resizefs: grow p4 (data) on the A/B layout, else p2 (rootfs) as before.
+
+The initramfs still boots slot A (p2); the A/B slot selector + rollback is Phase 2.
+Validated: genimage emits the 4-partition table (size>image padding and a
+size-only data partition both work). Boot + first-boot behavior pending a build+flash.
+---
+ build-rnsbox.sh                               |  7 ++
+ .../common/sd_tools/genimage_rootless_ab.cfg  | 65 +++++++++++++++++++
+ .../cvitek/SG200X/overlay/etc/init.d/S03data  | 54 +++++++++++++++
+ .../SG200X/overlay/etc/init.d/S99resizefs     | 18 +++--
+ 4 files changed, 139 insertions(+), 5 deletions(-)
+ create mode 100644 build/tools/common/sd_tools/genimage_rootless_ab.cfg
+ create mode 100755 buildroot/board/cvitek/SG200X/overlay/etc/init.d/S03data
+
+diff --git a/build-rnsbox.sh b/build-rnsbox.sh
+index bd7a4f80b..56bf4ac59 100755
+--- a/build-rnsbox.sh
++++ b/build-rnsbox.sh
+@@ -25,6 +25,7 @@ echo "=================== RNSBox build [$VARIANT] $(date) ==================="
+ DEFCONFIG=buildroot/configs/cvitek_SG200X_musl_riscv64_defconfig
+ PARTXML=build/boards/sg200x/sg2002_licheervnano_sd/partition/partition_sd.xml
+ GENIMG=build/tools/common/sd_tools/genimage_rootless.cfg
++GENIMG_AB=build/tools/common/sd_tools/genimage_rootless_ab.cfg  # lite A/B 4-partition layout
+ ISO_OVERLAY=buildroot/board/cvitek/SG200X/overlay/opt/rnsbox-clients/usbdisk.iso
+ ISO_STASH=/tmp/rnsbox-usbdisk.iso.stash
+ 
+@@ -32,6 +33,8 @@ restore() {
+ 	# put the tree back to the committed DVD-shaped state
+ 	sed -i 's/^BR2_TARGET_ROOTFS_EXT2_SIZE=.*/BR2_TARGET_ROOTFS_EXT2_SIZE="2800M"/' "$DEFCONFIG"
+ 	sed -i 's#\(<partition label="ROOTFS" size_in_kb=\)"[0-9]*"#\1"3072000"#' "$PARTXML"
++	# undo the lite A/B genimage swap, if any (restore the committed file)
++	[ -f "$GENIMG.abstash" ] && mv -f "$GENIMG.abstash" "$GENIMG"
+ 	# ensure the usb.disk0 lines are present in genimage (DVD shape)
+ 	grep -q '"usb.disk0"' "$GENIMG" || sed -i 's#\("usb.ncm.mac",\)#\1\n                        "usb.disk0",\n                        "usb.disk0.size",#' "$GENIMG"
+ 	# restore the ISO into the overlay if we stashed it
+@@ -65,6 +68,10 @@ else
+ 	sed -i 's#\(<partition label="ROOTFS" size_in_kb=\)"[0-9]*"#\1"1638400"#' "$PARTXML"
+ 	# drop the usb.disk0 lines from the genimage boot.vfat list (would error if absent)
+ 	sed -i '/"usb.disk0",/d; /"usb.disk0.size",/d' "$GENIMG"
++	# A/B: swap in the 4-partition genimage (rootfs_A + rootfs_B + data). The
++	# committed file is stashed so the restore() trap puts it back afterwards.
++	cp -f "$GENIMG" "$GENIMG.abstash"
++	cp -f "$GENIMG_AB" "$GENIMG"
+ 	SUFFIX=lite
+ fi
+ 
+diff --git a/build/tools/common/sd_tools/genimage_rootless_ab.cfg b/build/tools/common/sd_tools/genimage_rootless_ab.cfg
+new file mode 100644
+index 000000000..686a8764e
+--- /dev/null
++++ b/build/tools/common/sd_tools/genimage_rootless_ab.cfg
+@@ -0,0 +1,65 @@
++# RNSBox A/B (lite): 4-partition MBR for the dual-slot whole-OS auto-updater.
++#   p1 boot (FAT)  : fip.bin + kernel FIT (boot.sd) + gadget flags + slot state
++#   p2 rootfs_A    : ~1 GiB slot — ships the ext4; the spare space is growth
++#                    headroom (bump BR2_TARGET_ROOTFS_EXT2_SIZE, no repartition)
++#   p3 rootfs_B    : ~1 GiB slot — a copy at flash so both slots are bootable;
++#                    the updater overwrites the idle slot on each update
++#   p4 data        : persistent state (router config, Reticulum identity, SSH
++#                    host keys, updater state) — small at flash, grown to fill
++#                    the card on first boot by S99resizefs; mounted by S03data
++#
++# The kernel FIT (boot.sd) on p1 is SHARED by both slots (updated in place).
++# Slot size = the `size = 1024M` lines below; raise them (and reflash) for more
++# headroom. Two ~1 GiB slots + boot + a small data seed => a ~2.1 GiB raw image
++# (compresses to a small .xz — the empty slot space is zeros). Lite variant:
++# no usb.disk0 (that is the dvd clients drive) — this file is used only by the
++# lite build (build-rnsbox.sh swaps it in for genimage_rootless.cfg).
++
++image boot.vfat {
++        vfat {
++                label = "boot"
++                files = {
++                        "fip.bin",
++                        "rawimages/boot.sd",
++                        "usb.dev",
++                        "usb.ncm",
++                        "usb.ncm.mac",
++                        "usb.idVendor",
++                        "usb.idProduct",
++                        "usb.bcdDevice",
++                        "usb.manufacturer",
++                        "usb.product",
++                        "hostname",
++                        "ver",
++                }
++        }
++        size = 16M
++}
++
++image duo.img {
++        hdimage {
++        }
++
++        partition boot {
++                partition-type = 0x0C
++                bootable = "true"
++                image = "boot.vfat"
++        }
++
++        partition rootfs_a {
++                partition-type = 0x83
++                image = "rootfs.sd"
++                size = 1024M
++        }
++
++        partition rootfs_b {
++                partition-type = 0x83
++                image = "rootfs.sd"
++                size = 1024M
++        }
++
++        partition data {
++                partition-type = 0x83
++                size = 32M
++        }
++}
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S03data b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S03data
+new file mode 100755
+index 000000000..98f1ef6f4
+--- /dev/null
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S03data
+@@ -0,0 +1,54 @@
++#!/bin/sh
++# RNSBox A/B: mount the persistent /data partition (p4) and bind-mount the state
++# directories that MUST survive a rootfs slot swap — the Reticulum identity, the
++# router config + portal password, the SSH host keys, and the updater state.
++# First boot formats p4 and seeds each dir from the shipped rootfs defaults.
++#
++# Layout-detecting: on the single-partition (dvd / pre-A/B) image there is no
++# p4, so this is a clean no-op and that state simply stays on the rootfs.
++#
++# Runs at S03 — after S01fs mounts /boot and the stock S02* setup, and before
++# anything that reads the state (S10uuid, S30*, S60routing, S81router, S82rnsd,
++# S50sshd) so their writes land on /data.
++
++DATA=/dev/mmcblk0p4
++
++start() {
++	[ -b "$DATA" ] || return 0        # no data partition => single-partition layout
++
++	# Format on the very first boot if p4 isn't an ext filesystem yet.
++	if ! dumpe2fs -h "$DATA" >/dev/null 2>&1; then
++		printf "S03data: formatting %s ... " "$DATA"
++		mke2fs -t ext4 -F -q -L rnsbox-data "$DATA" && echo "OK" || { echo "FAILED"; return 0; }
++	fi
++
++	mkdir -p /data
++	mount -o noatime "$DATA" /data 2>/dev/null || { echo "S03data: mount failed"; return 0; }
++
++	# <store-name>:<rootfs-dir> — bind-mount each dir off /data, seeding it on
++	# first boot from the shipped rootfs copy (identity/keys created later land
++	# on /data automatically through the bind mount).
++	for map in \
++		rnsbox:/etc/rnsbox \
++		reticulum:/etc/reticulum \
++		ssh:/etc/ssh \
++		var-rnsbox:/var/lib/rnsbox \
++		var-nomadnet:/var/lib/nomadnetwork
++	do
++		name=${map%%:*}; dir=${map#*:}
++		store="/data/$name"
++		if [ ! -d "$store" ]; then
++			mkdir -p "$store"
++			[ -d "$dir" ] && cp -a "$dir/." "$store/" 2>/dev/null   # seed defaults
++		fi
++		mkdir -p "$dir"
++		mount --bind "$store" "$dir"
++	done
++	echo "S03data: /data mounted; state relocated to the persistent partition"
++}
++
++case "$1" in
++	start) start ;;
++	stop)  : ;;
++	*)     echo "usage: $0 {start|stop}"; exit 1 ;;
++esac
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S99resizefs b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S99resizefs
+index b0d1d81f0..111eec468 100755
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S99resizefs
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S99resizefs
+@@ -4,11 +4,19 @@
+ 
+ if [ "${1}" = start ]
+ then
+-	# use all sdcard free space for data
+-	parted -s /dev/mmcblk0 "resizepart 2 -0"
++	# On the A/B layout the growable partition is the persistent DATA partition
++	# (p4) — the rootfs slots (p2/p3) are fixed-size. On the single-partition
++	# (dvd / pre-A/B) layout it is the rootfs itself (p2). Grow whichever exists.
++	if [ -b /dev/mmcblk0p4 ]; then
++		PART=4
++	else
++		PART=2
++	fi
++	# use all remaining sdcard free space
++	parted -s /dev/mmcblk0 "resizepart ${PART} -0"
+ 	echo "yes
+ 	100%
+-	" | parted ---pretend-input-tty /dev/mmcblk0 "resizepart 2 100%"
+-	# resize data filesystem
+-	(resize2fs /dev/mmcblk0p2) &
++	" | parted ---pretend-input-tty /dev/mmcblk0 "resizepart ${PART} 100%"
++	# grow the filesystem (online if already mounted, e.g. /data)
++	(resize2fs "/dev/mmcblk0p${PART}") &
+ fi
+-- 
+2.47.3
+

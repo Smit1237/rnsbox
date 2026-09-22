@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: smit1237 <smit1237@gmail.com>
 Date: Tue, 8 Sep 2026 22:47:50 +0300
-Subject: [PATCH 15/22] buildroot: RNSBox defconfig and package wiring
+Subject: [PATCH 15/24] buildroot: RNSBox defconfig and package wiring
 
 Set the hostname to rnsbox; strip audio and unused python modules; enable
 python3 + flask + pyserial + cryptography, the new in-tree packages

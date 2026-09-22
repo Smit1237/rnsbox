@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: smit1237 <smit1237@gmail.com>
 Date: Tue, 8 Sep 2026 22:47:48 +0300
-Subject: [PATCH 08/22] rnsd: Reticulum daemon service and shipped config
+Subject: [PATCH 08/24] rnsd: Reticulum daemon service and shipped config
 
 S82rnsd runs rnsd once the clock is synced; S81router runs the admin portal.
 Ship an opinionated /etc/reticulum/config: transport enabled, a shared

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: smit1237 <smit1237@gmail.com>
 Date: Tue, 15 Sep 2026 04:55:01 +0300
-Subject: [PATCH 22/22] slip: optional SLIP-over-UART link to an external HaLow
+Subject: [PATCH 22/24] slip: optional SLIP-over-UART link to an external HaLow
  (RNode) modem
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

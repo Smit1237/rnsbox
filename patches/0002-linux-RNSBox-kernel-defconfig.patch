@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: smit1237 <smit1237@gmail.com>
 Date: Tue, 8 Sep 2026 22:47:47 +0300
-Subject: [PATCH 02/22] linux: RNSBox kernel defconfig
+Subject: [PATCH 02/24] linux: RNSBox kernel defconfig
 
 Strip media/framebuffer/sound/Bluetooth/ION/CMA and other unused subsystems;
 trim the USB gadget to CDC-NCM plus mass-storage; build cfg80211 in (=y) and
