@@ -12,6 +12,10 @@ on:
         type: choice
         options: [lite]
         default: lite
+      version:
+        description: "Release tag (blank = r<date>-<shortsha>). A GitHub Release is published only on manual runs."
+        type: string
+        default: ""
   push:
     branches: [auto-updater]
     paths: ['.github/workflows/build-lite.yml']
@@ -19,6 +23,9 @@ on:
 concurrency:
   group: build-lite-${{ github.ref }}
   cancel-in-progress: true
+
+permissions:
+  contents: write   # needed to publish a Release
 
 jobs:
   build:
@@ -86,9 +93,11 @@ jobs:
           # markers (GITHUB_ACTIONS / TF_BUILD) and demands a full stage-2
           # bootstrap. Buildroot builds host-rust at --stage 1, which is correct
           # for a host compiler, so scrub those markers for the build only.
+          # Output streams straight to the console (tee keeps a copy for the
+          # artifact) — no `tail`, so progress is visible live.
           ( unset GITHUB_ACTIONS TF_BUILD CI
             /usr/bin/time -v ./build.sh "${{ github.event.inputs.variant || 'lite' }}" ) \
-            2>&1 | tee /mnt/tmp/build.log | tail -n 60
+            2>&1 | tee /mnt/tmp/build.log
           echo "BUILD_SECONDS=$(( $(date +%s) - START ))" | tee -a "$GITHUB_ENV"
 
       - name: Disk after + image + timing
@@ -99,6 +108,41 @@ jobs:
           IMGDIR=/mnt/rnsbox/LicheeRV-Nano-Build/install/soc_sg2002_licheervnano_sd/images
           echo "## images"; ls -lh "$IMGDIR" 2>/dev/null || echo "(no images dir — build did not reach packaging)"
           echo "## last 40 build.log lines"; tail -n 40 /mnt/tmp/build.log 2>/dev/null || true
+
+      - name: Package image (.img.xz + SHA256SUMS)
+        if: success()
+        run: |
+          cd /mnt/rnsbox/LicheeRV-Nano-Build/install/soc_sg2002_licheervnano_sd/images
+          IMG=$(ls -1 *-lite.img | tail -1)
+          echo "compressing $IMG …"
+          xz -T0 -9 -k -f "$IMG"
+          sha256sum "$IMG" "$IMG.xz" | tee SHA256SUMS
+          ls -lh "$IMG" "$IMG.xz"
+          { echo "IMG=$IMG"; echo "IMGDIR=$PWD"; } >> "$GITHUB_ENV"
+
+      - name: Publish GitHub Release (manual runs only)
+        if: success() && github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VER="${{ github.event.inputs.version }}"
+          [ -z "$VER" ] && VER="r$(date -u +%Y.%m.%d)-${GITHUB_SHA:0:7}"
+          cd "$IMGDIR"
+          printf '%s\n' \
+            "Automated RNSBox **lite** build from \`${GITHUB_SHA:0:7}\` (branch \`${GITHUB_REF_NAME}\`)." \
+            "" \
+            "Decompress and flash to a microSD:" \
+            '```' \
+            "xz -d ${IMG}.xz && sudo dd if=${IMG} of=/dev/sdX bs=4M conv=fsync status=progress" \
+            '```' \
+            "Verify first with \`sha256sum -c SHA256SUMS\`." > /tmp/notes.md
+          gh release create "$VER" \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title "RNSBox lite $VER" \
+            --notes-file /tmp/notes.md \
+            "${IMG}.xz" SHA256SUMS
+          echo "Published release: $VER"
 
       - name: Upload lite image
         if: always()
