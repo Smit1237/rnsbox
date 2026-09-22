@@ -1,0 +1,113 @@
+name: build-lite
+
+# Feasibility test for the auto-updater work: can a GitHub-hosted runner build
+# the RNSBox *lite* image from scratch (it compiles a Rust host toolchain from
+# source, so it is heavy on time + disk)? Runs on manual dispatch, and once
+# automatically when this workflow file lands on the auto-updater branch.
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: "Image variant to build"
+        type: choice
+        options: [lite]
+        default: lite
+  push:
+    branches: [auto-updater]
+    paths: ['.github/workflows/build-lite.yml']
+
+concurrency:
+  group: build-lite-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Free up disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          docker-images: true
+          large-packages: false   # slow apt-remove; /mnt gives us the room
+          haskell: false
+          swap-storage: false     # keep swap — the LLVM/Rust build wants memory
+
+      - name: Disk + memory before
+        run: |
+          echo "## disk"; df -h / /mnt
+          echo "## mem";  free -h
+          echo "## cpu";  nproc
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential git wget curl cpio unzip rsync bc file \
+            python3 python3-dev python3-setuptools \
+            libssl-dev flex bison gawk texinfo help2man gettext \
+            autoconf automake libtool pkg-config cmake ninja-build \
+            libncurses5-dev device-tree-compiler u-boot-tools \
+            genext2fs dosfstools mtools parted squashfs-tools \
+            android-sdk-libsparse-utils jq scons
+
+      - name: Checkout patch series
+        uses: actions/checkout@v4
+        with:
+          path: rnsbox
+
+      - name: Prepare scratch on /mnt (the roomy disk)
+        run: |
+          sudo mkdir -p /mnt/rnsbox /mnt/dl /mnt/tmp
+          sudo chown -R "$USER":"$USER" /mnt/rnsbox /mnt/dl /mnt/tmp
+
+      - name: Cache buildroot downloads
+        uses: actions/cache@v4
+        with:
+          path: /mnt/dl
+          key: br-dl-${{ hashFiles('rnsbox/patches/*.patch') }}
+          restore-keys: |
+            br-dl-
+
+      - name: Build ${{ github.event.inputs.variant || 'lite' }}
+        env:
+          WORKDIR: /mnt/rnsbox/LicheeRV-Nano-Build
+          BR2_DL_DIR: /mnt/dl
+          TMPDIR: /mnt/tmp
+        run: |
+          export PATH=/usr/sbin:/sbin:$PATH
+          cd rnsbox
+          START=$(date +%s)
+          set -o pipefail
+          /usr/bin/time -v ./build.sh "${{ github.event.inputs.variant || 'lite' }}" 2>&1 | tee /mnt/tmp/build.log | tail -n 60
+          echo "BUILD_SECONDS=$(( $(date +%s) - START ))" | tee -a "$GITHUB_ENV"
+
+      - name: Disk after + image + timing
+        if: always()
+        run: |
+          echo "## disk after"; df -h / /mnt
+          echo "## build minutes: $(( ${BUILD_SECONDS:-0} / 60 ))"
+          IMGDIR=/mnt/rnsbox/LicheeRV-Nano-Build/install/soc_sg2002_licheervnano_sd/images
+          echo "## images"; ls -lh "$IMGDIR" 2>/dev/null || echo "(no images dir — build did not reach packaging)"
+          echo "## last 40 build.log lines"; tail -n 40 /mnt/tmp/build.log 2>/dev/null || true
+
+      - name: Upload lite image
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rnsbox-lite-image
+          path: /mnt/rnsbox/LicheeRV-Nano-Build/install/soc_sg2002_licheervnano_sd/images/*-lite.img
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: /mnt/tmp/build.log
+          if-no-files-found: warn
+          retention-days: 7
