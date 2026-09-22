@@ -56,3 +56,5 @@ jobs:
             --target "$TGT" --title "RNSBox lite $VER" \
             --notes-file notes.md "${IMG}.xz" SHA256SUMS
           echo "published $VER"
+
+# retrigger: repo workflow permissions now read/write
