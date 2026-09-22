@@ -1,0 +1,58 @@
+name: release-from-run
+
+# Promote an existing build-lite run's image artifact into a GitHub Release,
+# without rebuilding. Uses the Actions GITHUB_TOKEN (contents: write), so it
+# works even when a local gh token can't create releases.
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "build-lite run id that holds the rnsbox-lite-image artifact"
+        required: true
+      version:
+        description: "release tag (e.g. r2026.09.22-3667bdb)"
+        required: true
+      target:
+        description: "commit-ish the tag points at"
+        required: true
+  push:
+    branches: [auto-updater]
+    paths: ['.github/workflows/release-from-run.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish release from build artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RID: ${{ github.event.inputs.run_id || '35674357237' }}
+          VER: ${{ github.event.inputs.version || 'r2026.09.22-3667bdb' }}
+          TGT: ${{ github.event.inputs.target || '3667bdb6d46785a0fbe8df6cc0b0f46fe5899dd4' }}
+        run: |
+          set -euo pipefail
+          mkdir -p out && cd out
+          gh run download "$RID" -R "$GITHUB_REPOSITORY" -n rnsbox-lite-image
+          IMG=$(ls -1 *-lite.img | head -1)
+          echo "image: $IMG"
+          xz -T0 -9 -k -f "$IMG"
+          sha256sum "$IMG" "$IMG.xz" > SHA256SUMS
+          cat SHA256SUMS
+          printf '%s\n' \
+            "First RNSBox **lite** image release, built by CI from \`${TGT:0:7}\` (firmware = the 22-patch main series)." \
+            "" \
+            "**Flash to a microSD:**" \
+            '```bash' \
+            "xz -d ${IMG}.xz" \
+            "sudo dd if=${IMG} of=/dev/sdX bs=4M conv=fsync status=progress" \
+            '```' \
+            "Verify first with \`sha256sum -c SHA256SUMS\`. Rootfs auto-grows to fill the card on first boot; web UI at http://10.42.0.1/ (admin/admin)." \
+            "" \
+            "_Single-partition image (pre-A/B); the A/B auto-updater is in progress on the \`auto-updater\` branch._" > notes.md
+          gh release create "$VER" -R "$GITHUB_REPOSITORY" \
+            --target "$TGT" --title "RNSBox lite $VER" \
+            --notes-file notes.md "${IMG}.xz" SHA256SUMS
+          echo "published $VER"
