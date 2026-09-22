@@ -82,7 +82,13 @@ jobs:
           cd rnsbox
           START=$(date +%s)
           set -o pipefail
-          /usr/bin/time -v ./build.sh "${{ github.event.inputs.variant || 'lite' }}" 2>&1 | tee /mnt/tmp/build.log | tail -n 60
+          # Rust's bootstrap (x.py) panics on --stage 1 when it detects CI
+          # markers (GITHUB_ACTIONS / TF_BUILD) and demands a full stage-2
+          # bootstrap. Buildroot builds host-rust at --stage 1, which is correct
+          # for a host compiler, so scrub those markers for the build only.
+          ( unset GITHUB_ACTIONS TF_BUILD CI
+            /usr/bin/time -v ./build.sh "${{ github.event.inputs.variant || 'lite' }}" ) \
+            2>&1 | tee /mnt/tmp/build.log | tail -n 60
           echo "BUILD_SECONDS=$(( $(date +%s) - START ))" | tee -a "$GITHUB_ENV"
 
       - name: Disk after + image + timing
