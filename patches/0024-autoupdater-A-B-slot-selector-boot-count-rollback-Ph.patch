@@ -24,9 +24,9 @@ the ~245 MB RAM ceiling for the portal/rnsd/updater under pressure.
 The updater agent that writes the idle slot + flips ab_slot is Phase 3.
 ---
  .../cvitek/SG200X/overlay/etc/init.d/S03data  | 19 +++++++
- .../SG200X/overlay/etc/init.d/S98confirm      | 36 ++++++++++++
+ .../SG200X/overlay/etc/init.d/S98confirm      | 42 ++++++++++++++
  ramdisk/initramfs/musl_riscv64/init           | 57 ++++++++++++++-----
- 3 files changed, 98 insertions(+), 14 deletions(-)
+ 3 files changed, 104 insertions(+), 14 deletions(-)
  create mode 100755 buildroot/board/cvitek/SG200X/overlay/etc/init.d/S98confirm
 
 diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S03data b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S03data
@@ -61,18 +61,20 @@ index 98f1ef6f4..fc7bbb970 100755
  
 diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S98confirm b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S98confirm
 new file mode 100755
-index 000000000..90d55dff1
+index 000000000..d06054904
 --- /dev/null
 +++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S98confirm
-@@ -0,0 +1,36 @@
+@@ -0,0 +1,42 @@
 +#!/bin/sh
 +# RNSBox A/B: mark the current rootfs slot "good" once the system is healthy, so
 +# the initramfs boot-count rollback (see ramdisk .../init) does not revert a
 +# working update. Clears the boot-attempt counter on the shared /boot partition.
 +#
-+# "Healthy" = rnsd is running AND the admin portal is listening on :80. Runs late
-+# (S98, after S81router/S82rnsd) with a short retry. Layout-detecting: a clean
-+# no-op on the single-partition (pre-A/B) image (no p3).
++# "Healthy" = rnsd is running AND the admin portal is listening on :80. rnsd is
++# clock-gated (S82rnsd waits for /run/clock-synced) and cold-starts slowly on the
++# C906, so a background watcher waits up to ~5 min rather than blocking boot or
++# giving up too early. Layout-detecting: a clean no-op on the single-partition
++# (pre-A/B) image (no p3).
 +
 +[ "$1" = start ] || exit 0
 +[ -b /dev/mmcblk0p3 ] || exit 0          # A/B layout only
@@ -86,20 +88,24 @@ index 000000000..90d55dff1
 +	awk '$2 ~ /:0050$/ && $4 == "0A" { ok = 1 } END { exit !ok }' /proc/net/tcp
 +}
 +
-+i=0
-+while [ $i -lt 15 ]; do
-+	if healthy; then
-+		mount -o remount,rw /boot 2>/dev/null
-+		echo 0 > /boot/ab_tries
-+		sync
-+		mount -o remount,ro /boot 2>/dev/null
-+		echo "S98confirm: slot confirmed healthy — boot counter cleared"
-+		exit 0
-+	fi
-+	sleep 2
-+	i=$((i + 1))
-+done
-+echo "S98confirm: not healthy within timeout — leaving boot counter (rollback armed)"
++# Background watcher so boot is never blocked; poll up to ~5 min for health.
++(
++	i=0
++	while [ $i -lt 60 ]; do
++		if healthy; then
++			mount -o remount,rw /boot 2>/dev/null
++			echo 0 > /boot/ab_tries
++			sync
++			mount -o remount,ro /boot 2>/dev/null
++			echo "S98confirm: slot confirmed healthy — boot counter cleared" > /dev/console 2>/dev/null
++			exit 0
++		fi
++		sleep 5
++		i=$((i + 1))
++	done
++	echo "S98confirm: not healthy within timeout — rollback armed" > /dev/console 2>/dev/null
++) &
++
 +exit 0
 diff --git a/ramdisk/initramfs/musl_riscv64/init b/ramdisk/initramfs/musl_riscv64/init
 index 684c08a55..bf88499a3 100644
