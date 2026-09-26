@@ -1,0 +1,716 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: smit1237 <smit1237@gmail.com>
+Date: Thu, 24 Sep 2026 16:50:39 +0300
+Subject: [PATCH 26/30] docs: bring README.RNSBox.md and APPLYING.md up to date
+
+Clock and offline operation (rnsd always starts; time from NTP, browser or
+an optional DS3231), DS3231 wiring and validity, default WAN open ports
+incl. tcp/4242, networking (IPv6 on usb0 only, fail-closed firewall),
+logs, per-unit identity, hotspot password rule, daemon process groups,
+and build/apply steps checked against the code.
+---
+ APPLYING.md      | 168 +++++++++++++++++----
+ README.RNSBox.md | 382 +++++++++++++++++++++++++++++------------------
+ 2 files changed, 379 insertions(+), 171 deletions(-)
+
+diff --git a/APPLYING.md b/APPLYING.md
+index 55692b2da..5b85779dc 100644
+--- a/APPLYING.md
++++ b/APPLYING.md
+@@ -1,63 +1,177 @@
+ # Applying and building RNSBox
+ 
+ RNSBox ships as a `git format-patch` series on top of the upstream Sipeed board
+-support package. You apply the series onto a pristine upstream checkout and run
+-the RNSBox build driver.
++support package. You apply the series onto a pristine upstream checkout,
++compile it once with the upstream CVITEK flow, and then package an image with
++the RNSBox build driver, `build-rnsbox.sh`.
+ 
+-## 1. Get the upstream base
++## One command: `build.sh`
++
++The RNSBox patch-series repository,
++[github.com/Smit1237/rnsbox](https://github.com/Smit1237/rnsbox), has a
++`build.sh` that runs steps 2–4 below for you:
++
++```
++git clone https://github.com/Smit1237/rnsbox
++cd rnsbox
++./build.sh lite        # or: ./build.sh dvd
++```
++
++It clones the upstream base into `LicheeRV-Nano-Build/`, fetches the cross
++toolchain, applies `patches/*.patch`, runs one full build and then
++`build-rnsbox.sh` for the variant you asked for. On a later run it reuses the
++existing checkout as it is and does not apply patches again.
++
++The rest of this file is the same flow by hand.
++
++## 1. Build host
++
++A Linux machine set up for Buildroot. The upstream `host/ubuntu` container
++works (see [README.md](README.md)). The `dvd` variant also needs `xorriso`,
++`curl` and `python3` on the host, and access to GitHub to fetch the client
++apps.
++
++## 2. Get the upstream base and the toolchain
+ 
+ ```
+ git clone https://github.com/sipeed/LicheeRV-Nano-Build.git
+ cd LicheeRV-Nano-Build
+ git checkout d4003f15b35d43ad4842f427050ab2bba0114fa5
++git clone --depth=1 https://github.com/sophgo/host-tools host-tools
+ ```
+ 
+-The series was generated against exactly this commit.
++The series was generated against exactly this commit. `host-tools` is the
++cross toolchain; the build expects it at `host-tools/` in the tree.
+ 
+-## 2. Apply the RNSBox patch series
++## 3. Apply the RNSBox patch series
+ 
+ ```
+-git am /path/to/rnsbox-patches/*.patch
++git am /path/to/rnsbox/patches/*.patch
+ ```
+ 
++`git am` creates commits, so it needs a git identity. If you have none set,
++pass one inline: `git -c user.name=you -c user.email=you@example.com am …`.
+ If you would rather not create commits, `git apply` also works:
+ 
+ ```
+-git apply /path/to/rnsbox-patches/*.patch
++git apply /path/to/rnsbox/patches/*.patch
+ ```
+ 
+-## 3. Build
++## 4. Build
+ 
+-RNSBox uses the upstream CVITEK build flow with a single driver that selects
+-the image variant:
++Compile everything once with the upstream flow, then package the variant you
++want:
+ 
+ ```
+-./build-rnsbox.sh dvd     # full image + read-only clients disc (~2.8 GB)
+-./build-rnsbox.sh lite    # NCM-only image, no clients disc (~217 MB)
++export PATH=/usr/sbin:/sbin:$PATH
++source build/cvisetup.sh
++defconfig sg2002_licheervnano_sd
++build_all
++
++./build-rnsbox.sh lite    # NCM-only image, no clients disc (~226 MB)
++# or:
++./fetch-clients.sh
++./build-rnsbox.sh dvd     # + read-only disc of Reticulum client apps (~3.3 GB)
+ ```
+ 
+ Notes:
+ 
+-- The first build compiles a **Rust host toolchain from source** (required for
+-  `python-cryptography` on riscv64-musl, which in turn is required by
+-  Reticulum). Expect this to take a while on the first run only.
+-- The `dvd` variant expects the Reticulum client binaries under `dl/clients/`.
+-  Run `./fetch-clients.sh` first and review `build/clients-stick/` — see the
+-  follow-up note in [README.RNSBox.md](README.RNSBox.md). The `lite` variant
+-  needs none of this.
+-- Output images land under `install/soc_sg2002_licheervnano_sd/images/`,
+-  suffixed `-dvd` / `-lite`.
++- **`/usr/sbin` must be on `PATH`** for the final packing step: genimage calls
++  `mkdosfs` (dosfstools), which usually lives in `/usr/sbin`. Without it no
++  image is written, and the step can still exit successfully.
++  `build-rnsbox.sh` sets `PATH` itself; `build_all` needs it from your shell.
++- The first build compiles a **Rust host toolchain from source**. There is no
++  prebuilt Rust standard library for `riscv64gc-unknown-linux-musl`, and
++  `python-cryptography` (which Reticulum needs) is built with Rust. Expect the
++  first build to take one to two hours; later builds reuse the toolchain.
++- `build_all` compiles U-Boot, the kernel, the out-of-tree drivers (`osdrv`)
++  and Buildroot, and packs an image at the end. Ignore that image: it uses the
++  tree's committed DVD sizes but has no clients disc. (`build.sh` switches the
++  tree to the lite sizes before `build_all` so this image stays small.)
++- `build-rnsbox.sh` does not compile the kernel or U-Boot. It sets the variant
++  (rootfs size, partition size, and whether the clients disc and its
++  `usb.disk0` boot flag ship), rebuilds `rnsbox-portal` every time, rebuilds
++  `dnsmasq`, `python-lxmf` or the AIC8800 WiFi driver when the existing build
++  is out of date, then runs `pack_rootfs` and `pack_burn_image`. On exit it
++  restores the files it changed to the committed (DVD-shaped) state. With no
++  argument it builds `dvd`. The log goes to `/tmp/rnsbox-build.log`.
++- **`dvd` only:** `./fetch-clients.sh` downloads the latest stable release
++  (or, for a project with none, its newest release) of MeshChat, MeshChatX,
++  Ratspeak, Columba and Sideband from GitHub into `dl/clients/`. It checks
++  each file against the upstream checksums where a project publishes them,
++  and records every file in `dl/clients/MANIFEST.txt` (shipped on the disc as
++  `SHA256SUMS.txt`). `build-rnsbox.sh dvd` then builds the ISO and sizes the
++  rootfs and partition to fit it. To refresh the disc with newer releases,
++  delete `dl/clients/` first: `fetch-clients.sh` keeps older downloads, and
++  `build-rnsbox.sh dvd` puts every installer under `dl/clients/<app>/` on the
++  disc. The image packer stores partition sizes in 32 bits, so the disc must
++  stay under about 3.4 GiB. The client apps carry their own licences
++  (Sideband is non-commercial, Ratspeak is AGPL-3.0); check them before you
++  redistribute a `dvd` image. The `lite` variant needs none of this.
++- Output images land under `install/soc_sg2002_licheervnano_sd/images/`.
++  `build-rnsbox.sh` copies its result to a name suffixed `-lite` / `-dvd`;
++  flash that one.
++
++## 5. Rebuilding an existing tree
++
++`build-rnsbox.sh` never rebuilds the kernel. After you apply a newer series
++to a tree that has already been built, or change the kernel config, kernel
++sources or device tree yourself, do a clean kernel and `osdrv` rebuild first:
++
++```
++./build-rnsbox-kclean.sh
++./build-rnsbox.sh lite    # or dvd
++```
+ 
+-## 4. Flash
++`CONFIG_MODVERSIONS` is off, and a module's vermagic does not record the
++kernel config, so a module built against an older config still loads and can
++corrupt memory (turning on `CONFIG_IPV6`, for example, changes
++`struct net_device`). `build_kernel` does not rebuild the out-of-tree
++AIC8800 driver in `osdrv`, and older module copies stay in the Buildroot
++overlay and target, because nothing there deletes files.
++`build-rnsbox-kclean.sh` cleans and rebuilds the kernel and `osdrv`, checks
++that every shipped module carries the `5.10.4-rnsbox` vermagic, removes older
++module copies from the overlay and the Buildroot target, and packs an image.
++As with `build_all`, flash the image from the `build-rnsbox.sh` run that
++follows instead.
++
++`build-rnsbox.sh` catches the common cases: it warns when the built kernel
++lacks IPv6 (Reticulum's AutoInterface on `usb0` needs it), lacks the DS3231
++RTC driver, or predates RNSBox's `rtc-ds1307` fix; it rebuilds the AIC8800
++driver when that is older than the kernel config; it ships the kernel's
++installed modules and removes older copies from the overlay and target; and
++it stops when the kernel's installed modules are older than the kernel
++config.
++
++Buildroot does not notice a changed package recipe either. `build-rnsbox.sh`
++handles the packages listed above; for any other package you change, run
++`make -C buildroot <package>-dirclean` before packaging.
++
++## 6. Flash
+ 
+ ```
+ sudo dd if=install/soc_sg2002_licheervnano_sd/images/<image>.img \
+         of=/dev/sdX bs=4M conv=fsync status=progress
+ ```
+ 
+-Make sure `/usr/sbin` is on `PATH` so genimage's `mkfs.fat` resolves. The DVD
+-image needs a microSD comfortably larger than the ~3.3 GB DVD image (e.g. 8 GB); the rootfs auto-grows to fill the card
+-on first boot.
++A tool such as balenaEtcher works too. The lite image fits any card. The DVD
++image needs a microSD comfortably larger than the image (~3.3 GB today, so
++e.g. 8 GB). The rootfs grows to fill the card on first boot.
++
++## 7. First boot
++
++Plug the board into a host over USB-C. The host gets an address in
++`10.42.0.10`–`.20` by DHCP; browse to `http://10.42.0.1/`. Use the IP
++address: the portal answers only to an IP address (or `localhost` through an
++SSH tunnel). The built-in names `setup.lan`, `setup.rnsbox`, `router.rnsbox`
++and `rnsbox.local` redirect to the IP; any other name gets 403.
++
++| Service | User  | Password |
++|---------|-------|----------|
++| SSH     | root  | admin    |
++| Web UI  | admin | admin    |
+ 
+-Then plug the board into a host over USB-C and browse to `http://10.42.0.1/`
+-(admin / admin).
++Change both on first use. The WAN side opens `tcp 22` (SSH), `tcp 80` (the
++web UI, plus `8081` for the modem page) and `tcp 4242` (`rnsd`) by default;
++close any of them under *Network → Open ports*. See
++[README.RNSBox.md](README.RNSBox.md) for everything else.
+diff --git a/README.RNSBox.md b/README.RNSBox.md
+index 39b5a94e2..ff7ca80cc 100644
+--- a/README.RNSBox.md
++++ b/README.RNSBox.md
+@@ -5,7 +5,7 @@ small, USB-C-powered [Reticulum](https://reticulum.network/) router and
+ transport node with an OpenWrt-style web admin UI.
+ 
+ It is distributed as a **patch series on top of the upstream Sipeed board
+-support package**, so this tree contains only the RNSBox delta — the Linux
++support package**: RNSBox is only the delta on top of it, and the Linux
+ kernel, Buildroot and the CVITEK/Sipeed BSP themselves come from upstream.
+ 
+ - **Upstream base:** [`sipeed/LicheeRV-Nano-Build`](https://github.com/sipeed/LicheeRV-Nano-Build) at commit `d4003f15b`
+@@ -17,23 +17,31 @@ kernel, Buildroot and the CVITEK/Sipeed BSP themselves come from upstream.
+   with a `TCPServerInterface` on `0.0.0.0:4242` (open on the WAN by default,
+   so Reticulum peers can connect in), an `AutoInterface` on the USB-C LAN,
+   and two public RNS-testnet uplinks preconfigured.
++- **Works offline.** `rnsd` starts at every boot with or without internet, NTP
++  or an RTC, so HaLow-, LAN- or WiFi-only meshes work. The time comes from NTP
++  when a server is reachable, from your browser, or at boot from an optional
++  DS3231 RTC. See [Clock and offline operation](#clock-and-offline-operation).
+ - **USB-C gadget = LAN.** The board presents a CDC-NCM network interface
+   (`usb0 = 10.42.0.1/24`, dnsmasq DHCP + DNS). The DVD build additionally
+   exposes a read-only mass-storage "disc" pre-loaded with Reticulum client apps
+   for a zero-download quick start.
+-- **eth0 = WAN**, DHCP or static, with NAT masquerade plus per-rule port
+-  forwarding and open-port management.
+-- **`rnsbox-portal`** — a C++ CGI admin UI (served by `uhttpd`) on
+-  `http://10.42.0.1/` for network, Reticulum, WiFi and system settings. It is
++- **eth0 = WAN** (DHCP or static), or the WiFi client on the *W* board
++  (DHCP), with NAT masquerade plus per-rule port forwarding and open-port
++  management.
++- **`rnsbox-portal`** — a C++ CGI admin UI (served by `uhttpd`) for network,
++  Reticulum, WiFi, clock and system settings. Open it by IP address:
++  `http://10.42.0.1/` over USB-C, or the box's hotspot or WAN address. It is
+   the single source of truth for the generated `nftables` ruleset (boot and
+   live-apply both call the same generator). As a DNS-rebinding guard it only
+-  answers to an IP address (`http://10.42.0.1/`); the built-in names such as
+-  `setup.lan` just redirect there.
+-- Optional **NomadNet** LXMF / pages node (off by default) and **AIC8800 WiFi**
+-  STA/AP support for the *W* board variant.
+-- **Works offline.** Reticulum starts with or without internet, NTP or an
+-  RTC. The time comes from an optional DS3231 RTC, NTP when a WAN is up, or
+-  your browser. See [Clock and offline operation](#clock-and-offline-operation).
++  answers on an IP address (or `localhost`, for an SSH tunnel); the built-in
++  names such as `setup.lan` redirect to the IP, and any other name gets 403.
++- **AIC8800 WiFi** STA/AP support for the *W* board variant.
++- Optional **SLIP link to an external WiFi-HaLow (RNode) modem** for
++  long-range sub-GHz Reticulum (off by default). See
++  [Connecting a WiFi-HaLow (RNode) modem over SLIP](#connecting-a-wifi-halow-rnode-modem-over-slip).
++- Opt-in **NomadNet** LXMF / pages node and **`lxmd`** LXMF propagation node.
++  Both ship disabled because RAM is tight alongside `rnsd`. See
++  [Reticulum services](#reticulum-services).
+ 
+ The design goal throughout is a minimal OS: the camera / display / audio / NPU
+ / codec middleware of the stock BSP is stripped so nearly all of the 256 MB
+@@ -43,16 +51,51 @@ DDR is available to Linux and the router data plane.
+ 
+ - Sipeed LicheeRV Nano-e (no radio) or Nano-e **W** (AIC8800 WiFi). One image
+   serves both; WiFi bring-up is a clean no-op where there is no radio.
+-- microSD: the DVD build's size tracks the current client releases (~3.3 GB now; use a card comfortably larger, e.g. 8 GB);
+-  the lite build is ~217 MB. The rootfs auto-grows to fill the card on first
+-  boot.
++- microSD: the DVD build's size tracks the current client releases (~3.3 GB
++  now; use a card comfortably larger, e.g. 8 GB); the lite build is ~226 MB.
++  The rootfs auto-grows to fill the card on first boot.
++- Optional: a DS3231 RTC module (see [Optional DS3231 RTC](#optional-ds3231-rtc))
++  and a WiFi-HaLow RNode modem on UART1 (see
++  [Connecting a WiFi-HaLow (RNode) modem over SLIP](#connecting-a-wifi-halow-rnode-modem-over-slip)).
++
++## Default credentials
++
++| Service | User  | Password |
++|---------|-------|----------|
++| SSH     | root  | admin    |
++| Web UI  | admin | admin    |
++
++Change these on first use: SSH and the web UI are both open on the WAN by
++default. Change the web password under *Settings → Change admin password*, and
++root's password with `passwd` over SSH. The web password is stored hashed
++(pbkdf2) in `/etc/rnsbox/auth.json`. There is one session at a time: its
++token is random per login and kept only in RAM (`/run`), and a new login ends
++any other. Every state-changing portal action is a POST that must come from
++the portal's own page (same-origin `Origin`/`Referer` check); a plain link or
++a cross-site form can't change anything.
++
++Open on the WAN by default (*Network → Open ports*): `tcp 22` (SSH),
++`tcp 80` (the web UI, plus `8081` for the modem page) and `tcp 4242`
++(`rnsd`'s `TCPServerInterface`, for Reticulum peers). Remove any of them
++there to close it. The LAN side (the USB-C link, plus the WiFi hotspot while
++it is on) always has full access.
++
++The WiFi **hotspot has no default password**: it stays off until you set one
++(8–63 characters) on the WiFi tab. The old published default `changeme123` is
++refused, and a box still carrying it keeps its hotspot off (the WiFi client
++side keeps working) until a new password is set.
+ 
+ ## WiFi on the Nano-e W
+ 
+ The **W** board adds a single AIC8800 radio, driven from the portal's **WiFi**
+ tab. It has four modes: **off**, **STA** (join an upstream network), **AP** (run
+-a hotspot), and **STA + AP** (both at once). On the plain Nano-e, which has no
+-radio, WiFi bring-up is a clean no-op.
++a hotspot), and **STA + AP** (both at once). The hotspot runs on 2.4 GHz,
++and since the radio can't be on two bands at once, STA + AP pins the WiFi
++client to 2.4 GHz too: an upstream that only offers 5 GHz won't connect in
++that mode, so use STA-only for a 5 GHz uplink. The WiFi client can be the WAN
++(*Network → WAN uplink → wlan0*; always DHCP). The hotspot (`RNSBox-AP`,
++`192.168.42.1/24`) is a second LAN: its clients get DHCP, DNS, the portal and
++NAT'd internet, like the USB-C LAN.
+ 
+ Because the AIC8800 is a **single radio**, the STA and AP time-share it, and the
+ hotspot is treated as the priority so local clients stay served:
+@@ -68,29 +111,6 @@ hotspot is treated as the priority so local clients stay served:
+ A small background watchdog (`S36wifiwatch`) enforces this and is active only in
+ **STA + AP** mode; in STA-only or AP-only mode it does nothing.
+ 
+-## Default credentials
+-
+-| Service | User  | Password |
+-|---------|-------|----------|
+-| SSH     | root  | admin    |
+-| Web UI  | admin | admin    |
+-
+-Change these on first use. The web password is stored hashed (pbkdf2) in
+-`/etc/rnsbox/auth.json` after first login; the session token is random per
+-login and kept only in RAM (`/run`). Every state-changing portal action is a
+-POST that must come from the portal's own page (same-origin `Origin`/`Referer`
+-check); a plain link or a cross-site form can't change anything.
+-
+-Open on the WAN by default (*Network → Open ports*): `tcp 22` (SSH),
+-`tcp 80` (the web UI, plus `8081` for the modem page) and `tcp 4242`
+-(`rnsd`'s `TCPServerInterface`, for Reticulum peers). Remove any of them
+-there to close it; the USB-C LAN always has full access.
+-
+-The WiFi **hotspot has no default password**: it stays off until you set one
+-(8–63 characters) on the WiFi tab. The old published default `changeme123` is
+-refused, and a box still carrying it keeps its hotspot off (the WiFi client
+-side keeps working) until a new password is set.
+-
+ ## Networking notes
+ 
+ - **IPv6 is link-local only, and only on the USB-C LAN (`usb0`).** It exists
+@@ -114,24 +134,25 @@ side keeps working) until a new password is set.
+   forwards or open ports are allowed. If even that can't load, a built-in
+   IPv4-only emergency ruleset is used; if nf_tables is unusable, forwarding
+   stays off. Details go to `/var/log/nftgen.err`. The same emergency ruleset
+-  (USB-C LAN only) is loaded before the WAN gets an address at boot (`S29fw`)
+-  and when the firewall is stopped at shutdown, so WAN SSH is never briefly
+-  open while the box boots.
++  (LAN only: the USB-C link, plus the hotspot at shutdown if it is on) is
++  loaded before the WAN gets an address at boot (`S29fw`) and when the
++  firewall is stopped at shutdown, so WAN SSH is never briefly open while the
++  box boots.
+ - **eth0 is configured only when it is the WAN.** With `wlan0` as the WAN
+   (W board), `eth0` gets no DHCP client, address or route, so plugging a cable
+-  in can't take over the default route.
+-- **Logs.** `rnsd`, `lxmd` and `nomadnet` log to syslog (`/var/log/messages`,
+-  tags `rnsd[pid]` etc.), which is RAM-backed and rotated. `/var/log` lives on
+-  the 16 MB `/tmp` tmpfs.
++  in can't take over the default route. While `eth0` is the DHCP WAN,
++  re-plugging its cable renews the lease, so moving the box to another network
++  picks up a new address within seconds.
+ - **Per-unit identity.** The eth0 MAC, the USB serial number, the host-side
+   USB network MAC (which names a Linux host's `enx…` interface) and the box's
+   own USB network MAC (and so its `usb0` IPv6 link-local, which Reticulum's
+-  AutoInterface uses to tell boxes on one host apart) are derived
+-  per unit, from the chip UID where available, else from the microSD card's
+-  CID. They stay the same across reboots and reflashes of the same card;
+-  moving the card to another board moves the identity with it. Units upgraded
+-  from an image that shared one MAC get a new DHCP lease once and appear once
+-  as a new USB device.
++  AutoInterface uses to tell boxes on one host apart) are derived per unit
++  from the microSD card's CID. RNSBox doesn't load the driver that exposes the
++  chip UID, so the identity belongs to the card: it stays the same across
++  reboots and reflashes of the same card, and moving the card to another board
++  moves it with the card. A card that reports a blank CID gets a random ID
++  instead, which a reflash resets. Units upgraded from an image that shared
++  one MAC get a new DHCP lease once and appear once as a new USB device.
+ 
+ ## Clock and offline operation
+ 
+@@ -142,36 +163,40 @@ Reticulum identity on the first start as usual, whether or not there is
+ internet, NTP or an RTC. `ntpd` always runs, and boot never blocks on the
+ network or the time.
+ 
+-Where the time comes from:
+-
+-- **RTC at boot.** With the optional DS3231 fitted (below), the kernel sets
+-  the clock from it while booting. `S45ntpsync` then records the source as
+-  `rtc`, as long as the RTC's time can be trusted (see *Validity*).
+-- **NTP.** Whenever a route to one of the servers in Settings → NTP servers
+-  appears (an IPv4 default route, or a local time server on a directly
+-  connected subnet — e.g. a GPS NTP box on a mesh with no uplink; give it as
+-  an IP address, since a name needs DNS over a default route), and again
+-  whenever the routes change, a background one-shot runs `ntpdate` against
+-  them. It retries at growing intervals while the route stays up without
+-  NTP, and Settings → *Restart NTP* runs it at once (e.g. after editing the
+-  servers).
+-  `ntpd` is stopped for the few seconds of that step and started again
+-  afterwards, because two programs stepping the clock at once can apply the
+-  same correction twice. The result is re-checked against the servers; on
+-  success the source becomes `ntp`, and the time is written to the RTC.
+-  `ntpd` keeps the clock disciplined after that.
+-- **Browser.** Settings → *Sync clock to browser* sets the clock from your
++Where the time comes from, in order of precedence:
++
++- **NTP.** The shipped servers are IP addresses (Cloudflare and Google
++  anycast), so no DNS is needed; edit them under *Settings → NTP servers*.
++  Until NTP has set the clock, a background one-shot runs `ntpdate` against
++  them whenever a route to one of them appears or the routes change — an IPv4
++  default route, or a directly connected subnet for a local time server such
++  as a GPS NTP box on a mesh with no uplink (give that one as an IP address,
++  since a name needs DNS over a default route) — and otherwise retries after
++  10 minutes, then at doubling intervals up to once an hour. *Settings →
++  Restart NTP* runs it at once (e.g. after editing the servers). `ntpd` is
++  stopped for the few seconds of that step and started again afterwards,
++  because two programs stepping the clock at once can apply the same
++  correction twice. The result is re-checked against the servers; on success
++  the source becomes `ntp`, and the time is written to the RTC. `ntpd` keeps
++  the clock disciplined after that.
++- **Browser.** *Settings → Sync clock to browser* sets the clock from your
+   browser's time and writes it to the RTC, **even an RTC that was never set**.
+   That is how you set up an RTC on a box with no internet. NTP takes
+-  precedence: once NTP has synced, the browser button is not needed.
+-
+-The Settings page shows the system time, the clock source (none / RTC / NTP /
+-browser), the RTC state and the NTP servers. `/etc/init.d/S45ntpsync status`
+-shows the same from a shell, and `/var/log/ntp-step.log` has the NTP
+-one-shot's log. The RTC is written only on a successful NTP sync, on a
+-browser sync, by an hourly resync, and by the kernel's own 11-minute
+-write-back while `ntpd` has the clock synced. It is never written from an
+-untrusted clock.
++  precedence: once NTP has synced, the button is disabled.
++- **RTC at boot.** With the optional DS3231 fitted (below), the kernel sets
++  the clock from it while booting. `S45ntpsync` then records the source as
++  `rtc`, as long as the RTC's time can be trusted (see *Validity* below).
++  With no RTC, or one that isn't set, the clock starts at 1970 on every boot
++  until NTP or a browser sync sets it.
++
++The Settings page (*Time & Clock*) shows the system time, the clock source
++(none / RTC / NTP / browser), the RTC state and the NTP servers; the Dashboard
++shows the clock source too. From a shell, `/etc/init.d/S45ntpsync status`
++shows the clock source, the RTC state and whether the NTP one-shot is
++running, and `/var/log/ntp-step.log` has the one-shot's log. The RTC
++is written only on a successful NTP sync, on a browser sync, by an hourly
++resync, and by the kernel's own 11-minute write-back while `ntpd` has the
++clock synced. It is never written from an untrusted clock.
+ 
+ The **hourly resync** (`S45ntpsync resync`, from cron at :17) exists
+ because that kernel write-back can't be relied on here: every clock step —
+@@ -184,32 +209,38 @@ written to the RTC (and the source becomes `ntp` if it wasn't); further off,
+ the clock is stepped first, exactly as by the one-shot. No answer, no route
+ or no RTC: nothing is written.
+ 
+-**Without a trusted clock**, Reticulum still routes, but with a caveat. Its
+-announces carry a wrong (1970) timestamp. Reticulum keeps a path until the
+-current time passes its receive time plus 7 days, and replaces it only with an
+-announce emitted later than the stored one.
+-So a node whose clock is behind the timestamps it stored keeps stale paths
+-indefinitely. That happens to this box after a reboot when it ran with NTP or
+-a browser-set clock, or for days on an unset one: `S82rnsd` therefore sets
+-aside a path table dated more than an hour after the current clock before it
+-starts `rnsd` (identity and known destinations are kept), and the box
+-re-learns its paths from live announces. On an online box without an RTC
+-that is usually one re-learn per boot, since `rnsd` starts before NTP sets
+-the clock. Peers that
+-still hold this box's earlier, later-dated announce ignore its new ones until
+-that path expires on their own clock. Another RNSBox whose clock also rolled
+-back sets its table aside at its own restart; any other node whose clock
+-rolled back keeps the stale path until its clock is set. When the clock is set
+-later, Reticulum re-learns paths and re-establishes links once. A DS3231, or
+-NTP / a browser sync on every node, avoids all of this. NTP or a browser sync
+-fixes the timestamps from then on. A propagation node (`lxmd`,
+-or `nomadnet`'s) records with the unset date too: the messages it stores, the
+-propagation peers it hears, and its record of messages already handled. When
+-the clock is set all of these are re-dated rather than expired, so messages
+-still get LXMF's full 30-day lifetime, peers heard meanwhile aren't dropped as
+-14 days unreachable, and already-handled messages aren't accepted again. The
+-rnsd update check needs a correct date for HTTPS, so it is skipped (and the
+-portal says so) until the clock is set.
++### Running without a trusted clock
++
++Reticulum still routes without a trusted clock, but its announces carry a
++wrong (1970) timestamp, which has side effects:
++
++- **Stale paths.** Reticulum keeps a path until the current time passes its
++  receive time plus 7 days, and replaces it only with an announce emitted
++  later than the stored one. So a node whose clock is behind the timestamps
++  it stored keeps stale paths indefinitely. This box gets there after a
++  reboot when it ran with NTP or a browser-set clock, or for days on an unset
++  one. `S82rnsd` therefore sets aside a path table dated more than an hour
++  after the current clock before it starts `rnsd` (identity and known
++  destinations are kept), and the box re-learns its paths from live
++  announces. On an online box without an RTC that is usually one re-learn per
++  boot, since `rnsd` starts before NTP sets the clock.
++- **Peers.** Peers that still hold this box's earlier, later-dated announce
++  ignore its new ones until that path expires on their own clock. Another
++  RNSBox whose clock also rolled back sets its table aside at its own
++  restart; any other node whose clock rolled back keeps the stale path until
++  its clock is set.
++- **When the clock is set** later, Reticulum re-learns paths and
++  re-establishes links once, and timestamps are correct from then on.
++- **Propagation nodes** (`lxmd`, or `nomadnet`'s) record with the unset date
++  too: the messages they store, the propagation peers they hear, and their
++  record of messages already handled. When the clock is set, RNSBox's LXMF
++  patch re-dates all of these rather than expiring them, so messages still
++  get LXMF's full 30-day lifetime, peers heard meanwhile aren't dropped as
++  14 days unreachable, and already-handled messages aren't accepted again.
++- **The rnsd update check** needs a correct date for HTTPS, so it is skipped
++  (and the portal says so) until the clock is set.
++
++A DS3231, or NTP or a browser sync on every node, avoids all of this.
+ 
+ ### Optional DS3231 RTC
+ 
+@@ -266,36 +297,8 @@ or reading `/sys/class/rtc/rtc0/time` fails with *Invalid argument*.
+ Otherwise `S45ntpsync` ignores the RTC's time, and the clock source stays
+ *none* until the next NTP or browser sync writes the RTC. The flag lives in
+ the chip, so this holds on every boot until then. The Settings page shows
+-such an RTC, or one reading outside 2020–2100, as *not set*, along with the
+-DS3231's temperature sensor.
+-
+-## Build variants
+-
+-```
+-./build-rnsbox.sh dvd     # full image + read-only clients disc (~2.8 GB)
+-./build-rnsbox.sh lite    # NCM-only image, no clients disc (~217 MB)
+-```
+-
+-See [APPLYING.md](APPLYING.md) for the full flow.
+-
+-## Licensing
+-
+-- The **RNSBox code in this patch series** (the `rnsbox-portal` app, init
+-  scripts, Buildroot package recipes, build scripts and configuration) is
+-  released under the **MIT License** — see [LICENSE](LICENSE).
+-- The **upstream BSP** (Linux kernel, Buildroot, Sipeed / CVITEK sources)
+-  remains under its own respective licenses.
+-- The bundled Reticulum client applications are **downloaded at build time**,
+-  not redistributed in this tree. They carry their own licenses, some of which
+-  are non-commercial (e.g. Sideband, CC BY-NC-SA) or copyleft (e.g. Ratspeak,
+-  AGPL-3.0); review them before redistributing any built image.
+-
+-## Known follow-ups
+-
+-- `fetch-clients.sh` downloads a subset of the client apps and does not yet
+-  verify pinned checksums or cover every app the DVD build stages from
+-  `build/clients-stick/`. Treat the clients disc as optional and review that
+-  directory before relying on it. The `lite` build does not need it.
++such an RTC, or one reading outside 2020–2100, as *not set*. It also shows
++the DS3231's temperature sensor reading.
+ 
+ ## Connecting a WiFi-HaLow (RNode) modem over SLIP
+ 
+@@ -341,9 +344,10 @@ so its ceiling is **1,562,500** (25 MHz / 16) — it cannot reach the modem's
+ - **Modem**: set SLIP baud to `1500000` over its Ethernet web UI (or `POST
+   /api/slip_cfg`). Runtime-settable and persisted — no reflash.
+ - **RNSBox**: `baud=1500000` in the *HaLow modem (SLIP)* card (or
+-  `/etc/rnsbox/slip.conf`).
++  `/etc/rnsbox/slip.conf`); the portal refuses anything above 1562500.
+ 
+-If `rx_over_errors` climbs under load (`ip -s link show sl0`), drop both ends to
++If the `overrun` counter climbs under load (`ip -s -s link show sl0`, or
++`cat /sys/class/net/sl0/statistics/rx_over_errors`), drop both ends to
+ `1000000` or `921600`.
+ 
+ ### Bring it up
+@@ -355,7 +359,9 @@ If `rx_over_errors` climbs under load (`ip -s link show sl0`), drop both ends to
+    (`stty`), attaches SLIP (`ldattach`), and brings up a point-to-point `sl0` to
+    the modem — equivalent to editing `/etc/rnsbox/slip.conf` (applied by
+    `S31slip`). `ping 192.168.7.2` should now answer.
+-3. **Add the Reticulum interface** in the config editor, then Restart rnsd:
++3. **Add the Reticulum interface.** Once the modem answers, the HaLow card
++   offers **Add to rnsd config**, which adds the interface and restarts
++   `rnsd`. Or add it yourself in the config editor, then *Restart rnsd*:
+ 
+    ```
+    [[HaLow]]
+@@ -372,10 +378,10 @@ If `rx_over_errors` climbs under load (`ip -s link show sl0`), drop both ends to
+ ### Managing the modem from the portal
+ 
+ With SLIP up, the modem's own web UI is reachable only from the box. The portal
+-reverse-proxies it behind the login — *Reticulum tab → Open modem web UI* (or
+-browse to `/modem/`) opens the modem's full config/stats page through your
+-portal session, so nothing is exposed unauthenticated on the LAN. (Firmware OTA
+-is the exception: flash the modem over its own Ethernet UI.)
++reverse-proxies it behind the login: *Open modem web UI* on the HaLow card
++(Reticulum tab or Dashboard) opens the modem's full config/stats page through
++your portal session, so nothing is exposed unauthenticated on the LAN. (Firmware
++OTA is the exception: flash the modem over its own Ethernet UI.)
+ 
+ The modem page is served on its own port, `http://<box>:8081/cgi-bin/portal/modem/`
+ (the portal link redirects there), so the modem's scripts run in a separate
+@@ -389,6 +395,94 @@ The SLIP link is a point-to-point host route to the modem only; it doesn't touch
+ the `eth0` WAN or `usb0` LAN. Requires `CONFIG_SLIP` (kernel) and `ldattach`
+ (util-linux) — both shipped.
+ 
++## Reticulum services
++
++- **`rnsd`** reads `/etc/reticulum/config`, which the Reticulum tab can edit
++  (*Save*, then *Restart rnsd*); the same tab shows `rnstatus -a`. Its
++  transport identity lives under `/etc/reticulum/storage`, readable by root
++  only. If `rnsd` crashes, `S46wanwatch` starts it again within about 10 s;
++  an explicit `/etc/init.d/S82rnsd stop` sticks until the next `start` or
++  `restart`.
++- **Auto-restart** (optional, off by default): Reticulum tab → *Auto-restart
++  rnsd*, every 1–7 days at 04:00. `rnsd`'s RAM grows as it learns the network
++  (an announce cache, not a leak); a periodic restart bounds it.
++- **Updates.** The box checks PyPI for a newer `rns` daily at 05:00 and once
++  per boot (once the clock is set and a default route exists), and shows a
++  notice on the Reticulum tab; the automatic checks (daily and at boot) can
++  be switched off there, and *Check for updates* runs one on demand. It
++  never installs anything by itself. *Update rnsd … now* replaces the `rns`
++  package in place with `pip` and restarts `rnsd`; your config is untouched,
++  and it rolls back if `rnsd` fails to come back up.
++- **NomadNet and `lxmd`** ship installed but disabled (`enabled=no`): the
++  256 MB board can't comfortably run them beside `rnsd` for long. To enable
++  one, set `enabled=yes` in `/etc/rnsbox/nomadnet.conf` or
++  `/etc/rnsbox/lxmd.conf`, then reboot or run `/etc/init.d/S83nomadnet start`
++  / `/etc/init.d/S85lxmd start`. Both attach to `rnsd`'s shared instance
++  instead of starting a second stack. `lxmd` refuses to start when less than
++  `min_free_mb` (60 MB by default) of memory is available. Stopping either
++  one also ends the stamp workers LXMF forks, so none are left running. Run
++  one propagation node, not both: `lxmd` is the lightweight choice when that
++  is all you want; NomadNet adds a pages server.
++
++## Logs
++
++All logs are in RAM (`/var/log` lives on the 16 MB `/tmp` tmpfs), so they
++don't wear the microSD card and start empty at every boot.
++
++- `/var/log/messages` — syslog, rotated. `rnsd`, `lxmd` and `nomadnet` log
++  here (tags `rnsd[pid]` etc.).
++- `/var/log/ntp-step.log` — the NTP one-shot and the hourly RTC resync.
++- `/var/log/wanwatch.log` — the background watchdog (NTP retries, `rnsd`
++  restarts, eth0 re-plugs).
++- `/var/log/wifi.log` — WiFi bring-up and the STA + AP watchdog.
++- `/var/log/slip.log` — the SLIP link to the HaLow modem.
++- `/var/log/nftgen.err` — firewall generation problems.
++- `/var/log/cron.log` — scheduled jobs (auto-restart, update check, RTC
++  resync).
++- `/var/log/resizefs.log` — growing the rootfs to fill the card at boot
++  (`resize2fs`).
++
++eth0's DHCP client (`udhcpc`) is not logged, on purpose: with no DHCP server
++answering it would flood syslog. eth0 re-plugs show in `wanwatch.log`.
++
++## Build variants
++
++```
++./fetch-clients.sh        # dvd only: download the client apps first
++./build-rnsbox.sh dvd     # full image + read-only clients disc (~3.3 GB now)
++./build-rnsbox.sh lite    # NCM-only image, no clients disc (~226 MB)
++```
++
++The DVD image is sized to fit the client disc, so its size follows the
++current client releases. See [APPLYING.md](APPLYING.md) for the full flow.
++
++## Known follow-ups
++
++- `fetch-clients.sh` (run before a DVD build) downloads the **latest**
++  release of each client app; nothing is version-pinned. It checks each
++  download against the checksum files a project publishes, but where a
++  project publishes none, or its checksum file fails to download, it only
++  records the file's SHA-256 in `dl/clients/MANIFEST.txt`
++  (shipped on the disc as `SHA256SUMS.txt`). So the disc's contents depend on
++  what upstream published when they were fetched. It also keeps earlier
++  downloads, and the DVD build puts every installer under `dl/clients/` on
++  the disc, so delete `dl/clients/` before fetching newer releases. Treat the
++  clients disc as optional and review `dl/clients/` and
++  `build/clients-stick/` before relying on it. The `lite` build does not need
++  it.
++
++## Licensing
++
++- The **RNSBox code in this patch series** (the `rnsbox-portal` app, init
++  scripts, Buildroot package recipes, build scripts and configuration) is
++  released under the **MIT License** — see [LICENSE](LICENSE).
++- The **upstream BSP** (Linux kernel, Buildroot, Sipeed / CVITEK sources)
++  remains under its own respective licenses.
++- The bundled Reticulum client applications are **downloaded at build time**,
++  not redistributed in this tree. They carry their own licenses, some of which
++  are non-commercial (e.g. Sideband, CC BY-NC-SA) or copyleft (e.g. Ratspeak,
++  AGPL-3.0); review them before redistributing any built image.
++
+ ## Support RNSBox
+ 
+ RNSBox is free and open source (MIT). If it's useful to you, you can support
+-- 
+2.47.3
+

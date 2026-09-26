@@ -1,0 +1,3062 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: smit1237 <smit1237@gmail.com>
+Date: Thu, 24 Sep 2026 08:05:04 +0300
+Subject: [PATCH 24/30] time: rnsd starts without a synced clock; background
+ NTP; optional DS3231 RTC
+
+Reticulum must work with no internet at all (HaLow-, LAN- or WiFi-only
+meshes), so rnsd no longer waits for a synced clock and starts at every
+boot. lxmd and nomadnet stay opt-in (enabled=no); when enabled they no
+longer wait for the clock either.
+
+- S45ntpsync: non-blocking. Records the time source (/run/clock-source:
+  rtc|ntp|browser) and runs a detached NTP one-shot (ntpdate -u -b,
+  single-flight, step-locked against ntpd) that writes the RTC on
+  success. New `resync` (hourly cron) re-verifies the clock with
+  ntpdate -q and rewrites the RTC only from NTP-confirmed time.
+- Optional DS3231 on the i2c5 bit-bang bus (GPIOA15 SCL / GPIOA27 SDA):
+  kernel RTC_DRV_DS1307 + I2C_GPIO/ALGOBIT built in, rtc@68 in the DTS,
+  and rtc-ds1307 keeps the oscillator-stop flag so an unset or brownout
+  RTC is never used to set the clock.
+- Portal: browser time seed also writes the RTC (even if never set);
+  Time & Clock card shows source, RTC state and DS3231 temperature.
+- Clock-step fallout handled: stale rnsd path tables, dnsmasq leases,
+  LXMF messages/peers stored while the clock was unset (re-date patch).
+- WAN tcp/4242 (rnsd TCPServerInterface) open by default with 22 and 80.
+- python: psutil enabled; unicodedata made explicit (TLS/idna needs it).
+---
+ README.RNSBox.md                              | 149 ++++-
+ build-rnsbox-kclean.sh                        |  21 +
+ build-rnsbox.sh                               |  51 ++
+ .../dts_riscv/sg2002_licheervnano_sd.dts      |  15 +
+ .../linux/sg2002_licheervnano_sd_defconfig    |  21 +-
+ .../SG200X/overlay/etc/init.d/S45ntpsync      | 544 ++++++++++++++++--
+ .../SG200X/overlay/etc/init.d/S46wanwatch     | 248 ++++++--
+ .../cvitek/SG200X/overlay/etc/init.d/S49ntp   |  72 +++
+ .../SG200X/overlay/etc/init.d/S60routing      |   3 +
+ .../cvitek/SG200X/overlay/etc/init.d/S82rnsd  |  83 ++-
+ .../SG200X/overlay/etc/init.d/S83nomadnet     | 122 +++-
+ .../cvitek/SG200X/overlay/etc/init.d/S84cron  |  47 +-
+ .../cvitek/SG200X/overlay/etc/init.d/S85lxmd  | 117 +++-
+ .../board/cvitek/SG200X/overlay/etc/ntp.conf  |  37 +-
+ .../SG200X/overlay/etc/reticulum/config       |   9 +-
+ .../SG200X/overlay/etc/rnsbox/cron.conf       |  12 +-
+ .../SG200X/overlay/etc/rnsbox/lxmd.conf       |   8 +-
+ .../SG200X/overlay/etc/rnsbox/nomadnet.conf   |   8 +
+ .../SG200X/overlay/etc/rnsbox/openports.conf  |  12 +-
+ .../cvitek_SG200X_musl_riscv64_defconfig      |  10 +-
+ buildroot/package/dnsmasq/dnsmasq.mk          |   7 +
+ ...ate-messages-stored-before-clock-set.patch | 118 ++++
+ buildroot/package/python-nomadnet/Config.in   |   1 +
+ .../rnsbox-portal/src/bin/rnsbox-update-check |  24 +-
+ .../src/cgi/pages/dashboard.html              |   3 +
+ .../rnsbox-portal/src/cgi/pages/network.html  |   4 +-
+ .../rnsbox-portal/src/cgi/pages/settings.html |  22 +-
+ .../rnsbox-portal/src/cgi/routes_dash.cpp     |  11 +
+ .../rnsbox-portal/src/cgi/routes_net.cpp      |   2 +-
+ .../src/cgi/routes_reticulum.cpp              |  24 +-
+ .../rnsbox-portal/src/cgi/routes_settings.cpp | 159 ++++-
+ .../package/rnsbox-portal/src/cgi/store.cpp   |   5 +-
+ .../package/rnsbox-portal/src/cgi/sysinfo.cpp |  96 +++-
+ .../package/rnsbox-portal/src/cgi/sysinfo.h   |  36 +-
+ .../rnsbox-portal/src/cgi/www/style.css       |   2 +
+ linux_5.10/drivers/rtc/rtc-ds1307.c           |  55 +-
+ 36 files changed, 1894 insertions(+), 264 deletions(-)
+ create mode 100755 buildroot/board/cvitek/SG200X/overlay/etc/init.d/S49ntp
+ create mode 100644 buildroot/package/python-lxmf/0001-redate-messages-stored-before-clock-set.patch
+
+diff --git a/README.RNSBox.md b/README.RNSBox.md
+index 01dc637a2..39b5a94e2 100644
+--- a/README.RNSBox.md
++++ b/README.RNSBox.md
+@@ -14,8 +14,9 @@ kernel, Buildroot and the CVITEK/Sipeed BSP themselves come from upstream.
+ ## What it does
+ 
+ - **`rnsd`** (Reticulum 1.5.2) runs as the long-lived service: a transport node
+-  with a `TCPServerInterface` on `0.0.0.0:4242`, an `AutoInterface` on the
+-  USB-C LAN, and two public RNS-testnet uplinks preconfigured.
++  with a `TCPServerInterface` on `0.0.0.0:4242` (open on the WAN by default,
++  so Reticulum peers can connect in), an `AutoInterface` on the USB-C LAN,
++  and two public RNS-testnet uplinks preconfigured.
+ - **USB-C gadget = LAN.** The board presents a CDC-NCM network interface
+   (`usb0 = 10.42.0.1/24`, dnsmasq DHCP + DNS). The DVD build additionally
+   exposes a read-only mass-storage "disc" pre-loaded with Reticulum client apps
+@@ -30,6 +31,9 @@ kernel, Buildroot and the CVITEK/Sipeed BSP themselves come from upstream.
+   `setup.lan` just redirect there.
+ - Optional **NomadNet** LXMF / pages node (off by default) and **AIC8800 WiFi**
+   STA/AP support for the *W* board variant.
++- **Works offline.** Reticulum starts with or without internet, NTP or an
++  RTC. The time comes from an optional DS3231 RTC, NTP when a WAN is up, or
++  your browser. See [Clock and offline operation](#clock-and-offline-operation).
+ 
+ The design goal throughout is a minimal OS: the camera / display / audio / NPU
+ / codec middleware of the stock BSP is stripped so nearly all of the 256 MB
+@@ -77,6 +81,11 @@ login and kept only in RAM (`/run`). Every state-changing portal action is a
+ POST that must come from the portal's own page (same-origin `Origin`/`Referer`
+ check); a plain link or a cross-site form can't change anything.
+ 
++Open on the WAN by default (*Network → Open ports*): `tcp 22` (SSH),
++`tcp 80` (the web UI, plus `8081` for the modem page) and `tcp 4242`
++(`rnsd`'s `TCPServerInterface`, for Reticulum peers). Remove any of them
++there to close it; the USB-C LAN always has full access.
++
+ The WiFi **hotspot has no default password**: it stays off until you set one
+ (8–63 characters) on the WiFi tab. The old published default `changeme123` is
+ refused, and a box still carrying it keeps its hotspot off (the WiFi client
+@@ -124,6 +133,142 @@ side keeps working) until a new password is set.
+   from an image that shared one MAC get a new DHCP lease once and appear once
+   as a new USB device.
+ 
++## Clock and offline operation
++
++Reticulum has to work with **no internet at all**: HaLow-only, LAN-only or
++WiFi-only meshes. So nothing on the box waits for the clock. `rnsd` (and
++`lxmd` / `nomadnet` when enabled) always start at boot, creating the
++Reticulum identity on the first start as usual, whether or not there is
++internet, NTP or an RTC. `ntpd` always runs, and boot never blocks on the
++network or the time.
++
++Where the time comes from:
++
++- **RTC at boot.** With the optional DS3231 fitted (below), the kernel sets
++  the clock from it while booting. `S45ntpsync` then records the source as
++  `rtc`, as long as the RTC's time can be trusted (see *Validity*).
++- **NTP.** Whenever a route to one of the servers in Settings → NTP servers
++  appears (an IPv4 default route, or a local time server on a directly
++  connected subnet — e.g. a GPS NTP box on a mesh with no uplink; give it as
++  an IP address, since a name needs DNS over a default route), and again
++  whenever the routes change, a background one-shot runs `ntpdate` against
++  them. It retries at growing intervals while the route stays up without
++  NTP, and Settings → *Restart NTP* runs it at once (e.g. after editing the
++  servers).
++  `ntpd` is stopped for the few seconds of that step and started again
++  afterwards, because two programs stepping the clock at once can apply the
++  same correction twice. The result is re-checked against the servers; on
++  success the source becomes `ntp`, and the time is written to the RTC.
++  `ntpd` keeps the clock disciplined after that.
++- **Browser.** Settings → *Sync clock to browser* sets the clock from your
++  browser's time and writes it to the RTC, **even an RTC that was never set**.
++  That is how you set up an RTC on a box with no internet. NTP takes
++  precedence: once NTP has synced, the browser button is not needed.
++
++The Settings page shows the system time, the clock source (none / RTC / NTP /
++browser), the RTC state and the NTP servers. `/etc/init.d/S45ntpsync status`
++shows the same from a shell, and `/var/log/ntp-step.log` has the NTP
++one-shot's log. The RTC is written only on a successful NTP sync, on a
++browser sync, by an hourly resync, and by the kernel's own 11-minute
++write-back while `ntpd` has the clock synced. It is never written from an
++untrusted clock.
++
++The **hourly resync** (`S45ntpsync resync`, from cron at :17) exists
++because that kernel write-back can't be relied on here: every clock step —
++the NTP one-shot's, a browser sync, `ntpd`'s own — clears the kernel's
++"synced" state until `ntpd` has re-synced, which can take a long time or
++never happen, and without `ntpq` on the box nothing can confirm it. So once
++an hour, when an NTP server is reachable, the resync queries the servers
++(`ntpdate -q`, which never touches the clock): within 0.5 s, the time is
++written to the RTC (and the source becomes `ntp` if it wasn't); further off,
++the clock is stepped first, exactly as by the one-shot. No answer, no route
++or no RTC: nothing is written.
++
++**Without a trusted clock**, Reticulum still routes, but with a caveat. Its
++announces carry a wrong (1970) timestamp. Reticulum keeps a path until the
++current time passes its receive time plus 7 days, and replaces it only with an
++announce emitted later than the stored one.
++So a node whose clock is behind the timestamps it stored keeps stale paths
++indefinitely. That happens to this box after a reboot when it ran with NTP or
++a browser-set clock, or for days on an unset one: `S82rnsd` therefore sets
++aside a path table dated more than an hour after the current clock before it
++starts `rnsd` (identity and known destinations are kept), and the box
++re-learns its paths from live announces. On an online box without an RTC
++that is usually one re-learn per boot, since `rnsd` starts before NTP sets
++the clock. Peers that
++still hold this box's earlier, later-dated announce ignore its new ones until
++that path expires on their own clock. Another RNSBox whose clock also rolled
++back sets its table aside at its own restart; any other node whose clock
++rolled back keeps the stale path until its clock is set. When the clock is set
++later, Reticulum re-learns paths and re-establishes links once. A DS3231, or
++NTP / a browser sync on every node, avoids all of this. NTP or a browser sync
++fixes the timestamps from then on. A propagation node (`lxmd`,
++or `nomadnet`'s) records with the unset date too: the messages it stores, the
++propagation peers it hears, and its record of messages already handled. When
++the clock is set all of these are re-dated rather than expired, so messages
++still get LXMF's full 30-day lifetime, peers heard meanwhile aren't dropped as
++14 days unreachable, and already-handled messages aren't accepted again. The
++rnsd update check needs a correct date for HTTPS, so it is skipped (and the
++portal says so) until the clock is set.
++
++### Optional DS3231 RTC
++
++The Nano-e has no battery-backed clock, so it boots at 1970. A DS3231 module
++(the common ZS-042 board, or a bare chip) keeps the time across power-off on
++its coin cell. It sits on a bit-banged I²C bus, `i2c5`, at address `0x68`,
++and shows up as `/dev/rtc0`.
++
++```
++  LicheeRV Nano-e                 DS3231 module
++  ───────────────                 ─────────────
++   3V3      ────────────────────  VCC
++   GND      ────────────────────  GND
++   GPIOA15  ────────────────────  SCL
++   GPIOA27  ────────────────────  SDA
++```
++
++| Nano-e pad | Function   | DS3231 |
++|------------|------------|--------|
++| `3V3`      | power      | VCC    |
++| `GND`      | ground     | GND    |
++| `GPIOA15`  | I²C5 SCL   | SCL    |
++| `GPIOA27`  | I²C5 SDA   | SDA    |
++
++- **3.3 V only.** Power the module from `3V3`, never 5 V. The module's
++  pull-ups go to its VCC, and the SG2002 pads are not 5 V tolerant.
++- **Pull-ups.** I²C needs pull-ups on SDA and SCL. ZS-042-style modules
++  have 4.7 kΩ on board. With a bare chip, fit 4.7 kΩ from each line to 3.3 V.
++- **Coin-cell charging.** The ZS-042 trickle-charges its cell through a
++  resistor and diode, which is unsafe with a non-rechargeable CR2032. Remove
++  that resistor or diode, or use an LIR2032.
++- **Why not I2C1 / I2C3?** Sipeed's pinout labels the SD1 pads as I2C1 and
++  I2C3. On the Nano-e **W** those pads carry the SDIO bus to the AIC8800
++  WiFi. `GPIOA15` / `GPIOA27` are free on both boards, so one image serves
++  both. U-Boot already muxes them to GPIO.
++- **No module fitted** is fine. The probe finds nothing, there is no
++  `rtc0`, and the box behaves exactly as without an RTC.
++
++**Validity.** A DS3231 sets its oscillator-stop flag (OSF) whenever its
++oscillator has stopped. That happens on first power-up and when the coin cell
++ran flat while the board was unpowered. Its time is then meaningless: it
++restarts at 2000-01-01. The stock 5.10 driver cleared the flag while probing
++and read that time back anyway; RNSBox's patched `rtc-ds1307` keeps the flag
++(logging `oscillator stop flag set … SET TIME!` once at boot) and refuses to
++read the time while it is set, until the RTC is next written — which clears
++it. So the kernel doesn't set the clock from such an RTC, and `hwclock -r`
++or reading `/sys/class/rtc/rtc0/time` fails with *Invalid argument*.
++`S45ntpsync` trusts the RTC at boot only if both of these hold:
++
++- the kernel actually set the clock from it (`/sys/class/rtc/rtc0/hctosys`
++  is `1`);
++- the time lies between 2020 and 2100.
++
++Otherwise `S45ntpsync` ignores the RTC's time, and the clock source stays
++*none* until the next NTP or browser sync writes the RTC. The flag lives in
++the chip, so this holds on every boot until then. The Settings page shows
++such an RTC, or one reading outside 2020–2100, as *not set*, along with the
++DS3231's temperature sensor.
++
+ ## Build variants
+ 
+ ```
+diff --git a/build-rnsbox-kclean.sh b/build-rnsbox-kclean.sh
+index ed76fd14d..42e3dfec7 100755
+--- a/build-rnsbox-kclean.sh
++++ b/build-rnsbox-kclean.sh
+@@ -63,6 +63,27 @@ rm -f "${BR_OVERLAY_DIR:?}"/mnt/system/ko/*.ko "$BR_OVERLAY_DIR"/mnt/system/ko/3
+ 
+ echo "--- force-refresh local rnsbox-portal pkg ---"
+ rm -rf "$BRD"/output/build/rnsbox-portal-*
++# Same package refreshes as build-rnsbox.sh: pack_rootfs below runs the full
++# buildroot make, which doesn't notice a changed .mk or a new patch.
++# dnsmasq is built with HAVE_BROKEN_RTC (package/dnsmasq/dnsmasq.mk) so its
++# leases survive S45ntpsync's background clock step: rebuild a dnsmasq whose
++# --version options lack "no-RTC".
++DNSMASQ_BIN="$BRD/output/target/usr/sbin/dnsmasq"
++if [ -f "$DNSMASQ_BIN" ] && ! grep -q 'no-RTC' "$DNSMASQ_BIN"; then
++	echo "--- dnsmasq was built without HAVE_BROKEN_RTC: rebuilding it ---"
++	rm -rf "$BRD"/output/build/dnsmasq-*
++fi
++# python-lxmf carries the RNSBox re-date patch
++# (package/python-lxmf/0001-redate-messages-stored-before-clock-set.patch).
++# Buildroot applies patches only when it extracts a package, so a tree built
++# before the patch existed keeps shipping stock LXMF: rebuild it if the
++# target LXMRouter.py lacks the patch's CLOCK_FLOOR. Nothing else has a
++# build-time dependency on python-lxmf, so removing its build dir is enough.
++LXMF_PY=$(ls "$BRD"/output/target/usr/lib/python3*/site-packages/LXMF/LXMRouter.py 2>/dev/null | head -n 1)
++if [ -n "$LXMF_PY" ] && ! grep -q CLOCK_FLOOR "$LXMF_PY"; then
++	echo "--- python-lxmf lacks the RNSBox re-date patch: rebuilding it ---"
++	rm -rf "$BRD"/output/build/python-lxmf-*
++fi
+ export PATH=/usr/sbin:/sbin:$PATH
+ 
+ echo "--- pack_rootfs + pack_burn_image ---"
+diff --git a/build-rnsbox.sh b/build-rnsbox.sh
+index 8912f09fa..b7cde8185 100755
+--- a/build-rnsbox.sh
++++ b/build-rnsbox.sh
+@@ -92,12 +92,50 @@ if grep -q '^CONFIG_IPV6=y' "$KDEFCONFIG" && [ -f "$KBUILTCFG" ] \
+ 	echo "         this image keeps the old kernel. Rebuild kernel + osdrv"
+ 	echo "         (build_all, or ./build-rnsbox-kclean.sh) for AutoInterface."
+ fi
++# Same for the optional DS3231 RTC (built-in rtc-ds1307 + i2c-gpio, DTS rtc@68
++# on i2c5; the DTB comes from the kernel build too): an older kernel boots
++# fine but behaves as if no RTC were fitted.
++if grep -q '^CONFIG_RTC_DRV_DS1307=y' "$KDEFCONFIG" && [ -f "$KBUILTCFG" ] \
++   && ! grep -q '^CONFIG_RTC_DRV_DS1307=y' "$KBUILTCFG"; then
++	echo "WARNING: the built kernel lacks the DS3231 RTC driver the defconfig"
++	echo "         enables — this image acts as if no RTC were fitted. Rebuild"
++	echo "         the kernel (build_all, or ./build-rnsbox-kclean.sh)."
++fi
++# ...or has it, but built before RNSBox's rtc-ds1307.c patch (the driver keeps
++# a DS3231's oscillator-stop flag and refuses the lost time): S45ntpsync
++# trusts whatever time the kernel set the clock from, which is safe only
++# with the patch.
++KRTC_OBJ=linux_5.10/build/sg2002_licheervnano_sd/drivers/rtc/rtc-ds1307.o
++if [ -f "$KRTC_OBJ" ] && [ linux_5.10/drivers/rtc/rtc-ds1307.c -nt "$KRTC_OBJ" ]; then
++	echo "WARNING: the built kernel's rtc-ds1307 predates its oscillator-stop fix —"
++	echo "         a DS3231 that lost its time would be trusted at boot. Rebuild"
++	echo "         the kernel (build_all, or ./build-rnsbox-kclean.sh)."
++fi
+ 
+ echo "--- source cvisetup + defconfig ---"
+ source build/cvisetup.sh || { echo "FATAL: cvisetup"; exit 93; }
+ defconfig sg2002_licheervnano_sd || { echo "FATAL: defconfig"; exit 94; }
+ BRD="${BR_DIR:-$ROOT/buildroot}"
+ rm -rf "$BRD"/output/build/rnsbox-portal-*
++# dnsmasq is built with HAVE_BROKEN_RTC (package/dnsmasq/dnsmasq.mk) so its
++# leases survive S45ntpsync's background clock step. Buildroot doesn't notice
++# a changed .mk, so rebuild a dnsmasq whose --version options lack "no-RTC".
++DNSMASQ_BIN="$BRD/output/target/usr/sbin/dnsmasq"
++if [ -f "$DNSMASQ_BIN" ] && ! grep -q 'no-RTC' "$DNSMASQ_BIN"; then
++	echo "--- dnsmasq was built without HAVE_BROKEN_RTC: rebuilding it ---"
++	rm -rf "$BRD"/output/build/dnsmasq-*
++fi
++# python-lxmf carries the RNSBox re-date patch
++# (package/python-lxmf/0001-redate-messages-stored-before-clock-set.patch).
++# Buildroot applies patches only when it extracts a package, so a tree built
++# before the patch existed keeps shipping stock LXMF: rebuild it if the
++# target LXMRouter.py lacks the patch's CLOCK_FLOOR. Nothing else has a
++# build-time dependency on python-lxmf, so removing its build dir is enough.
++LXMF_PY=$(ls "$BRD"/output/target/usr/lib/python3*/site-packages/LXMF/LXMRouter.py 2>/dev/null | head -n 1)
++if [ -n "$LXMF_PY" ] && ! grep -q CLOCK_FLOOR "$LXMF_PY"; then
++	echo "--- python-lxmf lacks the RNSBox re-date patch: rebuilding it ---"
++	rm -rf "$BRD"/output/build/python-lxmf-*
++fi
+ export PATH=/usr/sbin:/sbin:$PATH
+ 
+ # aic8800 (osdrv, out-of-tree) must be rebuilt whenever the kernel config
+@@ -139,6 +177,19 @@ if [ -f "$KAUTOCONF" ] && [ -d "$KMODS" ]; then
+ 		&& { echo "FATAL: installed kernel modules predate the kernel config: build_kernel"; exit 97; }
+ 	mkdir -p "$SYSTEM_OUT_DIR/ko"
+ 	find "$KMODS" -name '*.ko' -exec cp -f {} "$SYSTEM_OUT_DIR/ko/" \;
++	# A driver that went =m -> =y leaves its old .ko behind here (cp never
++	# deletes), e.g. i2c-gpio + i2c-algo-bit, built in for the DS3231 RTC.
++	# Drop each top-level .ko that the same modules_install's modules.builtin
++	# now lists as built in; out-of-tree modules (3rd/) are never listed.
++	KBUILTIN=$(find "$KMODS" -name modules.builtin -print -quit)
++	if [ -n "$KBUILTIN" ]; then
++		for ko in "$SYSTEM_OUT_DIR"/ko/*.ko; do
++			[ -f "$ko" ] || continue
++			awk -F/ -v n="${ko##*/}" '$NF == n { f = 1 } END { exit !f }' "$KBUILTIN" || continue
++			echo "--- ${ko##*/} is built into the kernel now: dropping the stale module ---"
++			rm -f "$ko"
++		done
++	fi
+ fi
+ rm -f "${BR_OVERLAY_DIR:?}"/mnt/system/ko/*.ko "$BR_OVERLAY_DIR"/mnt/system/ko/3rd/*.ko \
+       "$BRD"/output/target/mnt/system/ko/*.ko "$BRD"/output/target/mnt/system/ko/3rd/*.ko
+diff --git a/build/boards/sg200x/sg2002_licheervnano_sd/dts_riscv/sg2002_licheervnano_sd.dts b/build/boards/sg200x/sg2002_licheervnano_sd/dts_riscv/sg2002_licheervnano_sd.dts
+index e4eff4fc1..695e2fa2d 100644
+--- a/build/boards/sg200x/sg2002_licheervnano_sd/dts_riscv/sg2002_licheervnano_sd.dts
++++ b/build/boards/sg200x/sg2002_licheervnano_sd/dts_riscv/sg2002_licheervnano_sd.dts
+@@ -208,7 +208,22 @@
+                 scl-gpios = <&porta 15 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+                 sda-gpios = <&porta 27 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+                 i2c-gpio,delay-us = <5>;
++                #address-cells = <1>;
++                #size-cells = <0>;
+                 status = "okay";
++
++		// RNSBox: optional DS3231 RTC (GPIOA15 = SCL, GPIOA27 = SDA,
++		// 3V3, GND). rtc-ds1307 + i2c-gpio are built in, so it registers
++		// as rtc0 during boot and RTC_HCTOSYS sets the clock from it;
++		// S45ntpsync decides whether that time is trusted. Not fitted:
++		// the probe fails (an address NAK is silent) and there is no
++		// rtc0, which RNSBox treats as "no RTC". i2c5 because
++		// Sipeed's header I2C1/I2C3 are the SD1 pads, i.e. the W board's
++		// SDIO WiFi.
++		rtc@68 {
++			compatible = "maxim,ds3231";
++			reg = <0x68>;
++		};
+ 	};
+ 
+         gpio-keys {
+diff --git a/build/boards/sg200x/sg2002_licheervnano_sd/linux/sg2002_licheervnano_sd_defconfig b/build/boards/sg200x/sg2002_licheervnano_sd/linux/sg2002_licheervnano_sd_defconfig
+index 6122d9741..3670a3d1e 100644
+--- a/build/boards/sg200x/sg2002_licheervnano_sd/linux/sg2002_licheervnano_sd_defconfig
++++ b/build/boards/sg200x/sg2002_licheervnano_sd/linux/sg2002_licheervnano_sd_defconfig
+@@ -138,7 +138,11 @@ CONFIG_I2C_DESIGNWARE_SLAVE=y
+ CONFIG_I2C_CHARDEV=y
+ CONFIG_I2C_MUX=y
+ CONFIG_I2C_DESIGNWARE_PLATFORM=y
+-CONFIG_I2C_GPIO=m
++# RNSBox: built in (was =m) for the optional DS3231 RTC on the bit-banged
++# i2c5 (DTS rtc@68, see RTC_DRV_DS1307 below). i2c-gpio selects the bit-bang
++# algorithm; spelled out so both resolve =y.
++CONFIG_I2C_GPIO=y
++CONFIG_I2C_ALGOBIT=y
+ # CONFIG_PTP_1588_CLOCK is not set
+ CONFIG_PINCTRL=y
+ CONFIG_CVITEK_PINCTRL_CV1835=y
+@@ -469,6 +473,21 @@ CONFIG_RCU_TRACE=n
+ # CONFIG_RUNTIME_TESTING_MENU is not set
+ 
+ CONFIG_RTC_CLASS=y
++# RNSBox: optional DS3231 RTC on i2c5 (GPIOA15 = SCL, GPIOA27 = SDA; DTS
++# rtc@68, compatible maxim,ds3231). Built in, not =m, so rtc0 registers
++# while the kernel boots and HCTOSYS sets the clock from it before init;
++# SYSTOHC writes the time back every 11 min only while ntpd has the kernel
++# synced. No chip fitted: the probe fails and there is no rtc0. The SoC RTC
++# (soph_rtc.ko) isn't shipped, so the DS3231 is rtc0. Its temperature
++# sensor (hwmon temp1_input) comes with HWMON=y: 5.10's rtc-ds1307 gates it
++# on IS_REACHABLE(CONFIG_HWMON) (there is no RTC_DRV_DS1307_HWMON symbol).
++# S45ntpsync decides at boot whether the RTC's time is trusted.
++CONFIG_RTC_HCTOSYS=y
++CONFIG_RTC_HCTOSYS_DEVICE="rtc0"
++CONFIG_RTC_SYSTOHC=y
++CONFIG_RTC_SYSTOHC_DEVICE="rtc0"
++CONFIG_RTC_DRV_DS1307=y
++CONFIG_HWMON=y
+ 
+ CONFIG_BLK_DEV_LOOP=y
+ CONFIG_SCSI=y
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S45ntpsync b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S45ntpsync
+index 4d9aa8a3f..7e85358d6 100755
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S45ntpsync
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S45ntpsync
+@@ -1,84 +1,508 @@
+ #!/bin/sh
+-# S45ntpsync - synchronously step the system clock from a hard-coded
+-# list of NTP server IPs before any service that depends on a sane
+-# clock comes up.
++# S45ntpsync - boot-time wall-clock provenance, the background NTP one-shot
++# and the hourly RTC resync.
+ #
+-# Why this exists, in one paragraph:
+-#   The Nano-e has no RTC; the clock starts at 1970 every boot. rnsd
+-#   stamps every announcement / link probe with wall-clock time, and
+-#   peers silently drop anything dated 1970. If S49ntp's daemon used
+-#   pool.ntp.org it'd race against DNS — which may not work until much
+-#   later in boot. So we run a one-shot `ntpd -gq` here against literal
+-#   anycast NTP IPs, before anything time-sensitive starts, and signal
+-#   success via /run/clock-synced. S82rnsd checks that file and refuses
+-#   to start without it.
++# Reticulum must work with no internet at all (HaLow-, LAN- or WiFi-only
++# meshes), so nothing waits for the clock: rnsd (and lxmd / nomadnet, when
++# the operator enabled them) start whether or not the time is known (RNS
++# creates its identity on first start either way), ntpd (S49ntp, -g) always
++# runs, and this script never blocks boot.
++#
++# Clock state, in /run (tmpfs: it resets every boot):
++#   /run/clock-source  one line: rtc | ntp | browser - where the trusted wall
++#                      clock came from; absent = no trusted source yet.
++#   /run/clock-synced  exists iff clock-source does ("the wall clock is
++#                      trustworthy"). Only what genuinely needs real time uses
++#                      it (TLS: the rnsd update checks); no service gates on
++#                      it.
++# Writers: this script at boot (rtc), the NTP one-shot and the hourly resync
++# below (ntp) and the portal's Settings -> "Sync clock to browser" (browser).
++# Precedence: ntp always wins; browser replaces rtc/none; rtc only at boot,
++# over nothing.
++#
++# start (rcS):
++#   1. RTC. With a DS3231 fitted (i2c5, DTS rtc@68 -> rtc0) the kernel has
++#      already set the clock from it (CONFIG_RTC_HCTOSYS) - unless the chip
++#      lost its time: RNSBox's rtc-ds1307 then refuses to read it (see
++#      rtc_trusted) and the clock is left alone. If the kernel set it, from
++#      a plausible time, source=rtc. No RTC, or one that isn't set: no
++#      source, and the clock stays at 1970 until NTP or a browser sync sets
++#      it.
++#   2. The NTP one-shot (seed), detached. start returns at once.
++# sync (S46wanwatch: the routing table changed, or the periodic retry, while
++# the source isn't ntp; the portal's Restart NTP): the one-shot again - exit
++# 3 when no configured server is routable right now (routable_servers), 2
++# (silently) when one is already running, 0 when started.
++# resync (S84cron, hourly): re-check the clock against NTP and write it to
++# the RTC (see resync) - a no-op without an RTC or a routable server.
++# stop only ends a running one-shot or resync; the clock state is left alone.
++# status: clock source, RTC, one-shot.
+ 
++SRC=/run/clock-source
+ FLAG=/run/clock-synced
++LOCK=/run/ntpsync.lock          # single-flight: the one-shot or a resync
++STEP_LOCK=/run/ntpsync.step.lock   # held while ntpdate steps; S49ntp defers
++BOOT_MARK=/run/ntpsync.boot     # the RTC was classified this boot
++PIDFILE=/var/run/ntpsync.pid
+ LOG=/var/log/ntp-step.log
++LOG_MAX=65536                   # bytes; rolled over to $LOG.old past this
++NTP_CONF=/etc/ntp.conf
++RTC_DEV=/dev/rtc0
++RTC_SYS=/sys/class/rtc/rtc0
++ROUTE_WAIT=90                   # s a one-shot waits for a route to a server
++NTPDATE_MAX=45                  # s cap on one ntpdate run (4 samples x 2 s
++                                # per server, plus musl's DNS timeouts when a
++                                # server line is a name); also caps each -q
++                                # query
++VERIFY_MAX=2                    # s: |offset| the re-check after a step accepts
++RESYNC_MAX=0.5                  # s: |offset| at which a resync only writes the
++                                # RTC; past it, it steps the clock first
++# A plausible wall clock: 2020-01-01 .. 2100-01-01 UTC, the portal's floor
++# for a browser time and for showing the RTC as set.
++CLOCK_FLOOR=1577836800
++CLOCK_CEIL=4102444800
+ 
+-# IPs from operators that publish stable anycast NTP. Mix providers
+-# so one being down doesn't deadlock boot.
+-NTP_SERVERS="162.159.200.1 162.159.200.123 216.239.35.0 216.239.35.4 216.239.35.8 216.239.35.12"
++log() {
++	printf '%s: %s\n' "$(date -u '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG"
++}
+ 
+-start() {
+-	rm -f "$FLAG"
+-
+-	# Wait up to 30s for ANY default route — from S30eth (eth0 WAN:
+-	# udhcpc lease or static gateway) or from dhcpcd (wlan0 WAN on the W
+-	# variant), per /etc/rnsbox/wan.conf. If it never appears, fail
+-	# immediately — no point trying NTP without WAN.
+-	printf "Waiting for default route: "
+-	have_route=0
+-	for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+-		if ip -4 route show default 2>/dev/null | grep -q "^default"; then
+-			have_route=1
+-			break
++# roll_log - keep $LOG (tmpfs) bounded: past LOG_MAX it becomes $LOG.old.
++roll_log() {
++	sz=$(wc -c 2>/dev/null <"$LOG")
++	[ "${sz:-0}" -gt "$LOG_MAX" ] 2>/dev/null && mv -f "$LOG" "$LOG.old"
++}
++
++utc_now() { date -u '+%Y-%m-%d %H:%M:%S'; }
++
++# clock_plausible - the system clock lies in CLOCK_FLOOR..CLOCK_CEIL.
++clock_plausible() {
++	now=$(date +%s)
++	[ "$now" -ge "$CLOCK_FLOOR" ] && [ "$now" -lt "$CLOCK_CEIL" ]
++}
++
++# cur_source - src = the recorded source, empty if none (builtins only).
++cur_source() {
++	src=
++	{ read -r src <"$SRC"; } 2>/dev/null
++}
++
++# set_source SRC - record a trusted source: clock-source first (renamed in),
++# then the derived clock-synced marker, so clock-synced never exists alone.
++set_source() {
++	printf '%s\n' "$1" > "$SRC.$$" && mv -f "$SRC.$$" "$SRC" && : > "$FLAG"
++}
++
++# rtc_trusted - the kernel set the clock from rtc0 at boot (hctosys reads 1)
++# and that time is believable (2020..2100). That is enough with RNSBox's
++# rtc-ds1307 (linux_5.10/drivers/rtc/rtc-ds1307.c): a DS3231 whose
++# oscillator stopped (never set, or the coin cell ran flat while unpowered)
++# keeps its oscillator-stop flag (OSF) until the RTC is next written, and
++# the driver refuses to read the time while it is set (EINVAL). So hctosys
++# fails ("hctosys: unable to read the hardware clock", hctosys reads 0) on
++# every boot until NTP or a browser sync writes the RTC; the flag lives in
++# the chip, so no boot log scraping or remembered verdict is needed. (The
++# stock driver cleared it at probe and read the restarted count - ~2000-01-01
++# - back as the time.) The year test catches an RTC that was written with a
++# wrong time. why = the reason when not trusted: osf (the read fails with
++# EINVAL) | unread (hctosys 0 otherwise: I2C error, ...) | range.
++rtc_trusted() {
++	why=
++	h=
++	{ read -r h <"$RTC_SYS/hctosys"; } 2>/dev/null
++	if [ "$h" != 1 ]; then
++		case "$(cat "$RTC_SYS/since_epoch" 2>&1 >/dev/null)" in
++			*'Invalid argument'*) why=osf ;;
++			*)                    why=unread ;;
++		esac
++		return 1
++	fi
++	clock_plausible || { why=range; return 1; }
++	return 0
++}
++
++# have_route - true while the main table has an IPv4 default route (S30eth:
++# eth0 udhcpc lease or static gateway; dhcpcd: wlan0 WAN on the W board);
++# ROUTE_IF = its interface. Builtins only.
++have_route() {
++	ROUTE_IF=
++	while read -r ifc dst _gw _flags _rc _use _met mask _rest; do
++		[ "$dst" = 00000000 ] && [ "$mask" = 00000000 ] || continue
++		ROUTE_IF=$ifc
++		return 0
++	done 2>/dev/null </proc/net/route
++	return 1
++}
++
++# ntp_servers - the hosts of the server/pool lines in /etc/ntp.conf (the list
++# the portal edits), space-separated. Only [A-Za-z0-9.:-] names that don't
++# start with '-' (that would reach ntpdate as an option); refclock
++# pseudo-addresses (127.127.x.x) skipped.
++ntp_servers() {
++	awk '($1 == "server" || $1 == "pool") && $2 !~ /^127\.127\./ &&
++	     $2 ~ /^[A-Za-z0-9.:][A-Za-z0-9.:-]*$/ { printf "%s ", $2 }' "$NTP_CONF" 2>/dev/null
++}
++
++# routable_servers - SERVERS = the ntp_servers() the kernel can route to now.
++# With an IPv4 default route: all of them. Without one (LAN-, HaLow- or
++# WiFi-only mesh; eth0 static with no gateway) the time server sits on a
++# connected subnet: literal addresses `ip route get` resolves; names are
++# skipped (no uplink for DNS). False when none.
++routable_servers() {
++	SERVERS=
++	all=$(ntp_servers)
++	if have_route; then SERVERS=$all; else
++		for s in $all; do
++			case "$s" in *[!0-9a-fA-F.:]*) continue ;; esac
++			ip route get "$s" >/dev/null 2>&1 && SERVERS="$SERVERS$s "
++		done
++	fi
++	[ -n "$SERVERS" ]
++}
++
++# capped SECS CMD... - run CMD, killed after SECS s (no timeout(1) in
++# busybox); returns its exit status. The watchdog sends its output nowhere
++# and closes fds 8 and 9, so neither it nor its sleep (orphaned once it is
++# killed) holds a lock or a caller's pipe; it kills only while the pid is
++# still CMD, so after `stop` killed this worker it can't hit a recycled pid.
++capped() {
++	t=$1
++	shift
++	"$@" &
++	cpid=$!
++	( sleep "$t"; c=; { read -r c <"/proc/$cpid/comm"; } 2>/dev/null
++	  [ "$c" = "${1##*/}" ] && kill "$cpid" 2>/dev/null ) >/dev/null 2>&1 8>&- 9>&- &
++	cw=$!
++	wait "$cpid"
++	cr=$?
++	kill "$cw" 2>/dev/null
++	return "$cr"
++}
++
++# ntp_offset SERVER... - off = the clock's offset (s) from the servers: the
++# one `ntpdate -u -q` reports for the server it would sync to (query only,
++# it never touches the clock; -u: unprivileged port), capped at NTPDATE_MAX
++# s. False, off empty, when no server answered (or the cap hit), and for
++# anything that isn't a plain number.
++ntp_offset() {
++	off=$(capped "$NTPDATE_MAX" ntpdate -u -q "$@" 2>/dev/null | awk '
++		/ntpdate\[/ { for (i = 1; i < NF; i++) if ($i == "offset") o = $(i + 1) }
++		END { if (o !~ /^[-+]?[0-9]+(\.[0-9]+)?$/) exit 1; print o }')
++}
++
++# abs_le OFF MAX - true if |OFF| <= MAX (seconds, decimals allowed).
++abs_le() {
++	awk -v o="$1" -v m="$2" 'BEGIN { a = o + 0; if (a < 0) a = -a; exit !(a <= m + 0) }'
++}
++
++# ntpd_stop - stop the ntpd daemon and wait until no ntpd is left (bounded).
++# By name, not S49ntp's pidfile: an ntpd that rcS's S49ntp start launched
++# just before we took the step lock writes its pidfile only after
++# daemonizing, and a pidfile left by an ntpd that exited could name a
++# recycled pid. Called with the step lock held, so no new one can start.
++ntpd_stop() {
++	n=0
++	while killall ntpd 2>/dev/null; do   # exit 0 = an ntpd was still there
++		n=$((n + 1))
++		[ "$n" -le 5 ] || return 1
++		sleep 1
++	done
++	rm -f /var/run/ntpd.pid
++	return 0
++}
++
++# step_lock SECS - take STEP_LOCK on fd 8, polling up to SECS s; false (fd 8
++# closed again) if it stays busy. Anything this process starts inherits fd
++# 8, so the lock stays held while ntpdate may still step even if `stop`
++# kills this worker (`stop` kills ntpdate too). Others hold it for a moment
++# only (S49ntp start, the portal's browser sync); bounded all the same,
++# polled so any flock(1) will do.
++step_lock() {
++	exec 8>"$STEP_LOCK"
++	n=0
++	while command -v flock >/dev/null 2>&1 && ! flock -n 8; do
++		n=$((n + 1))
++		if [ "$n" -gt "$1" ]; then
++			exec 8>&-
++			return 1
+ 		fi
+ 		sleep 1
+ 	done
+-	if [ $have_route -eq 0 ]; then
+-		echo "TIMEOUT (no default route, skipping NTP)"
++	return 0
++}
++
++# step_clock SERVER... - step the clock from NTP: the one-shot's step, and a
++# resync's when the clock is off by more than RESYNC_MAX. Called with
++# STEP_LOCK held (step_lock), which it releases. Steps with `ntpdate -u -b
++# <servers>`, capped at NTPDATE_MAX s, and re-checks with `ntpdate -u -q`
++# (|offset| <= VERIFY_MAX s) and the year. On success: source=ntp,
++# clock-synced, and the time written to rtc0 when there is one - even an RTC
++# that was never set: writing it is exactly how it gets set.
++#
++# One stepper at a time (ntp 4.2.8p17 source):
++#   - ntpdate steps RELATIVE to the current clock (clock_adjust() ->
++#     step_systime(offset)), once every server has answered 4 samples 2 s
++#     apart: ~8 s after it starts. ntpd -g, which rcS's S49ntp starts ~0.5 s
++#     after this, steps by itself ~6 s after start (iburst). When ntpd steps
++#     first, ntpdate's earlier samples still carry the old offset and it
++#     applies it a second time: the clock lands decades ahead, ntpd then
++#     exits on its 1000 s panic limit (its -g override already used up) and
++#     that wrong time would be trusted and written to the RTC.
++#   - So the step runs with STEP_LOCK held and ntpd stopped: S49ntp start
++#     defers while the lock is held (rcS's own start at boot included), and
++#     ntpd_stop ends any ntpd already running. The lock is released and ntpd
++#     started again on every path, success or not (S46wanwatch restarts it
++#     if this worker is killed in between). The portal's browser sync takes
++#     the same lock.
++#   - -u: ntpdate binds udp/123 only without -u (init_io()); with it, an
++#     unprivileged port.
++#   - -b: settimeofday() step, whatever the size. Exit 0 only when
++#     clock_adjust() picked a server and stepped; 1 when no server was
++#     reachable/suitable, or the name server failed. The -q re-check is the
++#     backstop: a clock that isn't within VERIFY_MAX s of the servers after
++#     the step is not trusted, and not written to the RTC.
++#   - settimeofday() also clears the kernel's NTP state (TK_CLEAR_NTP ->
++#     STA_UNSYNC), so RTC_SYSTOHC's 11-minute write-back waits until ntpd
++#     re-syncs: the kernel never writes an unvetted time. Hence the explicit
++#     hwclock -w here, and the hourly resync.
++#   - ntpd backs off to 1024 s polls while its servers are unreachable, so
++#     after a long offline spell it can take many minutes to re-sync on its
++#     own; the one-shot gets the wall clock right within seconds of a route.
++step_clock() {
++	ok=
++	if ! ntpd_stop; then
++		log "ntpd would not exit - not stepping beside it"
++	else
++		via=${ROUTE_IF:+default route via $ROUTE_IF}
++		log "${via:-no default route, servers on a connected subnet} -> ntpd stopped, ntpdate -u -b $*"
++		capped "$NTPDATE_MAX" ntpdate -u -b "$@"
++		rc=$?
++		if [ "$rc" -ne 0 ]; then
++			log "ntpdate failed (exit $rc) - clock untouched, source stays ${src:-none}"
++		elif ! ntp_offset "$@" || ! abs_le "$off" "$VERIFY_MAX"; then
++			log "after the step ntpdate -q reads offset ${off:-?} s - not trusting it"
++		elif ! clock_plausible; then
++			log "ntpdate exited 0 but the clock reads $(utc_now) - not trusting it"
++		else
++			# Recorded (and the RTC written) before the lock goes, so a
++			# browser sync can't step the clock in between.
++			ok=1
++			set_source ntp
++			log "clock stepped from NTP: $(utc_now) UTC (re-check offset $off s) -> source=ntp"
++			if [ -e "$RTC_DEV" ]; then
++				if hwclock -w -u -f "$RTC_DEV" 8>&- 9>&-; then
++					log "RTC ($RTC_DEV) written"
++				else
++					log "writing the RTC ($RTC_DEV) failed"
++				fi
++			fi
++		fi
++	fi
++	# Release the lock first, or this start defers too; fd 9 stays with us,
++	# not the daemon.
++	exec 8>&-
++	if /etc/init.d/S49ntp start >/dev/null 2>&1 9>&-; then
++		log "ntpd started again"
++	else
++		log "S49ntp start failed (S46wanwatch restarts ntpd if it isn't running)"
++	fi
++	[ -n "$ok" ]
++}
++
++# seed - the NTP one-shot; runs detached (see launch), output to $LOG. Waits
++# up to ROUTE_WAIT s for a route to a configured server (routable_servers: a
++# default route, or a local server on a directly connected subnet), then
++# steps the clock from those servers (step_clock).
++seed() {
++	cur_source
++	log "one-shot started (clock source: ${src:-none})"
++	if [ -z "$(ntp_servers)" ]; then
++		log "no usable server/pool lines in $NTP_CONF - nothing to query"
+ 		return 1
+ 	fi
+-	echo "OK ($(ip -4 route show default 2>/dev/null | awk 'NR==1{print $5}'))"
+-
+-	# One-shot synchronous NTP step. ntpd -gq exits after the first
+-	# successful sync. We can't use timeout(1) because busybox's ntpd
+-	# doesn't ship it - instead we background ntpd, poll the year,
+-	# and kill the daemon once we see it stepped (or after 60s).
+-	printf "Stepping clock from NTP: "
+-	ntpd -gq $NTP_SERVERS >>"$LOG" 2>&1 &
+-	NTP_PID=$!
+-	stepped=0
+-	for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 \
+-	         21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 \
+-	         41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60; do
+-		sleep 1
+-		if [ "$(date +%Y)" -ge 2024 ]; then
+-			stepped=1
+-			break
++	# Re-read every second, so a server list edited meanwhile is picked up.
++	i=0
++	until routable_servers; do
++		if [ "$i" -ge "$ROUTE_WAIT" ]; then
++			log "no configured NTP server routable after ${ROUTE_WAIT}s - giving up (S46wanwatch re-runs this when the routes change)"
++			return 1
+ 		fi
+-		# Stop early if ntpd already exited (failure) - no point waiting.
+-		kill -0 $NTP_PID 2>/dev/null || break
++		sleep 1
++		i=$((i + 1))
+ 	done
+-	# Make sure the one-shot daemon exits before S49ntp tries to bind UDP/123.
+-	kill $NTP_PID 2>/dev/null
+-	wait $NTP_PID 2>/dev/null
++	servers=$SERVERS
++	if ! step_lock 60; then
++		log "step lock still busy after 60s - giving up (S46wanwatch retries)"
++		return 1
++	fi
++	# shellcheck disable=SC2086 # one word per server
++	step_clock $servers
++}
+ 
+-	if [ $stepped -eq 1 ]; then
+-		touch "$FLAG"
+-		echo "OK ($(date '+%Y-%m-%d %H:%M:%S UTC'))"
+-	else
+-		echo "FAIL"
++# launch - run seed detached, single-flight. The lock is taken here, on fd 9,
++# and the detached worker inherits that open file description, so the lock
++# is held until the worker (and ntpdate, which keeps fd 9 too) exits; this
++# process just exits. Returns 0 = started, 2 = a one-shot (or a resync) is
++# already running.
++# `( seed )`, not `seed ... &`: ash runs a function's redirections as saved
++# pushes, so a backgrounded function keeps a copy of the caller's stdout for
++# its whole run and a caller reading our output through a pipe (the portal,
++# `| tee`) would wait out the one-shot. The subshell redirects for good.
++launch() {
++	exec 9>"$LOCK"
++	if command -v flock >/dev/null 2>&1 && ! flock -n 9 2>/dev/null; then
++		return 2
++	fi
++	roll_log
++	( seed ) </dev/null >>"$LOG" 2>&1 &
++	echo $! > "$PIDFILE"
++	echo "S45ntpsync: NTP one-shot started in the background (pid $!, log $LOG)"
++	return 0
++}
++
++# resync - keep the RTC on NTP time for as long as the box runs (S84cron,
++# hourly). Nothing else does that reliably here: the kernel's own write-back
++# (RTC_SYSTOHC, every 11 min) runs only while the kernel's NTP state says
++# synced, and every step clears that state - settimeofday() in ntpdate -b
++# (step_clock), in the portal's browser sync (date -s) and in ntpd's own
++# steps - until ntpd has re-synced and told the kernel so, which after a
++# step or an offline spell can take a long time, or never come when ntpd
++# has exited on its panic limit. And with no ntpq on the box there is no way
++# to confirm ntpd's sync. Without this the RTC would keep the time of the
++# last one-shot and drift from there (a DS3231: ~2 ppm, a clone more), and
++# the next boot would start from that.
++#
++# Exits 0 at once without an RTC (/dev/rtc0), and without a word when no
++# configured server is routable (offline: nothing to check against, and the
++# RTC is never written from a clock NTP hasn't just vouched for). Takes the
++# one-shot's single-flight lock ($LOCK; busy: exit 2, silently), then
++# STEP_LOCK, so neither a one-shot nor a browser sync can step the clock
++# between the query and the write, and asks the servers for the clock's
++# offset (ntp_offset: `ntpdate -u -q`, query only, capped):
++#   - no answer: nothing written; logged.
++#   - |offset| <= RESYNC_MAX s: the RTC is written (which also sets one whose
++#     oscillator-stop flag is up), and source=ntp if it wasn't; logged.
++#   - larger: the one-shot's step path (step_clock: stop ntpd, step, verify,
++#     write the RTC, start ntpd).
++# Output to $LOG. `stop` ends it like a one-shot worker ($PIDFILE).
++resync() {
++	[ -e "$RTC_DEV" ] || return 0
++	exec 9>"$LOCK"
++	if command -v flock >/dev/null 2>&1 && ! flock -n 9 2>/dev/null; then
++		return 2
++	fi
++	routable_servers || return 0
++	servers=$SERVERS
++	roll_log
++	echo $$ > "$PIDFILE"   # ours until we exit: launch needs $LOCK too
++	# shellcheck disable=SC2086 # one word per server
++	resync_locked $servers >>"$LOG" 2>&1 </dev/null
++	rc=$?
++	rm -f "$PIDFILE"
++	return "$rc"
++}
++
++resync_locked() {
++	cur_source
++	if ! step_lock 15; then
++		log "resync: step lock still busy after 15s - skipped until the next one"
++		return 2
++	fi
++	if ! ntp_offset "$@"; then
++		exec 8>&-
++		log "resync: no answer from $* - RTC left alone"
+ 		return 1
+ 	fi
++	if ! abs_le "$off" "$RESYNC_MAX"; then
++		log "resync: clock off by $off s (over $RESYNC_MAX s) -> stepping it first"
++		step_clock "$@"
++		return
++	fi
++	if ! clock_plausible; then
++		exec 8>&-
++		log "resync: the servers agree with a clock reading $(utc_now) - not trusting it, RTC left alone"
++		return 1
++	fi
++	if [ "$src" != ntp ]; then
++		set_source ntp
++		log "resync: clock within $off s of NTP -> source=ntp (was ${src:-none})"
++	fi
++	rc=0
++	if hwclock -w -u -f "$RTC_DEV" 8>&- 9>&-; then
++		log "resync: offset $off s -> RTC ($RTC_DEV) written"
++	else
++		log "resync: offset $off s, but writing the RTC ($RTC_DEV) failed"
++		rc=1
++	fi
++	exec 8>&-
++	return "$rc"
+ }
+ 
+-stop() { rm -f "$FLAG"; }
++start() {
++	if [ ! -f "$BOOT_MARK" ]; then
++		: > "$BOOT_MARK"
++		if [ ! -d "$RTC_SYS" ]; then
++			echo "S45ntpsync: no RTC - clock untrusted until NTP or a browser sync"
++			log "boot: no RTC"
++		elif rtc_trusted; then
++			cur_source
++			[ -n "$src" ] || set_source rtc
++			echo "S45ntpsync: clock set from the RTC ($(utc_now) UTC)"
++			log "boot: kernel set the clock from the RTC ($(utc_now) UTC) -> source=rtc"
++		else
++			echo "S45ntpsync: RTC present but not set ($why) - its time is ignored until NTP or a browser sync writes it"
++			log "boot: RTC present but its time is not trustworthy ($why; hctosys=$(cat "$RTC_SYS/hctosys" 2>/dev/null), clock $(utc_now) UTC)"
++		fi
++	fi
++	launch
++	return 0
++}
++
++stop() {
++	p=
++	{ read -r p <"$PIDFILE"; } 2>/dev/null
++	case "$p" in
++		''|*[!0-9]*) ;;
++		# only our own worker (a fork of this script), never a recycled pid
++		*) tr '\0' ' ' 2>/dev/null <"/proc/$p/cmdline" | grep -q S45ntpsync \
++		     && kill "$p" 2>/dev/null ;;
++	esac
++	killall ntpdate 2>/dev/null
++	rm -f "$PIDFILE"
++	return 0
++}
++
++status() {
++	cur_source
++	echo "clock source: ${src:-none}  (system time $(utc_now) UTC)"
++	if [ -d "$RTC_SYS" ]; then
++		# The driver refuses to read a time it knows is lost (EINVAL).
++		if t=$(cat "$RTC_SYS/date" "$RTC_SYS/time" 2>&1); then
++			t="reads $(echo $t) UTC"
++		else
++			case "$t" in
++				*'Invalid argument'*) t="not set (oscillator stopped: never set, or its backup cell ran flat)" ;;
++				*) t="unreadable" ;;
++			esac
++		fi
++		echo "RTC:          $(cat "$RTC_SYS/name" 2>/dev/null), hctosys=$(cat "$RTC_SYS/hctosys" 2>/dev/null), $t"
++	else
++		echo "RTC:          none"
++	fi
++	exec 9>"$LOCK"
++	if command -v flock >/dev/null 2>&1 && ! flock -n 9 2>/dev/null; then
++		echo "NTP one-shot: running, or an RTC resync (log $LOG)"
++	else
++		echo "NTP one-shot: idle (log $LOG)"
++	fi
++}
+ 
+ case "${1:-start}" in
+ 	start)   start ;;
+ 	stop)    stop ;;
+-	restart) stop; start ;;
+-	*) echo "Usage: $0 {start|stop|restart}" >&2; exit 1 ;;
++	restart) stop; sleep 1; start ;;
++	sync)    routable_servers || { echo "S45ntpsync: no configured NTP server is routable"; exit 3; }
++	         launch ;;
++	resync)  resync ;;
++	status)  status ;;
++	*) echo "Usage: $0 {start|stop|restart|sync|resync|status}" >&2; exit 1 ;;
+ esac
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S46wanwatch b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S46wanwatch
+index 2843a65a8..33ba7d6c0 100755
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S46wanwatch
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S46wanwatch
+@@ -1,27 +1,48 @@
+ #!/bin/sh
+-# S46wanwatch — background watchdog that retries S45ntpsync + S82rnsd if
+-# a default route appears AFTER the boot-time one-shot already gave up.
++# S46wanwatch — background watchdog (10 s tick) for what boot can't finish
++# by itself. Nothing here gates a service on the clock: rnsd (and lxmd /
++# nomadnet, when enabled) run with or without a trusted time (Reticulum has
++# to work on meshes with no internet at all).
+ #
+-# Scenarios this fixes:
+-#   1. Cold boot with no Ethernet cable plugged in. S45 waits 30s, no
+-#      default route appears, gives up. /run/clock-synced never gets
+-#      set. S82rnsd refuses to start. Later the user plugs in the
+-#      cable — this watchdog notices the default route, runs S45+S82.
+-#   2. Reticulum crash. rnsd's PID file goes stale; the watchdog
+-#      restarts it. Not after an explicit `S82rnsd stop` (rcK or the
+-#      operator); `S82rnsd start` re-arms it.
++# Scenarios this covers:
++#   1. NTP once a time server is reachable. While /run/clock-source isn't
++#      "ntp": when the IPv4 routing table changes (a default route appears or
++#      changes: cable plugged in after boot, WiFi client associates, the WAN
++#      switched or re-plugged into another network; or the connected subnet
++#      of a local NTP server on a LAN-, HaLow- or WiFi-only mesh comes up),
++#      and at growing intervals after that, `S45ntpsync sync` re-runs its
++#      detached NTP one-shot if a configured server is routable
++#      (single-flight: if one is already running, the next tick asks again).
++#      On success it records source=ntp and writes the RTC, if one is
++#      fitted. ntpd itself (S49ntp) runs all along; the one-shot is only the
++#      fast path.
++#   1b. ntpd not running: it exits by itself on a >1000 s offset once its -g
++#      override is used up, and S45ntpsync stops it for each one-shot step
++#      (a one-shot killed by `S45ntpsync stop` mid-step leaves it stopped).
++#      The watchdog starts it again; S49ntp start defers by itself while a
++#      one-shot is stepping, and that one-shot starts ntpd when done.
++#   2. Reticulum crash. rnsd's PID file goes stale; the watchdog restarts it
++#      — once rcS or the operator has started it this boot ($ARMED_MARK, so
++#      the first tick never races rcS's own S82rnsd start), and not after an
++#      explicit `S82rnsd stop` (rcK or the operator); `S82rnsd start`
++#      re-arms it.
+ #   3. The once-per-boot rnsd update check (S84cron bootcheck) needs a
+-#      synced clock; when the clock syncs late (scenario 1) the watchdog
+-#      triggers it.
++#      trusted clock (TLS) and an uplink; when either only arrives after boot
++#      (NTP once the WAN is up, a browser sync, or a WAN that comes up after
++#      the RTC already made the clock trusted) the watchdog triggers it.
+ #   4. USB host attached (or its NCM driver bound) only after rnsd started:
+ #      usb0 had no IPv6 link-local yet, so the AutoInterface skipped it; the
+ #      watchdog restarts rnsd once when the address appears.
+-#   5. nomadnet / lxmd enabled by the operator but refused at boot (no
+-#      synced clock, or no rnsd yet): started once the watchdog brings rnsd up.
+-#   6. Clock set without NTP (portal "Sync clock to browser", `date -s`, an
+-#      off-grid box with no default route): S45ntpsync never ran to create
+-#      /run/clock-synced, so the watchdog creates it once the year is sane.
+-#   7. eth0 cable re-plugged, possibly into another network. busybox udhcpc
++#   5. nomadnet / lxmd enabled by the operator (both opt-in: shipped
++#      enabled=no, and RAM is scarce): they attach to rnsd's shared
++#      instance, which takes rnsd several seconds to open. When rcS (or the
++#      operator) starts them before that, they defer via $DEPS_MARK instead
++#      of racing rnsd for it; the same mark follows a restart in scenario 2
++#      if either is enabled. The watchdog starts them once rnsd's shared
++#      instance accepts clients - each only if its conf still says enabled
++#      (svc_enabled), and its start checks that first again. A disabled one
++#      is never started from here.
++#   6. eth0 cable re-plugged, possibly into another network. busybox udhcpc
+ #      doesn't watch carrier (dhcpcd used to, back when it ran on eth0), so
+ #      the old address + default route would stay until T1/T2; the watchdog
+ #      has S30eth restart udhcpc asking for its old address — a brief WAN
+@@ -37,7 +58,13 @@ RNSD_PIDFILE=/var/run/rnsd.pid
+ BOOTCHECK_MARK=/run/rnsbox-update-bootcheck   # created by S84cron bootcheck
+ LL_MARK=/run/rnsd-usb0-no-ll                  # created by S82rnsd start
+ STOPPED_MARK=/run/rnsd.stopped                # explicit `S82rnsd stop`
+-DEPS_MARK=/run/wanwatch-deps-pending         # step 2 started rnsd
++ARMED_MARK=/run/rnsd.armed                    # S82rnsd start/restart ran
++DEPS_MARK=/run/wanwatch-deps-pending          # nomadnet/lxmd wait for rnsd
++CLOCK_SRC=/run/clock-source                   # rtc|ntp|browser (S45ntpsync)
++NTPD_PIDFILE=/var/run/ntpd.pid                # S49ntp / the ntpd daemon
++NTPD_OUT=/run/wanwatch-ntpd.out               # last `S49ntp start` output
++NTP_RETRY=600                                 # s before the first NTP retry,
++NTP_RETRY_MAX=3600                            # doubling up to this
+ 
+ log() {
+ 	printf '%s: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG"
+@@ -103,63 +130,161 @@ eth0_link() {
+ 	{ read -r UPS </sys/class/net/eth0/carrier_up_count; } 2>/dev/null
+ }
+ 
++# default_routes — ROUTES = the IPv4 default routes of the main table
++# (" iface:gateway:metric" each), empty when there is none. Builtins only.
++default_routes() {
++	ROUTES=
++	while read -r ifc dst gw _flags _rc _use met mask _rest; do
++		[ "$dst" = 00000000 ] && [ "$mask" = 00000000 ] || continue
++		ROUTES="$ROUTES $ifc:$gw:$met"
++	done 2>/dev/null </proc/net/route
++}
++
++# all_routes — ALLROUTES = a signature of the whole IPv4 main table
++# (" iface:dest:gateway:metric:mask" each), empty when there is none; step 1
++# reacts to any change, since a local time server needs no default route.
++# Builtins only.
++all_routes() {
++	ALLROUTES=
++	while read -r ifc dst gw _f _rc _use met mask _rest; do
++		[ "$ifc" = Iface ] && continue
++		ALLROUTES="$ALLROUTES $ifc:$dst:$gw:$met:$mask"
++	done 2>/dev/null </proc/net/route
++}
++
++# rns_shared_up — true once rnsd's shared instance accepts clients: RNS on
++# Linux listens on the abstract AF_UNIX socket @rns/<instance> (flags
++# 00010000 = listening, in /proc/net/unix; @rns/<instance>/rpc is its RPC
++# socket, not this), or on 127.0.0.1:37428 (st 0A) with shared_instance_type
++# = tcp. Same test as S83nomadnet/S85lxmd; builtins only.
++rns_shared_up() {
++	while read -r _num _ref _proto flags _type _st _ino path; do
++		case "$path" in
++			@rns/*/*) ;;
++			@rns/*) [ "$flags" = 00010000 ] && return 0 ;;
++		esac
++	done 2>/dev/null </proc/net/unix
++	while read -r _sl laddr _raddr st _rest; do
++		[ "$laddr" = 0100007F:9234 ] && [ "$st" = 0A ] && return 0
++	done 2>/dev/null </proc/net/tcp
++	return 1
++}
++
++# svc_enabled S8x... — true if that opt-in service (S83nomadnet, S85lxmd) is
++# installed and enabled=yes in its conf: its init script's own test.
++svc_enabled() {
++	[ -x "/etc/init.d/$1" ] && "/etc/init.d/$1" enabled
++}
++
+ loop() {
+ 	log "started"
+ 	eth0_link; eth_carrier=$CARRIER; eth_ups=$UPS
++	ntp_routes=; ntp_next=0; ntp_gap=$NTP_RETRY
+ 	while sleep 10; do
+-		# Step 0: the clock is already sane but S45ntpsync never set the
+-		# flag (no default route: browser sync, `date -s`, off-grid box).
+-		# Same success test as S45ntpsync.
+-		if [ ! -f /run/clock-synced ] && [ "$(date +%Y)" -ge 2024 ]; then
+-			log "clock already set ($(date '+%Y-%m-%d %H:%M:%S')) but /run/clock-synced absent -> creating it"
+-			: > /run/clock-synced
++		# Step 1: NTP one-shot while the clock source isn't ntp — on any
++		# change of the routing table (a new or changed default route, or a
++		# local time server's subnet coming up on a mesh with no uplink), and
++		# then every NTP_RETRY s (doubling to NTP_RETRY_MAX) while it stays:
++		# its first try may have failed with the upstream still coming up or
++		# NTP briefly blocked, and a LAN-only route never gets there.
++		# `S45ntpsync sync` returns at once: 0 = one-shot started, 3 = no
++		# configured server is routable (counts as a try: the next table
++		# change or retry asks again), 2 = one is already running (the
++		# boot-time one may still be waiting for this very route) -> ask
++		# again next tick rather than lose the edge. Builtins only until a
++		# run is due; only a change that started a one-shot is logged here
++		# (the one-shot logs to ntp-step.log, which it rolls over).
++		src=
++		{ read -r src <"$CLOCK_SRC"; } 2>/dev/null
++		if [ "$src" != ntp ] && [ -x /etc/init.d/S45ntpsync ]; then
++			all_routes
++			if [ -z "$ALLROUTES" ]; then
++				ntp_routes=
++			else
++				up=
++				{ read -r up _ </proc/uptime; } 2>/dev/null
++				up=${up%%.*}
++				if [ "$ALLROUTES" != "$ntp_routes" ] || [ "${up:-0}" -ge "$ntp_next" ]; then
++					/etc/init.d/S45ntpsync sync >/dev/null 2>> "$LOG"
++					rc=$?
++					if [ "$rc" -ne 2 ]; then
++						if [ "$ALLROUTES" != "$ntp_routes" ]; then
++							[ "$rc" -eq 0 ] && log "routes changed, clock source ${src:-none} -> NTP one-shot (/var/log/ntp-step.log)"
++							ntp_gap=$NTP_RETRY
++						else
++							ntp_gap=$((ntp_gap * 2))
++							[ "$ntp_gap" -le "$NTP_RETRY_MAX" ] || ntp_gap=$NTP_RETRY_MAX
++						fi
++						ntp_routes=$ALLROUTES
++						ntp_next=$(( ${up:-0} + ntp_gap ))
++					fi
++				fi
++			fi
+ 		fi
+ 
+-		# Step 1: if clock-synced is absent but a default route exists,
+-		# try S45. We must stop the running ntpd daemon first because
+-		# `ntpd -gq` binds UDP/123 and would EADDRINUSE otherwise.
+-		if [ ! -f /run/clock-synced ]; then
+-			if ip -4 route show default 2>/dev/null | grep -q '^default'; then
+-				log "default route present, /run/clock-synced absent -> kicking S45ntpsync"
+-				killall ntpd 2>/dev/null
+-				sleep 1
+-				/etc/init.d/S45ntpsync start >> "$LOG" 2>&1
+-				/etc/init.d/S49ntp start >> "$LOG" 2>&1 || true
+-			fi
++		# Step 1b: ntpd not running -> S49ntp start. Its pidfile, confirmed
++		# on /proc/<pid>/comm so a stale one naming a recycled pid can't hide
++		# a dead ntpd; builtins only until then. rcS started it before our
++		# first tick. While an NTP one-shot steps (ntpd stopped for it) the
++		# start defers, and isn't logged: the one-shot starts ntpd itself.
++		# Output via a file, not $(...): no pipe for the daemon to hold.
++		p=; c=
++		{ read -r p <"$NTPD_PIDFILE"; } 2>/dev/null
++		case "$p" in ''|*[!0-9]*) ;; *) { read -r c <"/proc/$p/comm"; } 2>/dev/null ;; esac
++		if [ "$c" != ntpd ] && [ -x /etc/init.d/S49ntp ]; then
++			/etc/init.d/S49ntp start > "$NTPD_OUT" 2>&1
++			out=
++			{ read -r out <"$NTPD_OUT"; } 2>/dev/null
++			case "$out" in
++				*deferred*) ;;
++				*) log "ntpd not running -> S49ntp start: $out" ;;
++			esac
+ 		fi
+ 
+-		# Step 2: clock-synced but rnsd not running -> kick S82.
+-		# S82rnsd refuses to start if /run/clock-synced is absent, so
+-		# rerunning is cheap when it shouldn't run anyway. Not after an
+-		# explicit `S82rnsd stop` ($STOPPED_MARK): rcK stops S82rnsd well
+-		# before S46wanwatch at shutdown, and an operator's stop must stick.
+-		# The check here is only a cheap filter: `kick` re-checks the mark
+-		# under S82rnsd's lock (a kick queued behind rcK's stop sees it) and,
+-		# unlike `start`, never clears it.
+-		if [ -f /run/clock-synced ] && [ ! -f "$STOPPED_MARK" ] && ! rnsd_running; then
+-			log "clock-synced but rnsd not running -> kicking S82rnsd"
++		# Step 2: rnsd not running -> kick S82 (armed: rcS or the operator
++		# started it this boot). Not after an explicit `S82rnsd stop`
++		# ($STOPPED_MARK): rcK stops S82rnsd well before S46wanwatch at
++		# shutdown, and an operator's stop must stick. The check here is
++		# only a cheap filter: `kick` re-checks the mark under S82rnsd's lock
++		# (a kick queued behind rcK's stop sees it) and, unlike `start`,
++		# never clears it.
++		if [ -f "$ARMED_MARK" ] && [ ! -f "$STOPPED_MARK" ] && ! rnsd_running; then
++			log "rnsd not running -> kicking S82rnsd"
+ 			/etc/init.d/S82rnsd kick >> "$LOG" 2>&1
+-			rnsd_running && : > "$DEPS_MARK"
+-		# Step 2b: rnsd came up from step 2 (late clock, crash) - one tick
+-		# later, so its shared instance is listening, start what rcS refused
+-		# without a synced clock / rnsd. Both are no-ops when disabled in
+-		# their conf or already running.
+-		elif [ -f "$DEPS_MARK" ]; then
+-			rm -f "$DEPS_MARK"
+-			if [ ! -f "$STOPPED_MARK" ] && rnsd_running; then
++			rnsd_running && { svc_enabled S83nomadnet || svc_enabled S85lxmd; } \
++				&& : > "$DEPS_MARK"
++		fi
++
++		# Step 2b: nomadnet/lxmd deferred (or rnsd restarted by step 2):
++		# start them once rnsd's shared instance accepts clients, so they
++		# attach to it instead of racing rnsd to open it themselves. Only
++		# those enabled in their conf (opt-in, shipped enabled=no; start
++		# checks it first again), and a no-op for one already running. After
++		# an explicit rnsd stop there is nothing to attach to: drop the mark.
++		if [ -f "$DEPS_MARK" ]; then
++			if [ -f "$STOPPED_MARK" ]; then
++				rm -f "$DEPS_MARK"
++			elif rnsd_running && rns_shared_up; then
++				rm -f "$DEPS_MARK"
+ 				for svc in S83nomadnet S85lxmd; do
+-					[ -x "/etc/init.d/$svc" ] && "/etc/init.d/$svc" start >> "$LOG" 2>&1
++					svc_enabled "$svc" || continue
++					log "rnsd's shared instance is up -> $svc start"
++					"/etc/init.d/$svc" start >> "$LOG" 2>&1
+ 				done
+ 			fi
+ 		fi
+ 
+-		# Step 3: once per boot, after the clock is synced, the post-boot
+-		# rnsd update check. S84cron bootcheck is a no-op once its /run
+-		# marker exists (and it honours cron.conf update_check), so this
+-		# fires at most once per boot.
++		# Step 3: once per boot, as soon as the clock is trusted
++		# (/run/clock-synced: RTC at boot, NTP, or a browser sync) AND an
++		# IPv4 default route exists, the post-boot rnsd update check. The
++		# route test (builtins) keeps an offline box with a trusted RTC from
++		# forking S84cron every tick. S84cron bootcheck is a no-op once its
++		# /run marker exists (and it honours cron.conf update_check), so
++		# this fires at most once per boot.
+ 		if [ -f /run/clock-synced ] && [ ! -d "$BOOTCHECK_MARK" ] \
+ 		   && [ -x /etc/init.d/S84cron ]; then
+-			/etc/init.d/S84cron bootcheck >> "$LOG" 2>&1
++			default_routes
++			[ -n "$ROUTES" ] && /etc/init.d/S84cron bootcheck >> "$LOG" 2>&1
+ 		fi
+ 
+ 		# Step 4: rnsd started before usb0 had its IPv6 link-local (no USB
+@@ -179,7 +304,8 @@ loop() {
+ 		# `S30eth renew` restarts udhcpc asking for its old address. Only
+ 		# while eth0 is the DHCP WAN (`S30eth dhcpwan`: not for static, a
+ 		# wlan0 WAN or /boot/eth.nodhcp); wan.conf is only parsed on a link
+-		# event, not every tick.
++		# event, not every tick. A new lease on another network changes the
++		# routing table, which step 1 picks up.
+ 		eth0_link
+ 		if [ "$CARRIER" = 1 ] && { [ "$eth_carrier" != 1 ] || [ "$UPS" != "$eth_ups" ]; } \
+ 		   && [ -x /etc/init.d/S30eth ] && /etc/init.d/S30eth dhcpwan; then
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S49ntp b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S49ntp
+new file mode 100755
+index 000000000..799ac3fdf
+--- /dev/null
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S49ntp
+@@ -0,0 +1,72 @@
++#!/bin/sh
++#
++# Starts Network Time Protocol daemon
++#
++# RNSBox: buildroot's package/ntp/S49ntp.in (NTPD_EXTRA_ARGS empty) with one
++# change in start(): it defers while S45ntpsync's NTP one-shot holds the step
++# lock. ntpdate -b steps RELATIVE to the current clock, so an ntpd -g step
++# inside its ~8 s sampling window would be applied twice (the clock lands
++# decades ahead). The one-shot stops ntpd for its step and starts it again
++# afterwards, success or not; S46wanwatch restarts ntpd if it is ever found
++# not running.
++#
++
++DAEMON="ntpd"
++PIDFILE="/var/run/$DAEMON.pid"
++STEP_LOCK=/run/ntpsync.step.lock   # held by S45ntpsync while it steps
++
++NTPD_ARGS=" -g"
++
++# shellcheck source=/dev/null
++[ -r "/etc/default/$DAEMON" ] && . "/etc/default/$DAEMON"
++
++start() {
++	printf 'Starting %s: ' "$DAEMON"
++	exec 8>"$STEP_LOCK"
++	if command -v flock >/dev/null 2>&1 && ! flock -n 8; then
++		exec 8>&-
++		echo "deferred (NTP one-shot running; it starts ntpd when done)"
++		return 0
++	fi
++	# shellcheck disable=SC2086 # we need the word splitting
++	start-stop-daemon -S -q -p "$PIDFILE" -x "/usr/sbin/$DAEMON" \
++		-- $NTPD_ARGS -p "$PIDFILE" 8>&-
++	status=$?
++	exec 8>&-
++	if [ "$status" -eq 0 ]; then
++		echo "OK"
++	else
++		echo "FAIL"
++	fi
++	return "$status"
++}
++
++stop() {
++	printf 'Stopping %s: ' "$DAEMON"
++	start-stop-daemon -K -q -p "$PIDFILE"
++	status=$?
++	if [ "$status" -eq 0 ]; then
++		rm -f "$PIDFILE"
++		echo "OK"
++	else
++		echo "FAIL"
++	fi
++	return "$status"
++}
++
++restart() {
++	stop
++	sleep 1
++	start
++}
++
++case "$1" in
++	start|stop|restart)
++		"$1";;
++	reload)
++		# Restart, since there is no true "reload" feature.
++		restart;;
++	*)
++		echo "Usage: $0 {start|stop|restart|reload}"
++		exit 1
++esac
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S60routing b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S60routing
+index 82662caca..d6dfa1c9e 100755
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S60routing
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S60routing
+@@ -212,6 +212,9 @@ regen_dnsmasq() {
+ 		echo "# WAN=$WAN (no DHCP served on the uplink — $WAN is a client there)"
+ 		echo "no-dhcp-interface=$WAN"
+ 		echo
++		echo "# Sole DHCP server on usb0 and the AP: ACK a renewal for a lease we no longer have (lost table, clock step) instead of NAKing it"
++		echo "dhcp-authoritative"
++		echo
+ 		echo "# usb0 LAN"
+ 		echo "interface=usb0"
+ 		echo "dhcp-range=set:usb0,$USB0_LAN_DHCP_START,$USB0_LAN_DHCP_END,255.255.255.0,12h"
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S82rnsd b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S82rnsd
+index 30b792b4f..4e484c094 100755
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S82rnsd
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S82rnsd
+@@ -1,11 +1,24 @@
+ #!/bin/sh
+ # S82rnsd — Reticulum Network Stack daemon.
+ #
+-# Gated on /run/clock-synced (S45ntpsync) because Reticulum's link
+-# announcements include a wall-clock timestamp and a node still at
+-# 1970 will be silently filtered by every peer with a sane clock. We
+-# refuse to start rather than spam invalid announcements that get
+-# rate-limited.
++# No clock gate: rnsd starts whether or not the wall clock is known.
++# Reticulum has to work on meshes with no internet at all (HaLow-, LAN- or
++# WiFi-only), and RNS creates its transport identity on first start either
++# way. S45ntpsync records where the time came from in /run/clock-source (RTC
++# at boot, NTP, or a browser sync), and S46wanwatch re-runs S45ntpsync's NTP
++# one-shot whenever a WAN appears. What an untrusted clock costs: RNS keeps a
++# path until now > its receive time + 7 d, and replaces it only with a
++# later-emitted announce, so a node whose clock is behind the timestamps it
++# stored keeps stale paths indefinitely. start() therefore sets aside a path
++# table dated more than an hour after the current clock (after a reboot to
++# 1970: no RTC, or one whose time was lost), and this box re-learns its
++# paths. Peers that still hold this box's earlier, later-dated announce
++# ignore its new ones until that path expires on their own clock; another
++# RNSBox whose clock also rolled back sets its table aside at its own
++# restart, any other such node keeps it until its clock is set. And when the
++# clock is stepped later, RNS ages its paths and links by wall clock, so it
++# re-learns paths and re-establishes links once. A DS3231 RTC
++# (README.RNSBox.md), or NTP / a browser sync on every node, avoids this.
+ #
+ # Config: /etc/reticulum/config (shipped as an opinionated default; the
+ # rnsbox-portal UI exposes a raw editor). rnsd creates the config dir
+@@ -14,9 +27,10 @@
+ #
+ # Bind addr: rnsd listens on whatever interfaces are declared in the
+ # config (typically a TCPServerInterface on 0.0.0.0:4242 + an
+-# AutoInterface on usb0). The nftables INPUT chain in S60routing only
+-# accepts inbound :4242 on WAN if the user added it to
+-# /etc/rnsbox/openports.conf via the portal.
++# AutoInterface on usb0). The nftables INPUT chain (S60routing) accepts
++# inbound :4242 on the WAN because the shipped /etc/rnsbox/openports.conf
++# opens it (`tcp 4242`, for WAN peers); remove that entry (portal: Network
++# -> Open ports) to keep them out.
+ #
+ # Logging: rnsd prints its log to stdout, and Python block-buffers a
+ # redirected stdout — a quiet rnsd never filled the buffer, so the old
+@@ -30,7 +44,7 @@
+ # /etc/reticulum/storage. It runs with umask 077, and start() tightens any
+ # file an older build left group/world-readable (plus the config dir itself,
+ # since the config can hold IFAC passphrases) on every start, even one that
+-# refuses on an unsynced clock — the full storage walk once per boot, a
++# finds rnsd already running — the full storage walk once per boot, a
+ # top-level check after that; the portal writes the config 0600. Everything
+ # that reads them — rnsd, rnstatus, lxmd, nomadnet, the portal (uhttpd) —
+ # runs as root.
+@@ -48,8 +62,15 @@ LL_MARK=/run/rnsd-usb0-no-ll
+ # `kick`/`kick-restart`, which check it under the lock and never clear it, so
+ # they don't resurrect rnsd while it exists.
+ STOPPED_MARK=/run/rnsd.stopped
++# Created by every explicit start/restart (rcS's boot-time start included):
++# S46wanwatch restarts a crashed rnsd only once it exists, so its first tick
++# can't race rcS to start rnsd (and then nomadnet/lxmd) itself.
++ARMED_MARK=/run/rnsd.armed
+ # Present once this boot's full permission walk over storage/ succeeded.
+ PERMS_MARK=/run/rnsd-perms-done
++# start() sets a path table aside only when it is dated more than this far
++# after the current clock (see there).
++CLOCK_SLACK=3600
+ 
+ [ -x "$DAEMON" ] || exit 0
+ 
+@@ -121,7 +142,7 @@ start() {
+ 	mkdir -p /var/run "$CFG_DIR"
+ 
+ 	# Tighten what an older build (umask 022) or the 0755 overlay left
+-	# readable - before the clock gate, so an unsynced box is covered too.
++	# readable - before the already-running check, so every start covers it.
+ 	# `find -perm` only touches files that still need it, so a normal boot
+ 	# writes nothing to the SD card; `! -type l` so chmod never follows a
+ 	# symlink out. The recursive walk over storage/ (thousands of
+@@ -146,11 +167,35 @@ start() {
+ 		return 0
+ 	fi
+ 
+-	if [ ! -f /run/clock-synced ]; then
+-		echo "S82rnsd: refusing to start - /run/clock-synced absent"
+-		echo "        (S45ntpsync did not succeed; check WAN link"
+-		echo "         and /var/log/ntp-step.log)"
+-		return 1
++	# A path table saved under a later clock than now pins stale routes: the
++	# box ran with NTP or a browser-set clock, or for days on an unset one,
++	# and has since rebooted to 1970. RNS drops a path only once
++	# now > its receive time + 7 d and replaces it only with a later-emitted
++	# announce, which peers whose clocks also rolled back never send. So set
++	# such a table aside and let rnsd re-learn from live announces; identity,
++	# known destinations and ratchets are kept. Checked here, with no rnsd
++	# running, so a live rnsd's table is never pulled away; not gated on
++	# /run/clock-source, since the pinning depends only on the stored times
++	# being ahead of the clock. (On an online box with no RTC that is usually
++	# one re-learn per boot: rnsd starts before NTP steps the clock.) Only a
++	# table more than CLOCK_SLACK (1 h) ahead counts. Without NTP nothing
++	# re-aligns the kernel clock with a DS3231 between boots (hctosys runs at
++	# boot only; RTC_SYSTOHC and S45ntpsync's hourly resync need NTP), so
++	# after weeks of uptime a fast SoC crystal leaves the table rcK's stop
++	# persisted tens of seconds ahead of the RTC time the next boot starts
++	# from. A gap that small only delays a path's 7-day expiry by as much,
++	# while the rollbacks this is for are decades (back to 1970). The
++	# reference file is dated CLOCK_SLACK into the future (busybox touch -d
++	# @epoch; stat -c is not built in); if touch fails the check is skipped
++	# and the table kept.
++	ref=/run/rnsd.clockref
++	if [ -d "$CFG_DIR/storage" ] \
++	   && touch -d "@$(( $(date +%s) + CLOCK_SLACK ))" "$ref" 2>/dev/null; then
++		for f in "$CFG_DIR/storage/destination_table" "$CFG_DIR/storage/tunnels"; do
++			[ "$f" -nt "$ref" ] && mv -f "$f" "$f.stale" \
++				&& logger -t S82rnsd -p daemon.notice "${f##*/} is dated over an hour after the current clock - set aside, rnsd re-learns paths" 2>/dev/null
++		done
++		rm -f "$ref"
+ 	fi
+ 
+ 	# RNS's AutoInterface adopts an iface only if it already has its IPv6
+@@ -262,12 +307,12 @@ if command -v flock >/dev/null 2>&1; then
+ fi
+ 
+ case "${1:-start}" in
+-	# An explicit start (incl. rcS's boot-time one that refuses on an unsynced
+-	# clock) or restart re-arms S46wanwatch step 2.
+-	start)   rm -f "$STOPPED_MARK"; start ;;
++	# An explicit start (incl. rcS's boot-time one) or restart arms
++	# S46wanwatch step 2 and re-arms it after a stop.
++	start)   rm -f "$STOPPED_MARK"; : > "$ARMED_MARK"; start ;;
+ 	# $STOPPED_MARK first, so S46wanwatch holds off during stop's wait too.
+ 	stop)    : > "$STOPPED_MARK"; stop ;;
+-	restart) stop; sleep 1; rm -f "$STOPPED_MARK"; start ;;
++	restart) stop; sleep 1; rm -f "$STOPPED_MARK"; : > "$ARMED_MARK"; start ;;
+ 	# S46wanwatch / S84cron: honour an explicit stop, re-checked under the lock
+ 	# (a kick queued behind rcK's or the operator's stop sees its mark), and
+ 	# never clear the mark.
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S83nomadnet b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S83nomadnet
+index 868954e4c..87342fa9a 100755
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S83nomadnet
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S83nomadnet
+@@ -1,12 +1,31 @@
+ #!/bin/sh
+ # S83nomadnet — Nomadnet daemon (LXMF propagation node + nomadnet pages
+-# server). Shipped DISABLED by default — most RNSBox owners only want
+-# rnsd (S82rnsd). Enable by flipping `enabled=no` -> `enabled=yes` in
+-# /etc/rnsbox/nomadnet.conf, then run this script with `start`.
++# server). Opt-in: shipped DISABLED (enabled=no) — most RNSBox owners only
++# want rnsd (S82rnsd), and RAM is scarce. Enable by flipping `enabled=no` ->
++# `enabled=yes` in /etc/rnsbox/nomadnet.conf, then run this script with
++# `start`. While disabled, start does nothing at all: it checks the flag
++# before anything else, even before the lock below. `enabled` exits 0 iff
++# the flag says yes (S46wanwatch asks it before starting nomadnet itself).
+ #
+-# Like S82rnsd, gates on /run/clock-synced. Nomadnet stamps every LXMF
+-# message + announce with wall-clock time; a 1970 clock makes peers
+-# reject everything we send.
++# No clock gate, like S82rnsd: it runs with or without a trusted wall clock
++# (Reticulum must work on meshes with no internet). LXMF stamps messages and
++# announces with wall-clock time, so until the clock is trusted
++# (/run/clock-source: RTC, NTP or a browser sync) those carry a 1970 date.
++# What its propagation node recorded meanwhile would then look decades old
++# the moment the clock is set: stored messages purged by the 30-day expiry,
++# the propagation peers it heard culled as 14 days unreachable, and the caches
++# of already-handled messages emptied (so they could be accepted again). The
++# RNSBox LXMF patch (package/python-lxmf/0001-*) re-dates all three instead.
++#
++# Shared instance: nomadnet passes no --rnsconfig, so its RNS uses
++# /etc/reticulum, rnsd's config — and attaches to rnsd's shared instance if
++# rnsd has it open, else opens it (with all of rnsd's interfaces) itself.
++# rnsd takes several seconds to get there, and rcS runs this right after
++# S82rnsd. So start needs rnsd running (else it refuses) and its shared
++# instance accepting clients (rns_shared_up); until then it defers: it leaves
++# /run/wanwatch-deps-pending and S46wanwatch starts nomadnet as soon as the
++# shared instance is up. start/stop are serialized on /run/nomadnet.lock
++# (rcS, the operator and S46wanwatch can overlap).
+ #
+ # Also like S82rnsd: runs with umask 077 (its identity key lives under
+ # $configdir/storage; start() tightens anything left group/world-readable)
+@@ -22,8 +41,31 @@ PIDFILE=/var/run/$NAME.pid
+ LOGPIPE=/var/run/$NAME.logpipe
+ DEFAULT_CONFIGDIR=/var/lib/nomadnetwork
+ PERMS_MARK=/run/nomadnet-perms-done   # configdir whose full walk ran this boot
++DEPS_MARK=/run/wanwatch-deps-pending  # S46wanwatch starts us once rnsd's up
++
++# Not installed: nothing to run (and `enabled` answers no).
++if [ ! -x "$DAEMON" ]; then
++	[ "$1" = enabled ] && exit 1
++	exit 0
++fi
+ 
+-[ -x "$DAEMON" ] || exit 0
++# rns_shared_up — true once rnsd's shared instance accepts clients: RNS on
++# Linux listens on the abstract AF_UNIX socket @rns/<instance> (flags
++# 00010000 = listening, in /proc/net/unix; @rns/<instance>/rpc is its RPC
++# socket, not this), or on 127.0.0.1:37428 (st 0A) with shared_instance_type
++# = tcp. Same test as S46wanwatch/S85lxmd; builtins only.
++rns_shared_up() {
++	while read -r _num _ref _proto flags _type _st _ino path; do
++		case "$path" in
++			@rns/*/*) ;;
++			@rns/*) [ "$flags" = 00010000 ] && return 0 ;;
++		esac
++	done 2>/dev/null </proc/net/unix
++	while read -r _sl laddr _raddr st _rest; do
++		[ "$laddr" = 0100007F:9234 ] && [ "$st" = 0A ] && return 0
++	done 2>/dev/null </proc/net/tcp
++	return 1
++}
+ 
+ # --- read the enable flag (single key=value lines, no shell sourcing) ---
+ read_conf() {
+@@ -42,13 +84,18 @@ read_conf() {
+ 	fi
+ }
+ 
+-start() {
++# disabled — true, with a note, unless $CONF says enabled=yes (also loads
++# configdir). Every start path runs this first.
++disabled() {
+ 	read_conf
+-	if [ "$enabled" != "yes" ]; then
+-		echo "S83nomadnet: disabled in $CONF (enabled=$enabled); skipping"
+-		echo "             flip to 'enabled=yes' to start at boot"
+-		return 0
+-	fi
++	[ "$enabled" = "yes" ] && return 1
++	echo "S83nomadnet: disabled in $CONF (enabled=$enabled); skipping"
++	echo "             flip to 'enabled=yes' to start at boot"
++	return 0
++}
++
++start() {
++	disabled && return 0
+ 
+ 	mkdir -p /var/run "$configdir"
+ 
+@@ -57,11 +104,19 @@ start() {
+ 		return 0
+ 	fi
+ 
+-	if [ ! -f /run/clock-synced ]; then
+-		echo "S83nomadnet: refusing to start - /run/clock-synced absent"
+-		echo "             (S45ntpsync did not succeed; check WAN link)"
++	# Attach to rnsd's shared instance — never open it ourselves.
++	if [ -z "$(pidof rnsd)" ]; then
++		echo "S83nomadnet: refusing to start - rnsd (S82rnsd) is not running"
++		echo "             nomadnet shares rnsd's Reticulum instance; start rnsd first"
+ 		return 1
+ 	fi
++	if ! rns_shared_up; then
++		: > "$DEPS_MARK"
++		echo "S83nomadnet: deferred - rnsd's shared instance isn't accepting clients yet"
++		echo "             S46wanwatch starts nomadnet as soon as it is (needs"
++		echo "             share_instance = Yes in /etc/reticulum/config)"
++		return 0
++	fi
+ 
+ 	# identity + peer data live under storage/ (only that subtree, in case
+ 	# configdir was pointed at a shared dir); `! -type l`: never follow links.
+@@ -87,11 +142,11 @@ start() {
+ 			umask 077
+ 			export PYTHONUNBUFFERED=1
+ 			exec "$DAEMON" --daemon --console --config "$configdir"
+-		) >"$LOGPIPE" 2>&1 &
++		) 9>&- >"$LOGPIPE" 2>&1 &
+ 		PID=$!
+-		logger -t "$NAME[$PID]" -p daemon.notice <"$LOGPIPE" &
++		logger -t "$NAME[$PID]" -p daemon.notice 9>&- <"$LOGPIPE" &
+ 	else
+-		( umask 077; exec "$DAEMON" --daemon --console --config "$configdir" ) >/dev/null 2>&1 &
++		( umask 077; exec "$DAEMON" --daemon --console --config "$configdir" ) 9>&- >/dev/null 2>&1 &
+ 		PID=$!
+ 	fi
+ 	echo "$PID" > "$PIDFILE"
+@@ -120,6 +175,33 @@ stop() {
+ 	fi
+ }
+ 
++# Opt-in, checked first: a start while disabled returns before the lock
++# (never waits on it, never creates it); start() checks again under it.
++case "${1:-start}" in
++	start)   disabled && exit 0 ;;
++	enabled) read_conf; [ "$enabled" = "yes" ]; exit ;;
++esac
++
++# Serialize start/stop/restart on /run/nomadnet.lock: two starts that both
++# passed the pidfile check would run two nomadnets. The spawn lines close
++# fd 9 (first, before the FIFO open can block) so nomadnet and logger can't
++# pin the lock. Bounded wait (busybox flock has no -w), as in S82rnsd.
++case "${1:-start}" in
++	start|stop|restart)
++		exec 9>/run/$NAME.lock
++		if command -v flock >/dev/null 2>&1; then
++			i=0
++			until flock -n 9 2>/dev/null; do
++				if [ "$i" -ge 15 ]; then
++					echo "S83nomadnet: ${1:-start}: /run/$NAME.lock still held after 15s - not done" >&2
++					exit 1
++				fi
++				sleep 1; i=$((i + 1))
++			done
++		fi
++		;;
++esac
++
+ case "${1:-start}" in
+ 	start)   start ;;
+ 	stop)    stop ;;
+@@ -133,5 +215,5 @@ case "${1:-start}" in
+ 			echo "running:         no"
+ 		fi
+ 		;;
+-	*) echo "Usage: $0 {start|stop|restart|status}" >&2; exit 1 ;;
++	*) echo "Usage: $0 {start|stop|restart|status|enabled}" >&2; exit 1 ;;
+ esac
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S84cron b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S84cron
+index 340caae5d..9fb76e7a0 100755
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S84cron
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S84cron
+@@ -9,12 +9,20 @@
+ #
+ # Scheduled tasks: the optional rnsd auto-restart (memory hygiene):
+ # rnsd_restart_days=N restarts rnsd every N days at 04:00 (N=0, the default,
+-# means no entry), and the daily 05:00 rnsd update check (update_check=yes).
++# means no entry), the daily 05:00 rnsd update check (update_check=yes), and
++# always the hourly RTC resync (`S45ntpsync resync`, at :17): the clock
++# re-checked against NTP and written to the RTC, since the kernel's own
++# 11-minute write-back can't be relied on here (see S45ntpsync). It does
++# nothing without an RTC or a reachable NTP server.
+ #
+-# Plus a once-per-boot update check (`bootcheck`), run as soon as the clock is
+-# synced: start() calls it (clock already synced by S45ntpsync at boot) and
+-# S46wanwatch calls it once it sees /run/clock-synced appear later (WAN came
+-# up late). A /run marker makes it fire once per boot whoever calls first.
++# Plus a once-per-boot update check (`bootcheck`), run once the clock is
++# trusted (/run/clock-synced, kept by S45ntpsync / the portal) and a default
++# route exists: start() calls it (covers a clock S45ntpsync took from the RTC
++# at boot, with the WAN already up) and S46wanwatch calls it once both hold
++# later (NTP once a WAN is up, a browser sync, or a late WAN). A /run marker
++# makes it fire once per boot whoever calls first. The update checks (this,
++# the daily one via rnsbox-update-check, and the portal's) are the one
++# consumer that genuinely needs real time; nothing else waits for the clock.
+ 
+ CONF=/etc/rnsbox/cron.conf
+ # On /run (0755, root-only). NOT the busybox default /var/spool (-> /tmp, 1777):
+@@ -50,6 +58,9 @@ gen_crontab() {
+ 	{
+ 		echo "# Auto-generated by S84cron from $CONF — do not hand-edit."
+ 		echo "# (edit /etc/rnsbox/cron.conf or use the portal Reticulum tab)"
++		# jobs otherwise inherit crond's PATH, which depends on who started
++		# it (rcS, or the portal's reload); hwclock and ip live in /sbin
++		echo "PATH=/sbin:/usr/sbin:/bin:/usr/bin"
+ 		if [ "$days" -ge 1 ] 2>/dev/null && [ "$days" -le 7 ]; then
+ 			# min hour day-of-month month day-of-week  command
+ 			# every N days at 04:00; kick-restart does nothing after an
+@@ -60,6 +71,9 @@ gen_crontab() {
+ 			# daily at 05:00: notify-only check for a newer rnsd (offline-safe)
+ 			echo "0 5 * * * /usr/sbin/rnsbox-update-check >> $LOG 2>&1"
+ 		fi
++		# hourly at :17 (clear of the jobs above): clock checked against NTP
++		# and written to the RTC; logs to /var/log/ntp-step.log itself
++		echo "17 * * * * /etc/init.d/S45ntpsync resync >> $LOG 2>&1"
+ 	} > "$tmp" || { rm -f "$tmp"; return 1; }
+ 	chmod 600 "$tmp"
+ 	mv -f "$tmp" "$CRONTAB"
+@@ -67,14 +81,29 @@ gen_crontab() {
+ 	                              || echo "S84cron: rnsd auto-restart disabled"
+ 	[ "$uc" = yes ] && echo "S84cron: daily rnsd update check enabled" \
+ 	                || echo "S84cron: rnsd update check disabled"
++	echo "S84cron: hourly RTC resync from NTP (a no-op without an RTC)"
+ }
+ 
+-# Once-per-boot update check. Needs a synced clock (TLS to PyPI, and the
+-# result is timestamped); until then it does nothing and S46wanwatch calls it
+-# again. mkdir is atomic, so the marker also settles a start()/wanwatch race.
+-# /run is tmpfs, so the marker resets every boot.
++# have_route - true while the main table has an IPv4 default route (same
++# test as S45ntpsync). Builtins only.
++have_route() {
++	while read -r _ifc dst _gw _flags _rc _use _met mask _rest; do
++		[ "$dst" = 00000000 ] && [ "$mask" = 00000000 ] && return 0
++	done 2>/dev/null </proc/net/route
++	return 1
++}
++
++# Once-per-boot update check. Needs a trusted clock (TLS to PyPI, and the
++# result is timestamped) and an uplink; until then it does nothing and
++# S46wanwatch calls it again. A trusted clock no longer implies an uplink:
++# with an RTC it is trusted at S45, possibly long before the WAN (upstream
++# router rebooting after the same power cut, cable plugged in later, WiFi STA
++# still associating), so the marker isn't spent until a default route exists.
++# mkdir is atomic, so the marker also settles a start()/wanwatch race. /run
++# is tmpfs, so the marker resets every boot.
+ bootcheck() {
+ 	[ -f /run/clock-synced ] || return 0
++	have_route || return 0
+ 	mkdir "$BOOTCHECK_MARK" 2>/dev/null || return 0
+ 	read_uc
+ 	if [ "$uc" != yes ]; then
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S85lxmd b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S85lxmd
+index 22f24206b..052bd0aa0 100755
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S85lxmd
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S85lxmd
+@@ -3,14 +3,31 @@
+ #
+ # lxmd is the lightweight, headless propagation node (store-and-forward relay
+ # for offline peers) — the frugal alternative to NomadNet's built-in one (no
+-# pages server, no TUI). Enable by setting `enabled=yes` in
+-# /etc/rnsbox/lxmd.conf, then reboot or run this script with `start`.
++# pages server, no TUI). Opt-in (enabled=no ships; RAM is scarce): enable by
++# setting `enabled=yes` in /etc/rnsbox/lxmd.conf, then reboot or run this
++# script with `start`. While disabled, start does nothing at all: it checks
++# the flag before anything else, even before the lock below. `enabled` exits
++# 0 iff the flag says yes (S46wanwatch asks it before starting lxmd itself).
+ #
+ # Runs AFTER S82rnsd so it attaches to rnsd's *shared* Reticulum instance
+ # (--rnsconfig /etc/reticulum) instead of starting a second transport stack —
+-# critical on a 245 MB box. Gates on /run/clock-synced (LXMF stamps stored
+-# messages + announces with wall-clock time) AND on a free-RAM floor, so a
+-# tight box can't OOM-kill rnsd by starting lxmd.
++# critical on a 245 MB box. So start needs rnsd running (else it refuses) and
++# its shared instance accepting clients (rns_shared_up): rnsd takes several
++# seconds to open it and rcS runs this right after S82rnsd, so until then it
++# defers — it leaves /run/wanwatch-deps-pending and S46wanwatch starts lxmd
++# as soon as the shared instance is up. Also gated on a free-RAM floor, so a
++# tight box can't OOM-kill rnsd by starting lxmd. start/stop are serialized
++# on /run/lxmd.lock (rcS, the operator and S46wanwatch can overlap).
++#
++# No clock gate, like S82rnsd: it runs with or without a trusted wall clock
++# (Reticulum must work on meshes with no internet). LXMF stamps stored
++# messages and announces with wall-clock time, so until the clock is trusted
++# (/run/clock-source: RTC, NTP or a browser sync) those carry a 1970 date.
++# What lxmd recorded meanwhile would then look decades old the moment the
++# clock is set: stored messages purged by the 30-day expiry, the propagation
++# peers it heard culled as 14 days unreachable, and the caches of
++# already-handled messages emptied (so they could be accepted again). The
++# RNSBox LXMF patch (package/python-lxmf/0001-*) re-dates all three instead.
+ #
+ # Like S82rnsd: runs with umask 077 (its identity key is /etc/lxmd/identity;
+ # start() tightens anything left group/world-readable) and with unbuffered
+@@ -25,8 +42,13 @@ RNS_CONFIGDIR=/etc/reticulum
+ PIDFILE=/var/run/$NAME.pid
+ LOGPIPE=/var/run/$NAME.logpipe
+ PERMS_MARK=/run/lxmd-perms-done   # this boot's full walk of $LXMD_CONFIGDIR ran
++DEPS_MARK=/run/wanwatch-deps-pending  # S46wanwatch starts us once rnsd's up
+ 
+-[ -x "$DAEMON" ] || exit 0
++# Not installed: nothing to run (and `enabled` answers no).
++if [ ! -x "$DAEMON" ]; then
++	[ "$1" = enabled ] && exit 1
++	exit 0
++fi
+ 
+ # --- read the enable flag + RAM floor (flat key=value, no shell sourcing) ---
+ read_conf() {
+@@ -44,35 +66,59 @@ read_conf() {
+ 	fi
+ }
+ 
++# rns_shared_up — true once rnsd's shared instance accepts clients: RNS on
++# Linux listens on the abstract AF_UNIX socket @rns/<instance> (flags
++# 00010000 = listening, in /proc/net/unix; @rns/<instance>/rpc is its RPC
++# socket, not this), or on 127.0.0.1:37428 (st 0A) with shared_instance_type
++# = tcp. Same test as S46wanwatch/S83nomadnet; builtins only.
++rns_shared_up() {
++	while read -r _num _ref _proto flags _type _st _ino path; do
++		case "$path" in
++			@rns/*/*) ;;
++			@rns/*) [ "$flags" = 00010000 ] && return 0 ;;
++		esac
++	done 2>/dev/null </proc/net/unix
++	while read -r _sl laddr _raddr st _rest; do
++		[ "$laddr" = 0100007F:9234 ] && [ "$st" = 0A ] && return 0
++	done 2>/dev/null </proc/net/tcp
++	return 1
++}
++
+ mem_available_mb() {
+ 	awk '/^MemAvailable:/{print int($2/1024); found=1} END{if(!found) print 0}' /proc/meminfo 2>/dev/null
+ }
+ 
+-start() {
++# disabled — true, with a note, unless $CONF says enabled=yes (also loads
++# min_free_mb). Every start path runs this first.
++disabled() {
+ 	read_conf
+-	if [ "$enabled" != "yes" ]; then
+-		echo "S85lxmd: disabled in $CONF (enabled=$enabled); skipping"
+-		echo "         set 'enabled=yes' to run an LXMF propagation node"
+-		return 0
+-	fi
++	[ "$enabled" = "yes" ] && return 1
++	echo "S85lxmd: disabled in $CONF (enabled=$enabled); skipping"
++	echo "         set 'enabled=yes' to run an LXMF propagation node"
++	return 0
++}
++
++start() {
++	disabled && return 0
+ 
+ 	if [ -f "$PIDFILE" ] && kill -0 "$(cat $PIDFILE)" 2>/dev/null; then
+ 		echo "S85lxmd: already running (pid $(cat $PIDFILE))"
+ 		return 0
+ 	fi
+ 
+-	if [ ! -f /run/clock-synced ]; then
+-		echo "S85lxmd: refusing to start - /run/clock-synced absent"
+-		echo "         (LXMF needs a real clock to stamp stored messages)"
+-		return 1
+-	fi
+-
+ 	# Attach to rnsd's shared instance — don't start a second transport stack.
+ 	if [ -z "$(pidof rnsd)" ]; then
+ 		echo "S85lxmd: refusing to start - rnsd (S82rnsd) is not running"
+ 		echo "         lxmd shares rnsd's Reticulum instance; start rnsd first"
+ 		return 1
+ 	fi
++	if ! rns_shared_up; then
++		: > "$DEPS_MARK"
++		echo "S85lxmd: deferred - rnsd's shared instance isn't accepting clients yet"
++		echo "         S46wanwatch starts lxmd as soon as it is (needs"
++		echo "         share_instance = Yes in /etc/reticulum/config)"
++		return 0
++	fi
+ 
+ 	# RAM floor: protect rnsd (the core service) from an OOM kill.
+ 	avail=$(mem_available_mb)
+@@ -107,11 +153,11 @@ start() {
+ 			umask 077
+ 			export PYTHONUNBUFFERED=1
+ 			exec "$DAEMON" -p --rnsconfig "$RNS_CONFIGDIR" --config "$LXMD_CONFIGDIR"
+-		) >"$LOGPIPE" 2>&1 &
++		) 9>&- >"$LOGPIPE" 2>&1 &
+ 		PID=$!
+-		logger -t "$NAME[$PID]" -p daemon.notice <"$LOGPIPE" &
++		logger -t "$NAME[$PID]" -p daemon.notice 9>&- <"$LOGPIPE" &
+ 	else
+-		( umask 077; exec "$DAEMON" -p --rnsconfig "$RNS_CONFIGDIR" --config "$LXMD_CONFIGDIR" ) >/dev/null 2>&1 &
++		( umask 077; exec "$DAEMON" -p --rnsconfig "$RNS_CONFIGDIR" --config "$LXMD_CONFIGDIR" ) 9>&- >/dev/null 2>&1 &
+ 		PID=$!
+ 	fi
+ 	echo "$PID" > "$PIDFILE"
+@@ -140,6 +186,33 @@ stop() {
+ 	fi
+ }
+ 
++# Opt-in, checked first: a start while disabled returns before the lock
++# (never waits on it, never creates it); start() checks again under it.
++case "${1:-start}" in
++	start)   disabled && exit 0 ;;
++	enabled) read_conf; [ "$enabled" = "yes" ]; exit ;;
++esac
++
++# Serialize start/stop/restart on /run/lxmd.lock: two starts that both passed
++# the pidfile check would run two lxmds. The spawn lines close fd 9 (first,
++# before the FIFO open can block) so lxmd and logger can't pin the lock.
++# Bounded wait (busybox flock has no -w), as in S82rnsd.
++case "${1:-start}" in
++	start|stop|restart)
++		exec 9>/run/$NAME.lock
++		if command -v flock >/dev/null 2>&1; then
++			i=0
++			until flock -n 9 2>/dev/null; do
++				if [ "$i" -ge 15 ]; then
++					echo "S85lxmd: ${1:-start}: /run/$NAME.lock still held after 15s - not done" >&2
++					exit 1
++				fi
++				sleep 1; i=$((i + 1))
++			done
++		fi
++		;;
++esac
++
+ case "${1:-start}" in
+ 	start)   start ;;
+ 	stop)    stop ;;
+@@ -153,5 +226,5 @@ case "${1:-start}" in
+ 			echo "running:         no"
+ 		fi
+ 		;;
+-	*) echo "Usage: $0 {start|stop|restart|status}" >&2; exit 1 ;;
++	*) echo "Usage: $0 {start|stop|restart|status|enabled}" >&2; exit 1 ;;
+ esac
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/ntp.conf b/buildroot/board/cvitek/SG200X/overlay/etc/ntp.conf
+index e3dc6b144..7e957fcdf 100644
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/ntp.conf
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/ntp.conf
+@@ -1,24 +1,31 @@
+ # RNSBox ntp.conf — IP-only NTP servers, no DNS dependency.
+ #
+-# Why: the Nano-e has no RTC, so the clock starts at 1970 every boot.
+-# rnsd refuses to start without /run/clock-synced, and S45ntpsync sets
+-# that flag only after a successful step against literal NTP IPs. Using
+-# pool.ntp.org from the daemon side would race DNS — which may not work
+-# until much later in boot.
++# Read by the ntpd daemon (S49ntp, always running, -g) and by S45ntpsync's
++# NTP one-shot, which runs `ntpdate -u -b` against the same server lines as
++# soon as a route to one of them appears (a local server on a directly
++# connected subnet counts, e.g. a GPS time server on a LAN-, HaLow- or
++# WiFi-only mesh with no default route), and again whenever the routes
++# change, then writes the time to the RTC if one is fitted. A server given by
++# name needs a default route (DNS); on a mesh with no uplink give it as an IP
++# address. The portal's Settings page edits the server lines; it keeps these
++# comments but puts the servers first.
+ #
+-# Pinning IPs from operators that publish stable anycast NTP addresses
+-# avoids the DNS dependency entirely. Mix providers so one going down
+-# doesn't lose us sync.
++# Nothing waits for NTP: rnsd and friends run with or without a synced clock
++# (Reticulum must work on meshes with no internet at all). Without a DS3231
++# RTC (README.RNSBox.md) the clock starts at 1970 every boot until NTP or a
++# browser sync sets it.
++#
++# Literal IPs because the one-shot runs the moment a route exists, which may
++# be before DNS works. Anycast addresses from two operators, so one going
++# down doesn't lose us sync: Cloudflare (162.159.200.1, 162.159.200.123) and
++# Google (216.239.35.0, .4, .8, .12).
+ 
+-# Cloudflare time service (anycast, well-distributed)
+ server 162.159.200.1   iburst
+ server 162.159.200.123 iburst
+-
+-# Google public NTP (anycast)
+-server 216.239.35.0   iburst
+-server 216.239.35.4   iburst
+-server 216.239.35.8   iburst
+-server 216.239.35.12  iburst
++server 216.239.35.0    iburst
++server 216.239.35.4    iburst
++server 216.239.35.8    iburst
++server 216.239.35.12   iburst
+ 
+ # Standard tightening - don't act as a public NTP server for anyone
+ restrict default nomodify nopeer noquery limited kod
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/reticulum/config b/buildroot/board/cvitek/SG200X/overlay/etc/reticulum/config
+index ba1365ef5..0ff56298d 100644
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/reticulum/config
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/reticulum/config
+@@ -5,8 +5,8 @@
+ #   - enables transport (we're a fixed-location router; routing for
+ #     other nodes is the whole point of running this as a service)
+ #   - listens on TCP 0.0.0.0:4242 so external Reticulum peers can
+-#     connect inbound (user must also add tcp/4242 to
+-#     /etc/rnsbox/openports.conf via the portal UI for WAN reach)
++#     connect inbound (WAN reach: `tcp 4242` in
++#     /etc/rnsbox/openports.conf, shipped open; the portal UI edits it)
+ #   - runs an AutoInterface on usb0 so devices on the USB-tethered
+ #     LAN auto-discover this node without manual config
+ #
+@@ -44,8 +44,9 @@
+ 
+   # Inbound TCP listener for external Reticulum peers. Bound on all
+   # interfaces; nftables limits which interfaces actually reach it.
+-  # Add `tcp 4242` to /etc/rnsbox/openports.conf via the portal to
+-  # make this reachable from the WAN side.
++  # Reachable from the WAN side through the `tcp 4242` entry that
++  # /etc/rnsbox/openports.conf ships with; remove it via the portal
++  # (Network -> Open ports) to close it there.
+   [[TCP Server]]
+     type = TCPServerInterface
+     enabled = True
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/cron.conf b/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/cron.conf
+index 651351b47..2fc473f53 100644
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/cron.conf
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/cron.conf
+@@ -8,13 +8,17 @@
+ #
+ # Applied by /etc/init.d/S84cron at boot (it regenerates the root crontab and
+ # starts crond) and live by the portal when you change it in the UI.
++# Always scheduled, not configurable here: the hourly RTC resync from NTP
++# (/etc/init.d/S45ntpsync resync), which does nothing without an RTC.
+ 
+ rnsd_restart_days=0
+ 
+ # update_check:
+-#   yes  (default) once a day, and once per boot as soon as the clock is
+-#        synced, check PyPI for a newer rnsd (Reticulum) release and show a
+-#        notice in the portal. Notify-only: it never changes the installed
+-#        package or any config, and fails quietly when the box is offline.
++#   yes  (default) once a day, and once per boot once the clock is trusted
++#        and a default route exists, check PyPI for a newer rnsd (Reticulum)
++#        release and show a notice in the portal. Notify-only: it never
++#        changes the installed package or any config, and fails quietly when
++#        the box is offline. Skipped while the clock isn't set (HTTPS needs
++#        a correct date).
+ #   no   disable the periodic update check.
+ update_check=yes
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/lxmd.conf b/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/lxmd.conf
+index 697809029..ccb120d83 100644
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/lxmd.conf
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/lxmd.conf
+@@ -8,7 +8,13 @@
+ #
+ # Shipped DISABLED by default. To enable: set `enabled=yes` below, then reboot
+ # or run `/etc/init.d/S85lxmd start`. The propagation node's own settings
+-# (message store size, node name, peering) live in /etc/lxmd/config.
++# (message store size, node name, peering) live in /etc/lxmd/config. If rnsd
++# has only just started and isn't accepting clients yet, the start is deferred
++# and S46wanwatch starts lxmd a few seconds later. It needs no synced clock:
++# what the propagation node records before the clock is set - stored messages,
++# the propagation peers it hears, its record of messages already handled - is
++# re-dated when it is set, so messages still get LXMF's full 30-day lifetime,
++# peers aren't dropped as unreachable and nothing is delivered twice.
+ #
+ # *** RAM CAUTION — read this ***
+ # The LicheeRV Nano-e has only 256 MB. rnsd + the web portal already use most of
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/nomadnet.conf b/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/nomadnet.conf
+index 170da45ee..73e610e10 100644
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/nomadnet.conf
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/nomadnet.conf
+@@ -9,6 +9,14 @@
+ # To enable: change `enabled=no` to `enabled=yes` below, then either
+ # reboot or run:
+ #   /etc/init.d/S83nomadnet start
++# It attaches to rnsd's shared Reticulum instance: if rnsd has only just
++# started and isn't accepting clients yet, the start is deferred and
++# S46wanwatch starts nomadnet a few seconds later. It needs no synced clock:
++# what its propagation node records before the clock is set - stored
++# messages, the propagation peers it hears, its record of messages already
++# handled - is re-dated when it is set, so messages still get LXMF's full
++# 30-day lifetime, peers aren't dropped as unreachable and nothing is
++# delivered twice.
+ #
+ # Content lives under `configdir` (default /var/lib/nomadnetwork).
+ # Edit page sources in $configdir/storage/pages/ — see
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/openports.conf b/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/openports.conf
+index 2d017be09..f0daedfa2 100644
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/openports.conf
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/openports.conf
+@@ -3,12 +3,12 @@
+ # One rule per line:
+ #   <proto>  <port>   [# comment]
+ #
+-# SSH (22) and the web UI (80) ship as default entries so the box is reachable
+-# on the WAN out of the box. Remove them here (or in the portal: Network ->
+-# Open ports) to close WAN access — the LAN side (usb0) always stays open.
+-#
+-# Add rnsd's TCPServerInterface port (default 4242) if you want external
+-# Reticulum peers to reach you.
++# SSH (22), the web UI (80) and rnsd's TCPServerInterface (4242, so external
++# Reticulum peers can connect in) ship as default entries, so the box is
++# reachable on the WAN out of the box. Remove them here (or in the portal:
++# Network -> Open ports) to close WAN access — the LAN side (usb0) always
++# stays open.
+ # Managed by the rnsbox-portal UI (Network -> Open ports).
+ tcp 22  # SSH
+ tcp 80  # web admin UI
++tcp 4242  # rnsd TCPServerInterface for WAN peers
+diff --git a/buildroot/configs/cvitek_SG200X_musl_riscv64_defconfig b/buildroot/configs/cvitek_SG200X_musl_riscv64_defconfig
+index 7634161a1..6982583be 100644
+--- a/buildroot/configs/cvitek_SG200X_musl_riscv64_defconfig
++++ b/buildroot/configs/cvitek_SG200X_musl_riscv64_defconfig
+@@ -1395,7 +1395,10 @@ BR2_PACKAGE_PYTHON3_BZIP2=y
+ # BR2_PACKAGE_PYTHON3_OSSAUDIODEV is not set
+ # BR2_PACKAGE_PYTHON3_READLINE is not set
+ BR2_PACKAGE_PYTHON3_SSL=y
+-# BR2_PACKAGE_PYTHON3_UNICODEDATA is not set
++# unicodedata is a hard runtime dep: every TLS client hostname goes through the
++# idna codec (stringprep -> unicodedata), pip's requests imports encodings.idna,
++# and nomadnet.util imports it at top level. 3.11 built it despite "not set".
++BR2_PACKAGE_PYTHON3_UNICODEDATA=y
+ # BR2_PACKAGE_PYTHON3_SQLITE is not set
+ BR2_PACKAGE_PYTHON3_PYEXPAT=y
+ # BR2_PACKAGE_PYTHON3_XZ is not set
+@@ -1659,7 +1662,10 @@ BR2_PACKAGE_PYTHON_PIP=y
+ # BR2_PACKAGE_PYTHON_PRIORITY is not set
+ # BR2_PACKAGE_PYTHON_PROMPT_TOOLKIT is not set
+ # BR2_PACKAGE_PYTHON_PROTOBUF is not set
+-# BR2_PACKAGE_PYTHON_PSUTIL is not set
++# psutil: RNS includes rnsd's resident memory ("rss") in its interface stats
++# (get_interface_stats over the shared instance: rnstatus, rnstatus -j) only
++# when psutil is importable; it imports it lazily (importlib find_spec).
++BR2_PACKAGE_PYTHON_PSUTIL=y
+ # BR2_PACKAGE_PYTHON_PSYCOPG2 is not set
+ # BR2_PACKAGE_PYTHON_PTYPROCESS is not set
+ # BR2_PACKAGE_PYTHON_PUDB is not set
+diff --git a/buildroot/package/dnsmasq/dnsmasq.mk b/buildroot/package/dnsmasq/dnsmasq.mk
+index 9c05857f2..c57af4ede 100644
+--- a/buildroot/package/dnsmasq/dnsmasq.mk
++++ b/buildroot/package/dnsmasq/dnsmasq.mk
+@@ -22,6 +22,13 @@ DNSMASQ_IGNORE_CVES += CVE-2023-28450
+ 
+ DNSMASQ_I18N = $(if $(BR2_SYSTEM_ENABLE_NLS),-i18n)
+ 
++# RNSBox: the board has no RTC by default and S45ntpsync steps the clock in
++# the background after dnsmasq is up, so time leases on CLOCK_MONOTONIC.
++# Otherwise leases handed out at 1970 expire at the step and renewals get
++# NAKed. The lease file stores lengths, not expiry times; it is on tmpfs
++# (/var/lib/misc -> /tmp), so there is no old file to migrate.
++DNSMASQ_COPTS += -DHAVE_BROKEN_RTC
++
+ ifneq ($(BR2_PACKAGE_DNSMASQ_DHCP),y)
+ DNSMASQ_COPTS += -DNO_DHCP
+ endif
+diff --git a/buildroot/package/python-lxmf/0001-redate-messages-stored-before-clock-set.patch b/buildroot/package/python-lxmf/0001-redate-messages-stored-before-clock-set.patch
+new file mode 100644
+index 000000000..db197c789
+--- /dev/null
++++ b/buildroot/package/python-lxmf/0001-redate-messages-stored-before-clock-set.patch
+@@ -0,0 +1,118 @@
++From: smit1237 <smit1237@gmail.com>
++Date: Thu, 24 Sep 2026 05:30:00 +0300
++Subject: [PATCH] LXMRouter: re-date state recorded before the clock was set
++
++RNSBox runs lxmd / nomadnet as propagation nodes whether or not the wall
++clock is set: with no RTC and no NTP (HaLow-, LAN- or WiFi-only meshes) the
++clock starts at 1970, or ~2000 on an unset DS3231. Timestamps LXMRouter
++takes then look decades old once the clock is set (NTP, a browser sync, a
++later trusted-RTC boot), and its wall-clock expiry drops the state:
++
++ - Stored messages are named <transient_id>_<received>_<stamp> with that
++   received time; clean_message_store() (every 8 min on a propagation node)
++   purges an entry once now > received + MESSAGE_EXPIRY, so the first clean
++   after the clock is set deletes every message stored while it was unset.
++ - peer() and a successful sync set a propagation peer's last_heard to the
++   local clock; sync_peers() (every 24 s) culls a peer once now > last_heard
++   + LXMPeer.MAX_UNREACHABLE (14 d), so every peer heard while the clock was
++   unset is dropped as unreachable, with the unhandled-message lists that
++   are rebuilt from self.peers when the store is saved.
++ - clean_transient_id_caches() purges locally delivered / processed
++   transient IDs past MESSAGE_EXPIRY*6, so messages already handled while
++   the clock was unset could be accepted and delivered again.
++
++Instead, when such a timestamp is below CLOCK_FLOOR (2020-01-01 UTC, the
++floor RNSBox's S45ntpsync and portal use for a plausible clock) and the
++clock now reads at or above it, re-date it to the current time:
++
++ - a stored message's file is renamed with the current time and the entry's
++   path and receive time updated, so it gets its full 30-day lifetime from
++   when the clock was set (updating entry[2] also keeps get_weight()'s
++   storage-limit culling from treating it as decades old);
++ - a peer's last_heard is set to now (one never heard, at 0, is left
++   alone: the startup path-request logic keys on that), so only a peer
++   genuinely unheard for 14 days is culled;
++ - a transient-ID cache entry is re-stamped with now instead of purged.
++
++While the clock is still unset, everything works on the unset clock as
++before.
++
++Signed-off-by: smit1237 <smit1237@gmail.com>
++---
++ LXMF/LXMRouter.py | 32 +++++++++++++++++++++++++++++---
++ 1 file changed, 29 insertions(+), 3 deletions(-)
++
++diff --git a/LXMF/LXMRouter.py b/LXMF/LXMRouter.py
++--- a/LXMF/LXMRouter.py
+++++ b/LXMF/LXMRouter.py
++@@ -36,6 +36,10 @@
++     P_LINK_MAX_INACTIVITY = 3*60
++ 
++     MESSAGE_EXPIRY        = 30*24*60*60
+++    # RNSBox: a receive timestamp below this (2020-01-01 UTC) was taken while
+++    # the wall clock was unset (no RTC / no NTP yet: 1970, ~2000 on an unset
+++    # DS3231). Re-dated once the clock is set instead of expired or culled.
+++    CLOCK_FLOOR           = 1577836800
++     STAMP_COST_EXPIRY     = 45*24*60*60
++ 
++     NODE_ANNOUNCE_DELAY   = 20
++@@ -958,7 +962,11 @@
++         removed_entries = []
++         for transient_id in self.locally_delivered_transient_ids:
++             timestamp = self.locally_delivered_transient_ids[transient_id]
++-            if now > timestamp+LXMRouter.MESSAGE_EXPIRY*6.0:
+++            if timestamp < LXMRouter.CLOCK_FLOOR <= now:
+++                # RNSBox: recorded while the clock was unset; keep it
+++                # (re-dated) so the message isn't accepted again.
+++                self.locally_delivered_transient_ids[transient_id] = now
+++            elif now > timestamp+LXMRouter.MESSAGE_EXPIRY*6.0:
++                 removed_entries.append(transient_id)
++ 
++         for transient_id in removed_entries:
++@@ -968,7 +976,9 @@
++         removed_entries = []
++         for transient_id in self.locally_processed_transient_ids:
++             timestamp = self.locally_processed_transient_ids[transient_id]
++-            if now > timestamp+LXMRouter.MESSAGE_EXPIRY*6.0:
+++            if timestamp < LXMRouter.CLOCK_FLOOR <= now:
+++                self.locally_processed_transient_ids[transient_id] = now
+++            elif now > timestamp+LXMRouter.MESSAGE_EXPIRY*6.0:
++                 removed_entries.append(transient_id)
++ 
++         for transient_id in removed_entries:
++@@ -1106,7 +1116,18 @@
++ 
++             if len(components) == 3 and float(components[1]) > 0 and len(os.path.split(components[0])[1]) == (RNS.Identity.HASHLENGTH//8)*2 and int(components[2]) == stamp_value:
++                 timestamp = float(components[1])
++-                if now > timestamp+LXMRouter.MESSAGE_EXPIRY:
+++                if timestamp < LXMRouter.CLOCK_FLOOR <= now:
+++                    # Stored before the clock was set: give it its full expiry
+++                    # from now rather than purging it as decades old.
+++                    new_path = os.path.join(os.path.dirname(filepath), f"{components[0]}_{now}_{components[2]}")
+++                    try:
+++                        os.rename(filepath, new_path)
+++                        entry[1] = new_path
+++                        entry[2] = now
+++                        RNS.log("Re-dated message "+RNS.prettyhexrep(transient_id)+" stored before the clock was set", RNS.LOG_DEBUG)
+++                    except Exception as e:
+++                        RNS.log("Could not re-date "+RNS.prettyhexrep(transient_id)+" in the message store. The contained exception was: "+str(e), RNS.LOG_ERROR)
+++                elif now > timestamp+LXMRouter.MESSAGE_EXPIRY:
++                     RNS.log("Purging message "+RNS.prettyhexrep(transient_id)+" due to expiry", RNS.LOG_EXTREME)
++                     removed_entries[transient_id] = filepath
++             else:
++@@ -2029,8 +2050,13 @@
++         waiting_peers = []
++         unresponsive_peers = []
++         peers = self.peers.copy()
+++        now = time.time()
++         for peer_id in peers:
++             peer = peers[peer_id]
+++            if 0 < peer.last_heard < LXMRouter.CLOCK_FLOOR <= now:
+++                # RNSBox: heard while the clock was unset. Re-date it rather
+++                # than cull the peer as unreachable for decades.
+++                peer.last_heard = now
++             if time.time() > peer.last_heard + LXMPeer.MAX_UNREACHABLE:
++                 if not peer_id in self.static_peers: culled_peers.append(peer_id)
++             
++-- 
++2.43.0
+diff --git a/buildroot/package/python-nomadnet/Config.in b/buildroot/package/python-nomadnet/Config.in
+index 387a6b518..7a43d2467 100644
+--- a/buildroot/package/python-nomadnet/Config.in
++++ b/buildroot/package/python-nomadnet/Config.in
+@@ -4,6 +4,7 @@ config BR2_PACKAGE_PYTHON_NOMADNET
+ 	select BR2_PACKAGE_PYTHON_LXMF        # runtime
+ 	select BR2_PACKAGE_PYTHON_URWID       # runtime (TUI)
+ 	select BR2_PACKAGE_PYTHON_QRCODE      # runtime (QR identity codes)
++	select BR2_PACKAGE_PYTHON3_UNICODEDATA # runtime (nomadnet.util imports it)
+ 	help
+ 	  Nomad Network — a Reticulum-based application stack that
+ 	  ships an LXMF propagation node, a nomadnet "page" server
+diff --git a/buildroot/package/rnsbox-portal/src/bin/rnsbox-update-check b/buildroot/package/rnsbox-portal/src/bin/rnsbox-update-check
+index 5101fa683..cdb41f476 100755
+--- a/buildroot/package/rnsbox-portal/src/bin/rnsbox-update-check
++++ b/buildroot/package/rnsbox-portal/src/bin/rnsbox-update-check
+@@ -1,9 +1,21 @@
+ #!/bin/sh
+ # rnsbox-update-check — thin launcher for the standalone update-check helper.
+-# Called by S84cron (daily at 05:00 + once per boot after the clock syncs:
+-# `S84cron bootcheck`, triggered by S84cron start or S46wanwatch). The helper
+-# is stdlib-only Python (no Flask, no rnsbox_portal package); the C++ portal
+-# invokes the same script for the on-demand "Check for updates" / "Apply update"
+-# buttons on the Reticulum tab. Arg defaults to "cron" (query PyPI + persist +
+-# print a human summary); the portal passes "check" / "apply" (JSON output).
++# Called by S84cron (daily at 05:00 + once per boot once the clock is trusted
++# and a default route exists: `S84cron bootcheck`, triggered by S84cron start
++# or S46wanwatch). The helper is stdlib-only Python (no Flask, no
++# rnsbox_portal package); the C++ portal invokes the same script for the
++# on-demand "Check for updates" / "Apply update" buttons on the Reticulum tab
++# (and refuses them itself while the clock isn't set). Arg defaults to "cron"
++# (query PyPI + persist + print a human summary); the portal passes "check" /
++# "apply" (JSON output).
++#
++# cron: skipped while the clock isn't trusted (/run/clock-synced, S45ntpsync):
++# HTTPS to PyPI fails "certificate is not yet valid" at a 1970 / ~2000 clock,
++# which the helper would record as an offline error with a 1970 timestamp.
++case "${1:-cron}" in
++cron)	if [ ! -f /run/clock-synced ]; then
++		echo "update-check: skipped - clock not set (no NTP, RTC or browser time yet); HTTPS to PyPI needs a correct date"
++		exit 0
++	fi ;;
++esac
+ exec python3 /usr/lib/rnsbox/updatecheck.py "${1:-cron}"
+diff --git a/buildroot/package/rnsbox-portal/src/cgi/pages/dashboard.html b/buildroot/package/rnsbox-portal/src/cgi/pages/dashboard.html
+index c5049831a..0e53f86af 100644
+--- a/buildroot/package/rnsbox-portal/src/cgi/pages/dashboard.html
++++ b/buildroot/package/rnsbox-portal/src/cgi/pages/dashboard.html
+@@ -22,6 +22,7 @@
+       <tr><th>Kernel</th><td>__KERNEL__</td></tr>
+       <tr><th>Uptime</th><td id="d-uptime">__UPTIME__</td></tr>
+       <tr><th>Load avg</th><td id="d-load">__LOAD__</td></tr>
++      <tr><th>Clock source</th><td id="d-clock">__CLOCK__</td></tr>
+     </table>
+     <div class="meter-label">
+       <span>RAM</span>
+@@ -75,6 +76,8 @@ __HALOW_SCRIPT__
+     var s=d.sys||{}, m=s.mem||{}, wif=d.wan_if||{}, lif=d.lan_if||{}, rn=d.rnsd||{}, up=d.update||{};
+     setText('d-uptime', s.uptime||'');
+     setText('d-load', (s.load||[]).join(' / '));
++    var cm={ntp:'NTP',rtc:'RTC',browser:'browser'}, cs=cm.hasOwnProperty(d.clock_source)?cm[d.clock_source]:'';
++    setHTML('d-clock', cs?'<span class="badge ok">'+esc(cs)+'</span>':'<span class="badge warn">none</span>');
+     if(m.total_mb){
+       var pct=m.used_pct||0;
+       setText('d-ram-label', m.used_mb+' / '+m.total_mb+' MB · '+m.avail_mb+' MB free');
+diff --git a/buildroot/package/rnsbox-portal/src/cgi/pages/network.html b/buildroot/package/rnsbox-portal/src/cgi/pages/network.html
+index 56add6596..9720b28f1 100644
+--- a/buildroot/package/rnsbox-portal/src/cgi/pages/network.html
++++ b/buildroot/package/rnsbox-portal/src/cgi/pages/network.html
+@@ -72,7 +72,7 @@
+ 
+ <section class="card">
+   <h3>Open ports (services on this router exposed on WAN)</h3>
+-  <p class="muted">Allows inbound connections on the WAN to services bound on this device. <strong>SSH (22)</strong> and the <strong>web UI (80)</strong> are open by default (the web UI also carries the HaLow modem page on 8081) &mdash; remove them to close WAN access (the LAN side &mdash; <code>usb0</code>, plus the WiFi hotspot while it is on &mdash; always stays open). Add rnsd's TCPServerInterface port (4242) here for external Reticulum peers.</p>
++  <p class="muted">Allows inbound connections on the WAN to services bound on this device. <strong>SSH (22)</strong>, the <strong>web UI (80)</strong> (which also carries the HaLow modem page on 8081) and <strong>rnsd's TCPServerInterface (4242)</strong>, for external Reticulum peers, are open by default &mdash; remove them to close WAN access (the LAN side &mdash; <code>usb0</code>, plus the WiFi hotspot while it is on &mdash; always stays open).</p>
+   <table class="data">
+     <thead>
+       <tr><th>Proto</th><th>Port</th><th>Comment</th><th></th></tr>
+@@ -97,7 +97,7 @@
+   <h3>LAN clients (DHCP leases)</h3>
+   <table class="data">
+     <thead>
+-      <tr><th>IP</th><th>MAC</th><th>Name</th><th>Expires (epoch)</th></tr>
++      <tr><th>IP</th><th>MAC</th><th>Name</th><th>Lease (s)</th></tr>
+     </thead>
+     <tbody>
+       __LEASES_ROWS__
+diff --git a/buildroot/package/rnsbox-portal/src/cgi/pages/settings.html b/buildroot/package/rnsbox-portal/src/cgi/pages/settings.html
+index 92403c8e4..0201ea687 100644
+--- a/buildroot/package/rnsbox-portal/src/cgi/pages/settings.html
++++ b/buildroot/package/rnsbox-portal/src/cgi/pages/settings.html
+@@ -7,18 +7,27 @@
+       <span class="timeval">__SYS_TIME__</span> <span class="muted">UTC</span>
+       __TIME_BADGE__
+     </td></tr>
++    <tr><th>Clock source</th><td>__CLOCK_SOURCE__</td></tr>
++    <tr><th>Hardware clock</th><td>__RTC_STATUS__</td></tr>
++    __RTC_TEMP_ROW__
+   </table>
++  <p class="muted">Reticulum (and nomadnet/lxmd when enabled) runs whatever the
++  clock says — no internet needed; a correct clock just keeps timestamps
++  meaningful. At boot the time comes from the hardware clock (RTC) when one is
++  fitted and set; NTP takes over whenever a time server is reachable, and every
++  NTP or browser sync is written to the RTC (and, while a time server is
++  reachable, the NTP time once an hour).</p>
+ 
+   <h4>Sync to browser</h4>
+-  <p class="muted">The board has no real-time clock, so it boots at 1970. Set the
+-  clock to this device's time — the quickest way to get a correct clock on a box
+-  with no internet. Setting it also starts rnsd (and nomadnet/lxmd if enabled),
+-  which wait for a valid clock.</p>
++  <p class="muted">Set the clock to this device's time — the quickest way to get a
++  correct clock on a box with no internet (HaLow-, LAN- or WiFi-only). A fitted
++  RTC is set too, even one that was never set, so the time survives reboots.</p>
+   <p>This browser reads <strong id="browser-time">…</strong> UTC</p>
+   <form method="post" action="__BASE__/settings/time/browser"
+         onsubmit="this.epoch.value = Math.floor(Date.now()/1000)">
+     <input type="hidden" name="epoch" value="">
+-    <button type="submit" class="btn-primary">Sync clock to browser</button>
++    <button type="submit" class="btn-primary"__BROWSER_BTN_ATTR__>Sync clock to browser</button>
++    __BROWSER_NOTE__
+   </form>
+ 
+   <h4>NTP servers</h4>
+@@ -32,7 +41,8 @@
+   </form>
+   <form method="post" action="__BASE__/settings/ntp/restart" class="ntp-restart">
+     <button type="submit" class="btn">Restart NTP</button>
+-    <span class="muted">ntpd runs with <code>-g</code>, so it steps the clock even from 1970 once it can reach a server.</span>
++    <span class="muted">Restarts ntpd (it runs with <code>-g</code>, so it steps the clock even from 1970) and
++    runs a one-off sync against these servers right away; a successful sync is written to the RTC.</span>
+   </form>
+ 
+   <script>
+diff --git a/buildroot/package/rnsbox-portal/src/cgi/routes_dash.cpp b/buildroot/package/rnsbox-portal/src/cgi/routes_dash.cpp
+index d39964fde..a63ab3ccb 100644
+--- a/buildroot/package/rnsbox-portal/src/cgi/routes_dash.cpp
++++ b/buildroot/package/rnsbox-portal/src/cgi/routes_dash.cpp
+@@ -50,6 +50,15 @@ static std::string fmt_pct(double p) {
+     char buf[32]; snprintf(buf, sizeof(buf), "%.1f", p); return buf;
+ }
+ 
++// /run/clock-source as a badge (the full picture is on the Settings tab). Same
++// labels as the /dashboard/data patch() below.
++static std::string clock_badge(const std::string& src) {
++    if (src == "ntp")     return "<span class=\"badge ok\">NTP</span>";
++    if (src == "rtc")     return "<span class=\"badge ok\">RTC</span>";
++    if (src == "browser") return "<span class=\"badge ok\">browser</span>";
++    return "<span class=\"badge warn\">none</span>";
++}
++
+ // --- JSON helpers for /dashboard/data ---
+ static std::string str_array_json(const std::vector<std::string>& v) {
+     std::string o = "[";
+@@ -158,6 +167,7 @@ void dashboard_page(const Request& req, Response& res) {
+     h = R(std::move(h), "__KERNEL__",   E(sys.kernel));
+     h = R(std::move(h), "__UPTIME__",   E(sys.uptime));
+     h = R(std::move(h), "__LOAD__",     E(sys.load[0]) + " / " + E(sys.load[1]) + " / " + E(sys.load[2]));
++    h = R(std::move(h), "__CLOCK__",    clock_badge(sysinfo::clock_source()));
+ 
+     // RAM meter
+     h = R(std::move(h), "__RAM_USED__",      std::to_string(sys.mem.used_mb));
+@@ -261,6 +271,7 @@ void dashboard_data(const Request& req, Response& res) {
+     J += "\"lan_if\":" + iface_json(lif) + ",";
+     J += "\"gateway\":\"" + JE(net.default_gateway) + "\",";
+     J += "\"dns\":" + str_array_json(net.dns) + ",";
++    J += "\"clock_source\":\"" + JE(sysinfo::clock_source()) + "\",";
+     updatecheck::State u = updatecheck::display();
+     J += "\"update\":{\"installed\":" + (u.installed.empty() ? std::string("null") : "\"" + JE(u.installed) + "\"");
+     J += ",\"update_available\":" + std::string(u.update_available ? "true" : "false");
+diff --git a/buildroot/package/rnsbox-portal/src/cgi/routes_net.cpp b/buildroot/package/rnsbox-portal/src/cgi/routes_net.cpp
+index ff30a015b..a8ef99472 100644
+--- a/buildroot/package/rnsbox-portal/src/cgi/routes_net.cpp
++++ b/buildroot/package/rnsbox-portal/src/cgi/routes_net.cpp
+@@ -108,7 +108,7 @@ void network_page(const Request& req, Response& res) {
+     } else {
+         for (const auto& l : leases) {
+             rows += "<tr><td>" + E(l.ip) + "</td><td><code>" + E(l.mac) + "</code></td>"
+-                    "<td>" + E(l.name) + "</td><td>" + E(l.expires) + "</td></tr>";
++                    "<td>" + E(l.name) + "</td><td>" + E(l.length) + "</td></tr>";
+         }
+     }
+     h = R(std::move(h), "__LEASES_ROWS__", rows);
+diff --git a/buildroot/package/rnsbox-portal/src/cgi/routes_reticulum.cpp b/buildroot/package/rnsbox-portal/src/cgi/routes_reticulum.cpp
+index 646ea63ee..d841e9428 100644
+--- a/buildroot/package/rnsbox-portal/src/cgi/routes_reticulum.cpp
++++ b/buildroot/package/rnsbox-portal/src/cgi/routes_reticulum.cpp
+@@ -27,6 +27,16 @@ static std::string R(std::string s, const std::string& a, const std::string& b)
+ static std::string E(const std::string& s) { return render::esc(s); }
+ static std::string ret_redirect() { return web::base() + "/reticulum"; }
+ 
++// HTTPS to PyPI needs a real date. With no trusted clock (/run/clock-source
++// absent: no NTP, RTC or browser sync yet) TLS fails "certificate is not yet
++// valid", which updatecheck.py records only as "URLError" (reads as offline),
++// and check() would persist a 1970/2000 checked_at. So don't run it at all.
++// (rnsbox-update-check applies the same rule to the cron/boot checks.)
++static bool clock_trusted() { return !sysinfo::clock_source().empty(); }
++static const char NO_CLOCK[] =
++    "the clock isn't set (no NTP, RTC or browser time yet) and HTTPS needs a "
++    "correct date. Set it under Settings → Time & Clock.";
++
+ // store._truthy: falsey iff stripped/lowered value in {no,0,false,off,""}.
+ static bool truthy(const std::string& s) {
+     std::string v = util::trim(s);
+@@ -164,7 +174,10 @@ void reticulum_page(const Request& req, Response& res) {
+     } else {
+         chk = "not checked yet";
+     }
+-    if (!uerror.empty())
++    if (!clock_trusted())
++        chk += " <span class=\"muted\">— paused: the clock isn't set (HTTPS needs a correct date); "
++               "set it under Settings &rarr; Time &amp; Clock</span>";
++    else if (!uerror.empty())
+         chk += " <span class=\"muted\">— last attempt failed (offline?)</span>";
+     h = R(std::move(h), "__UPDATE_CHECK_LINE__", chk);
+ 
+@@ -429,6 +442,11 @@ static void update_json(Response& res, bool ok, bool reload, const std::string&
+ 
+ void reticulum_checkupdate(const Request& req, Response& res) {
+     if (!web::require_auth(req, res, true)) return;
++    // Before python starts, so no bogus checked_at / error gets persisted.
++    if (!clock_trusted()) {
++        update_json(res, false, false, std::string("Can't check for updates: ") + NO_CLOCK);
++        return;
++    }
+     auto rr = util::run({"/usr/bin/python3", "/usr/lib/rnsbox/updatecheck.py", "check"}, "", 60);
+     std::string j = rr.out;
+     if (j.find("installed") == std::string::npos && j.find("error") == std::string::npos) {
+@@ -451,6 +469,10 @@ void reticulum_checkupdate(const Request& req, Response& res) {
+ 
+ void reticulum_applyupdate(const Request& req, Response& res) {
+     if (!web::require_auth(req, res, true)) return;
++    if (!clock_trusted()) {
++        update_json(res, false, false, std::string("Can't update: ") + NO_CLOCK);
++        return;
++    }
+     // Long: pip install + rnsd restart, with a rollback on failure. Budgets nest
+     // (arithmetic in updatecheck.py, above APPLY_BUDGET): the helper finishes
+     // inside 270 s + python start-up, we give it 285 s, and uhttpd's script /
+diff --git a/buildroot/package/rnsbox-portal/src/cgi/routes_settings.cpp b/buildroot/package/rnsbox-portal/src/cgi/routes_settings.cpp
+index 7a2c4d3de..c9fe7262e 100644
+--- a/buildroot/package/rnsbox-portal/src/cgi/routes_settings.cpp
++++ b/buildroot/package/rnsbox-portal/src/cgi/routes_settings.cpp
+@@ -9,11 +9,15 @@
+ #include "sysinfo.h"
+ #include "util.h"
+ #include <cctype>
++#include <cstdio>
+ #include <cstdlib>
++#include <cstring>    // ::strerror (an unreadable RTC)
+ #include <ctime>
+ #include <string>
+ #include <vector>
+-#include <unistd.h>   // ::sleep for the wrong-password brute-force speed bump
++#include <fcntl.h>
++#include <sys/file.h> // ::flock (S45ntpsync's clock-step lock)
++#include <unistd.h>   // ::sleep (wrong-password speed bump), ::access (/dev/rtc0)
+ 
+ using http::Request;
+ using http::Response;
+@@ -24,6 +28,53 @@ static std::string R(std::string s, const std::string& a, const std::string& b)
+ static std::string E(const std::string& s) { return render::esc(s); }
+ static std::string settings_redirect() { return web::base() + "/settings"; }
+ 
++// ---- Time & Clock card fragments ----
++
++// /run/clock-source as a badge + one line of what it means.
++static std::string clock_source_html(const std::string& src) {
++    if (src == "ntp")
++        return "<span class=\"badge ok\">NTP</span> <span class=\"muted\">stepped from a time server</span>";
++    if (src == "rtc")
++        return "<span class=\"badge ok\">RTC</span> <span class=\"muted\">read from the hardware clock at boot</span>";
++    if (src == "browser")
++        return "<span class=\"badge ok\">browser</span> <span class=\"muted\">set from a browser on this page</span>";
++    return "<span class=\"badge warn\">none</span> <span class=\"muted\">no NTP, RTC or browser time yet</span>";
++}
++
++static std::string rtc_html(const sysinfo::Rtc& rtc) {
++    if (!rtc.present)
++        return "<span class=\"muted\">none fitted — the clock starts at 1970 on every boot "
++               "until NTP or a browser sync sets it</span>";
++    std::string chip = rtc.name.empty() ? std::string() : " <span class=\"muted\">(" + E(rtc.name) + ")</span>";
++    if (rtc.valid)
++        return "<span class=\"badge ok\">set</span> <span class=\"timeval\">" + E(rtc.time) +
++               "</span> <span class=\"muted\">UTC</span>" + chip;
++    // The driver refuses the time while the oscillator-stop flag is set (EINVAL).
++    if (rtc.osf)
++        return "<span class=\"badge warn\">not set</span>" + chip +
++               "<br><span class=\"muted\">Fitted, but its oscillator has stopped since it was last set "
++               "(never set, or its backup cell ran flat while unpowered), so it holds no valid time "
++               "and was ignored at boot. The next NTP sync or a browser sync below sets it; replace "
++               "the coin cell if this recurs.</span>";
++    if (!rtc.time.empty())
++        return "<span class=\"badge warn\">not set</span>" + chip +
++               "<br><span class=\"muted\">It reads an implausible </span><span class=\"timeval\">" + E(rtc.time) +
++               "</span> <span class=\"muted\">UTC (outside 2020–2100), so it was ignored at boot. "
++               "The next NTP sync or a browser sync below sets it.</span>";
++    std::string why = rtc.read_errno ? std::string(::strerror(rtc.read_errno)) : std::string("unexpected value");
++    return "<span class=\"badge warn\">unreadable</span>" + chip +
++           "<br><span class=\"muted\">Fitted, but reading it failed (" + E(why) + "), so its time "
++           "is ignored. Check its wiring; the next NTP sync or a browser sync below writes it.</span>";
++}
++
++// Row only when the DS3231's hwmon sensor is there (millidegrees -> 0.25 °C steps).
++static std::string rtc_temp_row(const sysinfo::Rtc& rtc) {
++    if (!rtc.present || !rtc.has_temp) return std::string();
++    char buf[32];
++    snprintf(buf, sizeof(buf), "%.2f", rtc.temp_mc / 1000.0);
++    return "<tr><th>RTC temperature</th><td>" + E(buf) + " &deg;C</td></tr>";
++}
++
+ // ---- GET render ----
+ 
+ void settings_page(const Request& req, Response& res) {
+@@ -40,14 +91,30 @@ void settings_page(const Request& req, Response& res) {
+     time_t now = ::time(nullptr);
+     char ts[40]; struct tm tmv; gmtime_r(&now, &tmv);
+     strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tmv);
+-    bool synced = (now > 1600000000);   // > 2020-09 => the clock has been set
++    // Synced = a recorded source (the same rule as /run/clock-synced); the year
++    // test only guards against a stale or mistaken source file.
++    std::string src = sysinfo::clock_source();
++    bool synced = !src.empty() && (long long)now >= sysinfo::CLOCK_FLOOR;
++    sysinfo::Rtc rtc = sysinfo::rtc_status();
+ 
++    // Fixed/system tokens first, operator-controlled values (NTP servers,
++    // hostname, WAN) last, so a value that happens to spell a token is never
++    // expanded again.
+     std::string h = render::page_file("settings");
+     h = R(std::move(h), "__BASE__", base);
+     h = R(std::move(h), "__SYS_TIME__", E(std::string(ts)));
+     h = R(std::move(h), "__TIME_BADGE__",
+           synced ? "<span class=\"badge ok\">synced</span>"
+                  : "<span class=\"badge warn\">not synced</span>");
++    h = R(std::move(h), "__CLOCK_SOURCE__", clock_source_html(src));
++    h = R(std::move(h), "__RTC_STATUS__", rtc_html(rtc));
++    h = R(std::move(h), "__RTC_TEMP_ROW__", rtc_temp_row(rtc));
++    // NTP outranks a browser (see time_browser), so the button is moot once it
++    // has synced; the POST handler enforces it regardless.
++    h = R(std::move(h), "__BROWSER_BTN_ATTR__", src == "ntp" ? " disabled" : "");
++    h = R(std::move(h), "__BROWSER_NOTE__", src == "ntp"
++          ? "<span class=\"muted\">Not needed: NTP has synced the clock, and it takes precedence.</span>"
++          : "");
+     h = R(std::move(h), "__NTP_SERVERS__", E(ntp_joined));
+     h = R(std::move(h), "__HOSTNAME__", E(host));
+     h = R(std::move(h), "__WAN__", E(wan));
+@@ -159,8 +226,29 @@ void ntp_set(const Request& req, Response& res) {
+ void ntp_restart(const Request& req, Response& res) {
+     if (!web::require_auth(req, res, false)) return;
+     web::run_init("S49ntp");
+-    render::redirect_flash(res, settings_redirect(), "success",
+-        "ntpd restarted — it will step the clock once it reaches a server.");
++    // Plus S45ntpsync's one-shot, so an edited server list steps the clock
++    // within seconds instead of after ntpd's poll backoff. `sync` only launches
++    // it detached and returns (0 = started, 2 = one is already running, 3 = no
++    // configured server is routable right now: no default route, and no
++    // literal-address server on a connected subnet); it never re-classifies
++    // the RTC, and on success it records source=ntp and writes the RTC itself.
++    // Safe right after the restart: the one-shot stops ntpd for its step and
++    // starts it again (never two steppers at once), and when no server is
++    // routable it isn't launched at all, leaving the restarted ntpd on the new
++    // list.
++    int rc = util::run({"/etc/init.d/S45ntpsync", "sync"}, "", 10).exit_code;
++    std::string msg = "ntpd restarted";
++    if (rc == 0)
++        msg += ", and a one-off NTP sync started in the background: reload in a few seconds "
++               "to see the clock source (log: /var/log/ntp-step.log).";
++    else if (rc == 2)
++        msg += "; an NTP sync is already running (log: /var/log/ntp-step.log).";
++    else if (rc == 3)
++        msg += "; none of the NTP servers is reachable right now (no route to any of them) — "
++               "ntpd keeps trying, and the clock is stepped once one is.";
++    else
++        msg += " — it will step the clock once it reaches a server.";
++    render::redirect_flash(res, settings_redirect(), "success", msg);
+ }
+ 
+ void time_browser(const Request& req, Response& res) {
+@@ -175,11 +263,36 @@ void time_browser(const Request& req, Response& res) {
+         render::redirect_flash(res, settings_redirect(), "error", "Could not read the browser time.");
+         return;
+     }
+-    long epoch = atol(es.c_str());
++    // > 12 digits is past 2100 anyway; capping it keeps atol from overflowing
++    // (wrapping) back into the plausible window.
++    long epoch = es.size() > 12 ? 0L : atol(es.c_str());
+     if (epoch < 1577836800L || epoch > 4102444800L) {   // 2020-01-01 .. 2100-01-01
+         render::redirect_flash(res, settings_redirect(), "error", "Browser time looks implausible; clock not changed.");
+         return;
+     }
++    // One clock stepper at a time: S45ntpsync's NTP one-shot holds this lock
++    // while ntpdate -b steps the clock relative to the current time, so a step
++    // of ours inside its sampling window would be applied twice. Held (and
++    // S49ntp start deferred) only for the date + hwclock below; O_CLOEXEC
++    // keeps it out of those children.
++    int lfd = ::open("/run/ntpsync.step.lock", O_RDWR | O_CREAT | O_CLOEXEC, 0644);
++    if (lfd >= 0 && ::flock(lfd, LOCK_EX | LOCK_NB) != 0) {
++        ::close(lfd);
++        render::redirect_flash(res, settings_redirect(), "error",
++            "An NTP sync is running right now (up to a minute when its servers are unreachable); "
++            "browser time not applied. Try again shortly.");
++        return;
++    }
++    struct LockGuard { int fd; ~LockGuard() { if (fd >= 0) ::close(fd); } } guard{lfd};   // close = unlock
++    // /run/clock-source precedence is ntp > browser > rtc: once NTP has stepped
++    // the clock, a browser time (at best off by the page's age) would only fight
++    // the running ntpd — and would be written into the RTC as well. Tested
++    // under the lock, so a one-shot that has just finished is seen.
++    if (sysinfo::clock_source() == "ntp") {
++        render::redirect_flash(res, settings_redirect(), "error",
++            "The clock is already synced by NTP, which takes precedence; browser time not applied.");
++        return;
++    }
+     time_t e = (time_t)epoch;
+     char stamp[40]; struct tm tmv; gmtime_r(&e, &tmv);
+     strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &tmv);
+@@ -187,15 +300,35 @@ void time_browser(const Request& req, Response& res) {
+         render::redirect_flash(res, settings_redirect(), "error", "Could not set the clock; nothing changed.");
+         return;
+     }
+-    // S45ntpsync is the only other writer of this flag and it needs a default
+-    // route, so without this an off-grid box (USB LAN + SLIP modem, no WAN)
+-    // never starts rnsd/lxmd/nomadnet. The browser time was range-checked above.
++    // Trusted wall clock from here on. clock-synced is only the derived marker
++    // (exists iff clock-source does), so the source goes first. Re-read anyway
++    // (the one-shot records ntp under the same lock, so it shouldn't have
++    // landed since the test above): ntp stays the source.
++    // rnsd/lxmd/nomadnet need nothing from us: they run with or without a clock.
++    if (sysinfo::clock_source() != "ntp")
++        util::write_file_atomic("/run/clock-source", "browser\n", 0644);
+     util::write_file_atomic("/run/clock-synced", "", 0644);
+-    web::run_init("S82rnsd", "kick");   // honours an explicit stop; no-op if running
+-    web::run_init("S83nomadnet", "start");
+-    web::run_init("S85lxmd", "start");
+-    render::redirect_flash(res, settings_redirect(), "success",
+-        "Clock set to " + std::string(stamp) + " UTC (from your browser); time-gated services started.");
++
++    std::string msg = "Clock set to " + std::string(stamp) + " UTC from your browser";
++    const char* cat = "success";
++    // Persist it in the RTC when one is fitted — even one that reads "not set":
++    // writing it is exactly how it gets set (RNSBox's rtc-ds1307 clears a
++    // DS3231's oscillator-stop flag on the write). Busybox hwclock, RTC in UTC.
++    if (::access("/dev/rtc0", F_OK) == 0) {
++        util::RunResult hw = util::run({"/sbin/hwclock", "-w", "-u", "-f", "/dev/rtc0"}, "", 10);
++        if (hw.exit_code == 0) {
++            msg += " and written to the hardware clock (RTC).";
++        } else {
++            std::string why = hw.timed_out ? std::string("timed out") : util::trim(hw.out.substr(0, hw.out.find('\n')));
++            if (why.size() > 120) why.resize(120);
++            if (why.empty()) why = "exit " + std::to_string(hw.exit_code);
++            msg += ", but writing the hardware clock (RTC) failed (" + why + "): it will not survive a reboot.";
++            cat = "warn";
++        }
++    } else {
++        msg += ". No hardware clock (RTC) fitted, so it is lost at the next reboot.";
++    }
++    render::redirect_flash(res, settings_redirect(), cat, msg);
+ }
+ 
+ }  // namespace routes
+diff --git a/buildroot/package/rnsbox-portal/src/cgi/store.cpp b/buildroot/package/rnsbox-portal/src/cgi/store.cpp
+index 87107d401..58b1eb932 100644
+--- a/buildroot/package/rnsbox-portal/src/cgi/store.cpp
++++ b/buildroot/package/rnsbox-portal/src/cgi/store.cpp
+@@ -329,8 +329,11 @@ bool write_reticulum_config(const std::string& text, std::string& err) {
+ }
+ 
+ // ---- NTP servers ----
++// A leading '-' is refused: after `server` ntp.conf reads -4/-6 as qualifiers,
++// and S45ntpsync's `ntpdate -u -b <servers>` would take it as an option (it
++// skips such names too).
+ static bool valid_ntp_server(const std::string& s) {
+-    if (s.empty() || s.size() > 253) return false;
++    if (s.empty() || s.size() > 253 || s[0] == '-') return false;
+     for (char c : s) if (!(isalnum((unsigned char)c) || c == '.' || c == '-' || c == ':')) return false;
+     return true;
+ }
+diff --git a/buildroot/package/rnsbox-portal/src/cgi/sysinfo.cpp b/buildroot/package/rnsbox-portal/src/cgi/sysinfo.cpp
+index 77e89fece..cd82f3c12 100644
+--- a/buildroot/package/rnsbox-portal/src/cgi/sysinfo.cpp
++++ b/buildroot/package/rnsbox-portal/src/cgi/sysinfo.cpp
+@@ -3,11 +3,15 @@
+ #include "util.h"
+ #include <algorithm>
+ #include <cctype>
++#include <cerrno>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <ctime>
+ #include <dirent.h>
++#include <fcntl.h>
+ #include <sys/stat.h>
++#include <unistd.h>
+ 
+ namespace {
+ 
+@@ -82,6 +86,40 @@ long meminfo_kb(const std::string& mi, const char* key) {
+     return strtol(mi.c_str() + p + strlen(key), nullptr, 10);
+ }
+ 
++// A strictly numeric sysfs value (optional leading '-'); false for anything
++// else, including an empty read (sysfs show() returned an error).
++bool parse_ll(const std::string& s, long long& out) {
++    if (s.empty() || s.size() > 19) return false;
++    size_t i = (s[0] == '-') ? 1 : 0;
++    if (i == s.size()) return false;
++    for (size_t k = i; k < s.size(); ++k) if (!isdigit((unsigned char)s[k])) return false;
++    out = strtoll(s.c_str(), nullptr, 10);
++    return true;
++}
++
++// One read of a small sysfs attribute, trimmed; err = the errno of a failed
++// open/read, 0 on success. (read_file() can't tell an error from an empty
++// value, and the RTC attributes report the driver's verdict as the errno.)
++std::string sysfs_read(const std::string& p, int& err) {
++    err = 0;
++    int fd = ::open(p.c_str(), O_RDONLY | O_CLOEXEC);
++    if (fd < 0) { err = errno; return std::string(); }
++    char buf[128];
++    ssize_t n = ::read(fd, buf, sizeof(buf));
++    if (n < 0) err = errno;
++    ::close(fd);
++    return n > 0 ? util::trim(std::string(buf, (size_t)n)) : std::string();
++}
++
++// Canonical path (symlinks resolved); empty if it doesn't resolve.
++std::string real_path(const std::string& p) {
++    char* r = ::realpath(p.c_str(), nullptr);
++    if (!r) return std::string();
++    std::string s(r);
++    free(r);
++    return s;
++}
++
+ }  // namespace
+ 
+ namespace sysinfo {
+@@ -260,7 +298,7 @@ std::vector<Lease> dnsmasq_leases() {
+             auto p = split_ws(ln);
+             if (p.size() >= 5) {
+                 Lease l;
+-                l.expires = p[0]; l.mac = p[1]; l.ip = p[2];
++                l.length = p[0]; l.mac = p[1]; l.ip = p[2];
+                 l.name = (p[3] == "*") ? "(no name)" : p[3];
+                 l.client_id = p[4];
+                 out.push_back(std::move(l));
+@@ -280,4 +318,60 @@ Slip slip_status() {
+     return s;
+ }
+ 
++std::string clock_source() {
++    std::string s = util::trim(util::read_file("/run/clock-source", 64));
++    return (s == "rtc" || s == "ntp" || s == "browser") ? s : std::string();
++}
++
++Rtc rtc_status() {
++    Rtc r;
++    const std::string rtc = "/sys/class/rtc/rtc0";
++    if (!is_dir(rtc)) return r;   // no RTC fitted: the DS3231 probe failed quietly
++    r.present = true;
++    r.name = slurp_trim(rtc + "/name");
++    // since_epoch's read fails with the driver's error: EINVAL while RNSBox's
++    // rtc-ds1307 holds a DS3231's oscillator-stop flag (its time was lost; the
++    // flag stays until the RTC is written), EIO & co. on a bus fault. A time it
++    // does return must still lie in the 2020..2100 window S45ntpsync's boot
++    // check and the browser sync apply.
++    int err = 0;
++    std::string se = sysfs_read(rtc + "/since_epoch", err);
++    long long e = 0;
++    if (err) {
++        r.read_errno = err;
++        r.osf = (err == EINVAL);
++    } else if (parse_ll(se, e) && e >= 0) {
++        time_t t = (time_t)e;
++        struct tm tmv;
++        char buf[40];
++        if (gmtime_r(&t, &tmv) && strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tmv)) {
++            r.epoch = e;
++            r.time = buf;
++            r.valid = (e >= CLOCK_FLOOR && e < 4102444800LL);
++        }
++    }
++    // DS3231 die temperature: its hwmon device is a child of the same I2C client
++    // as rtc0, so match on the resolved `device` link; fall back to the hwmon
++    // name (the client name, "ds3231" from the DT compatible).
++    std::string client = real_path(rtc + "/device");
++    std::string hw, by_name;
++    if (DIR* d = opendir("/sys/class/hwmon")) {
++        while (struct dirent* ent = readdir(d)) {
++            std::string n = ent->d_name;
++            if (n.compare(0, 5, "hwmon") != 0) continue;
++            std::string p = "/sys/class/hwmon/" + n;
++            if (!client.empty() && real_path(p + "/device") == client) { hw = p; break; }
++            if (by_name.empty() && slurp_trim(p + "/name") == "ds3231") by_name = p;
++        }
++        closedir(d);
++    }
++    if (hw.empty()) hw = by_name;
++    long long mc = 0;
++    if (!hw.empty() && parse_ll(slurp_trim(hw + "/temp1_input"), mc) && mc > -100000 && mc < 200000) {
++        r.has_temp = true;
++        r.temp_mc = (long)mc;
++    }
++    return r;
++}
++
+ }  // namespace sysinfo
+diff --git a/buildroot/package/rnsbox-portal/src/cgi/sysinfo.h b/buildroot/package/rnsbox-portal/src/cgi/sysinfo.h
+index fe714ee90..f209b12c8 100644
+--- a/buildroot/package/rnsbox-portal/src/cgi/sysinfo.h
++++ b/buildroot/package/rnsbox-portal/src/cgi/sysinfo.h
+@@ -49,11 +49,45 @@ Rnsd rnsd_status(bool with_raw = false);
+ // while an AP is up (and the iface exists).
+ std::vector<std::string> lan_ifaces();
+ 
+-struct Lease { std::string expires, mac, ip, name, client_id; };
++// length: dnsmasq is built with HAVE_BROKEN_RTC, so the leases file's first
++// field is the lease length in seconds, not an expiry epoch.
++struct Lease { std::string length, mac, ip, name, client_id; };
+ std::vector<Lease> dnsmasq_leases();
+ 
+ struct Slip { bool present = false, up = false; };
+ Slip slip_status();
+ 
++// Wall-clock provenance: /run/clock-source, written by S45ntpsync (boot: "rtc"
++// when the kernel set the clock from rtc0; "ntp" from the NTP one-shot and the
++// hourly RTC resync) and the Settings browser sync ("browser"). Returns exactly
++// "rtc" | "ntp" | "browser", or "" when there is no trusted source yet (file
++// absent or anything else).
++std::string clock_source();
++
++// Earliest epoch we accept as a set clock (2020-01-01 UTC) — the browser-sync
++// plausibility floor, reused for the RTC.
++constexpr long long CLOCK_FLOOR = 1577836800LL;
++
++// The hardware clock, if one probed (DS3231 on i2c5 -> rtc0; the SoC RTC driver
++// isn't shipped). Reads the chip over I2C, so Settings-page only — never on the
++// 5 s dashboard refresh.
++struct Rtc {
++    bool present = false;     // /sys/class/rtc/rtc0 exists
++    bool valid = false;       // it reads back a time in CLOCK_FLOOR..2100 (the
++                              // window S45ntpsync's boot check applies)
++    bool osf = false;         // the read failed with EINVAL: RNSBox's rtc-ds1307
++                              // refuses the time while a DS3231's oscillator-stop
++                              // flag is set (never set, or its backup cell ran
++                              // flat while unpowered), until the RTC is written
++    int read_errno = 0;       // errno of a failed read (EINVAL: osf)
++    long long epoch = 0;      // its time (UTC) when it read one
++    std::string time;         // "YYYY-MM-DD HH:MM:SS" (UTC) when it read one,
++                              // in the window or not
++    std::string name;         // rtc0/name, e.g. "rtc-ds1307 5-0068"
++    bool has_temp = false;    // DS3231 die temperature via its hwmon device
++    long temp_mc = 0;         // millidegrees C
++};
++Rtc rtc_status();
++
+ }  // namespace sysinfo
+ #endif
+diff --git a/buildroot/package/rnsbox-portal/src/cgi/www/style.css b/buildroot/package/rnsbox-portal/src/cgi/www/style.css
+index 56ceb7c26..7aa3304ac 100644
+--- a/buildroot/package/rnsbox-portal/src/cgi/www/style.css
++++ b/buildroot/package/rnsbox-portal/src/cgi/www/style.css
+@@ -389,6 +389,8 @@ img.qr {
+ textarea.ntp-servers { min-height: 64px; max-width: 360px; }
+ .time-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+ form.ntp-restart { margin-top: 8px; }
++button:disabled, button:disabled:hover { opacity: 0.55; cursor: not-allowed; }
++.btn-primary:disabled:hover { background: var(--primary); }
+ 
+ /* ---- HaLow modem (dashboard summary + Reticulum live block) ---- */
+ .cardhead { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+diff --git a/linux_5.10/drivers/rtc/rtc-ds1307.c b/linux_5.10/drivers/rtc/rtc-ds1307.c
+index 9f5f54ca0..d7fe02bd8 100644
+--- a/linux_5.10/drivers/rtc/rtc-ds1307.c
++++ b/linux_5.10/drivers/rtc/rtc-ds1307.c
+@@ -265,6 +265,22 @@ static int ds1307_get_time(struct device *dev, struct rtc_time *t)
+ 		if (tmp & DS1338_BIT_OSF)
+ 			return -EINVAL;
+ 		break;
++	case ds_1337:
++	case ds_1339:
++	case ds_1341:
++	case ds_3231:
++		/*
++		 * RNSBox: the oscillator stopped since the time was last set
++		 * (never set, or the backup cell ran flat while unpowered), so
++		 * the registers hold a restarted count, not the time. Refused
++		 * until ds1307_set_time() clears the flag (probe leaves it).
++		 */
++		ret = regmap_read(ds1307->regmap, DS1337_REG_STATUS, &tmp);
++		if (ret)
++			return ret;
++		if (tmp & DS1337_BIT_OSF)
++			return -EINVAL;
++		break;
+ 	case ds_1340:
+ 		if (tmp & DS1340_BIT_nEOSC)
+ 			return -EINVAL;
+@@ -401,6 +417,27 @@ static int ds1307_set_time(struct device *dev, struct rtc_time *t)
+ 		}
+ 	}
+ 
++	switch (ds1307->type) {
++	case ds_1337:
++	case ds_1339:
++	case ds_1341:
++	case ds_3231:
++		/*
++		 * RNSBox: the time is valid now, so clear the oscillator stop
++		 * flag that ds1307_get_time() refuses on - only after the time
++		 * registers were written, so a failed write leaves it set.
++		 */
++		result = regmap_update_bits(ds1307->regmap, DS1337_REG_STATUS,
++					    DS1337_BIT_OSF, 0);
++		if (result) {
++			dev_err(dev, "%s error %d\n", "write", result);
++			return result;
++		}
++		break;
++	default:
++		break;
++	}
++
+ 	return 0;
+ }
+ 
+@@ -1864,12 +1901,18 @@ static int ds1307_probe(struct i2c_client *client,
+ 		regmap_write(ds1307->regmap, DS1337_REG_CONTROL,
+ 			     regs[0]);
+ 
+-		/* oscillator fault?  clear flag, and warn */
+-		if (regs[1] & DS1337_BIT_OSF) {
+-			regmap_write(ds1307->regmap, DS1337_REG_STATUS,
+-				     regs[1] & ~DS1337_BIT_OSF);
+-			dev_warn(ds1307->dev, "SET TIME!\n");
+-		}
++		/*
++		 * Oscillator fault?  Warn, and leave the flag set.  RNSBox:
++		 * upstream 5.10 cleared it here and then read the restarted
++		 * count back as the time, so RTC_HCTOSYS set the system clock
++		 * from a chip that had lost its time (never set, or a flat
++		 * backup cell) and nothing could tell afterwards. Kept, it
++		 * makes ds1307_get_time() return -EINVAL (hctosys refuses it,
++		 * hwclock -r fails) until ds1307_set_time() clears it.
++		 */
++		if (regs[1] & DS1337_BIT_OSF)
++			dev_warn(ds1307->dev,
++				 "oscillator stop flag set, time invalid until set - SET TIME!\n");
+ 		break;
+ 
+ 	case rx_8025:
+-- 
+2.47.3
+

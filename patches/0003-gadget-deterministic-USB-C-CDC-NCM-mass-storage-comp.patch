@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: smit1237 <smit1237@gmail.com>
 Date: Tue, 8 Sep 2026 22:47:48 +0300
-Subject: [PATCH 03/23] gadget: deterministic USB-C CDC-NCM (+ mass-storage)
+Subject: [PATCH 03/30] gadget: deterministic USB-C CDC-NCM (+ mass-storage)
  composite
 
 Bring the USB-C gadget up as CDC-NCM with a fixed usb0 = 10.42.0.1/24 (dnsmasq
@@ -12,18 +12,22 @@ fix that arms the NTB flush hrtimer once per NTB instead of per datagram,
 removing a small-flow throughput stall under sustained load. genimage/sd_gen
 ship the gadget descriptor flag files on the boot FAT.
 ---
- .../common/sd_tools/genimage_rootless.cfg     |  29 ++-
- .../sd_tools/sd_gen_burn_image_rootless.sh    |  40 +++-
- .../SG200X/overlay/etc/init.d/S08usbdev       |  65 ++++--
- .../SG200X/overlay/etc/init.d/S30gadget_nic   | 201 ++++--------------
+ .../common/sd_tools/genimage_rootless.cfg     |  28 ++-
+ .../sd_tools/sd_gen_burn_image_rootless.sh    |  48 +++-
+ .../SG200X/overlay/etc/init.d/S02devicekey    |  97 +++++++-
+ .../SG200X/overlay/etc/init.d/S08usbdev       |  94 ++++++--
+ .../cvitek/SG200X/overlay/etc/init.d/S09ipv6  |  50 ++++
+ .../cvitek/SG200X/overlay/etc/init.d/S10uuid  |  12 +-
+ .../SG200X/overlay/etc/init.d/S30gadget_nic   | 223 ++++++------------
  .../drivers/usb/gadget/function/f_ncm.c       |  21 +-
- 5 files changed, 167 insertions(+), 189 deletions(-)
+ 8 files changed, 376 insertions(+), 197 deletions(-)
+ create mode 100755 buildroot/board/cvitek/SG200X/overlay/etc/init.d/S09ipv6
 
 diff --git a/build/tools/common/sd_tools/genimage_rootless.cfg b/build/tools/common/sd_tools/genimage_rootless.cfg
-index af447e3eb..31188ae35 100644
+index af447e3eb..dc0945215 100644
 --- a/build/tools/common/sd_tools/genimage_rootless.cfg
 +++ b/build/tools/common/sd_tools/genimage_rootless.cfg
-@@ -1,19 +1,31 @@
+@@ -1,19 +1,30 @@
 +# RNSBox: composite CDC-NCM + USB mass-storage gadget. /boot has the usb.*
 +# flag files + descriptor strings that S08usbdev reads to compose the gadget.
 +# Stock Sipeed shipped: usb.dev usb.ncm usb.rndis wifi.sta gt9xx logo.jpeg.
@@ -46,7 +50,6 @@ index af447e3eb..31188ae35 100644
 -			"ver",
 +                        "usb.dev",
 +                        "usb.ncm",
-+                        "usb.ncm.mac",
 +                        "usb.disk0",
 +                        "usb.disk0.size",
 +                        "usb.idVendor",
@@ -63,16 +66,16 @@ index af447e3eb..31188ae35 100644
  }
  
  image duo.img {
-@@ -31,4 +43,3 @@ image duo.img {
+@@ -31,4 +42,3 @@ image duo.img {
                  image = "rootfs.sd"
          }
  }
 -
 diff --git a/build/tools/common/sd_tools/sd_gen_burn_image_rootless.sh b/build/tools/common/sd_tools/sd_gen_burn_image_rootless.sh
-index bfce61c3b..02f5e5573 100755
+index bfce61c3b..1f85d2b00 100755
 --- a/build/tools/common/sd_tools/sd_gen_burn_image_rootless.sh
 +++ b/build/tools/common/sd_tools/sd_gen_burn_image_rootless.sh
-@@ -26,15 +26,45 @@ mkdir -pv ${output_dir}/input/rawimages/
+@@ -26,15 +26,53 @@ mkdir -pv ${output_dir}/input/rawimages/
  cp -fv ${output_dir}/fip.bin ${output_dir}/input/
  cp -fv ${output_dir}/rawimages/boot.sd ${output_dir}/input/rawimages/
  cp -fv ${output_dir}/rawimages/rootfs.sd ${output_dir}/input/
@@ -110,8 +113,16 @@ index bfce61c3b..02f5e5573 100755
 +echo 0x0105 > ${output_dir}/input/usb.bcdDevice
 +echo "RNSBox" > ${output_dir}/input/usb.manufacturer
 +echo "RNSBox Reticulum router (LicheeRV Nano-e)" > ${output_dir}/input/usb.product
-+# Pin the device-side NCM MAC so host-side `enxXXXX` ifname is deterministic.
-+echo "02:1d:6b:01:04:02" > ${output_dir}/input/usb.ncm.mac
++# No fixed device-side NCM MAC: S30gadget_nic derives the box's own usb0 MAC
++# per unit from /device_key. It is also the source of usb0's fe80:: address,
++# which is how Reticulum's AutoInterface tells boxes apart, so it must differ
++# per unit (one MAC for every box made two boxes on one host a single peer).
++# /boot/usb.ncm.mac is an optional override and is not shipped; the input dir
++# survives between builds, so remove an old copy explicitly.
++# The host-side MAC — and so the host's `enxXXXX` ifname — is the gadget's ncm
++# host_addr, which S08usbdev also derives per unit from /device_key (optional
++# override: /boot/usb.ncm.host_mac, not shipped).
++rm -f ${output_dir}/input/usb.ncm.mac
 +# Override the auto-generated `licheervnano-<keyhash>` hostname (S10uuid
 +# reads /boot/hostname if present and overrides /etc/hostname with it).
 +echo "rnsbox" > ${output_dir}/input/hostname
@@ -123,8 +134,116 @@ index bfce61c3b..02f5e5573 100755
  sed -i -e "s/duo.img/${image}/g" ${output_dir}/genimage.cfg
  cd ${output_dir}/
  ${THISDIR}/genimage
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S02devicekey b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S02devicekey
+index 9d55fb43b..cbca43260 100755
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S02devicekey
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S02devicekey
+@@ -1,13 +1,96 @@
+ #!/bin/sh
++# S02devicekey — per-unit device key, written to
++#   /device_key         16 lowercase hex chars. S08usbdev uses it as the USB
++#                       serial number and to derive the host-side NCM MAC.
++#   /device_key_legacy  "UID: xxxxxxxx_yyyyyyyy". S10uuid (hostname suffix,
++#                       eth0 MAC) and S30gadget_nic sha512sum it.
++#
++# Stock Sipeed only reads the chip UID from /sys/class/cvi-base/base_uid,
++# which exists only while osdrv's soph_base.ko is loaded. RNSBox doesn't build
++# that module (camera/codec middleware stripped), so both files came out
++# empty: every unit got the same eth0 MAC (48:da:35:6f:cf:83, from sha512 of
++# an empty file) and an empty USB serial. Sources, first hit wins — each one
++# per-unit and stable across reboots:
++#   1. base_uid, if a build loads soph_base.ko (files identical to stock)
++#   2. the SD card's CID (+ serial): unique per card, survives a reflash
++#   3. wlan0's burned-in MAC (only if the WiFi driver is already up)
++#   4. a random id generated once and kept in /etc/rnsbox/device-id
++# The chip UID is NOT read with devmem: base.c gets it from the efuse shadow
++# registers via cvi_efuse_read_from_shadow(), which switches clk_efuse on
++# around the read. Linux gates that clock once boot is done, and reading a
++# gated APB block (or poking the shared clock-enable register) from userspace
++# is not something to ship untested.
++
++UID_SYS=/sys/class/cvi-base/base_uid
++ID_FILE=/etc/rnsbox/device-id
++
++# 16 lowercase hex chars from arbitrary text
++hash16() {
++	printf '%s' "$1" | sha256sum | cut -c1-16
++}
++
++# write $2 (+ newline) to $1 unless it already holds it — spares an SD write
++# on every boot
++put() {
++	[ "$(cat "$1" 2>/dev/null)" = "$2" ] || echo "$2" > "$1"
++}
+ 
+ if [ "$1" = "start" ]
+ then
+-	str_value=$(cat /sys/class/cvi-base/base_uid | awk '{print $2}')
+-	first_uint=$(echo $str_value | cut -d'_' -f1)
+-	second_uint=$(echo $str_value | cut -d'_' -f2)
+-	result="$first_uint$second_uint"
+-	echo $result > /device_key
++	key=""
++	legacy=""
++	src=""
++
++	# 1. chip UID, stock format "UID: xxxxxxxx_yyyyyyyy" (all-zero = unfused)
++	uid=$(cat "$UID_SYS" 2>/dev/null)
++	str_value=$(echo "$uid" | awk '{print $2}')
++	case "$str_value" in
++		*[1-9a-f]*_*|*_*[1-9a-f]*)
++			key="${str_value%%_*}${str_value#*_}"
++			legacy="$uid"
++			src="chip UID"
++			;;
++	esac
++
++	# 2. SD card CID (skip blank IDs: some counterfeit cards report all 0/F)
++	if [ -z "$key" ]; then
++		for d in /sys/block/mmcblk*/device; do
++			cid=$(cat "$d/cid" 2>/dev/null)
++			case "$cid" in *[1-9a-eA-E]*) ;; *) continue ;; esac
++			key=$(hash16 "sd:$cid:$(cat "$d/serial" 2>/dev/null)")
++			src="SD card CID (${d%/device})"
++			break
++		done
++	fi
++
++	# 3. wlan0 MAC, only if burned-in (addr_assign_type 0), not software-set
++	if [ -z "$key" ] && [ "$(cat /sys/class/net/wlan0/addr_assign_type 2>/dev/null)" = 0 ]; then
++		mac=$(cat /sys/class/net/wlan0/address 2>/dev/null)
++		case "$mac" in
++			''|00:00:00:00:00:00) ;;
++			*) key=$(hash16 "wlan0:$mac"); src="wlan0 MAC" ;;
++		esac
++	fi
++
++	# 4. random id, generated on first boot and kept on the rootfs
++	if [ -z "$key" ]; then
++		key=$(cat "$ID_FILE" 2>/dev/null)
++		case "$key" in
++			*[!0-9a-f]*) key="" ;;
++			????????????????) ;;
++			*) key="" ;;
++		esac
++		if [ -z "$key" ]; then
++			key=$( { cat /proc/sys/kernel/random/uuid; head -c 16 /dev/urandom; } \
++				2>/dev/null | sha256sum | cut -c1-16)
++			echo "$key" > "$ID_FILE" 2>/dev/null
++		fi
++		src="random id ($ID_FILE)"
++	fi
++
++	[ -n "$legacy" ] || legacy="UID: ${key%????????}_${key#????????}"
++	put /device_key "$key"
+ 	# for compatibility with previous network mac addr
+-	cat /sys/class/cvi-base/base_uid > /device_key_legacy
++	put /device_key_legacy "$legacy"
++	echo "device key: from $src"
+ fi
+-
 diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S08usbdev b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S08usbdev
-index 7630ba409..4de12aecd 100755
+index 7630ba409..4d2648658 100755
 --- a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S08usbdev
 +++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S08usbdev
 @@ -90,28 +90,40 @@ then
@@ -184,9 +303,39 @@ index 7630ba409..4de12aecd 100755
  			fi
  		fi
  
-@@ -130,6 +142,20 @@ then
+@@ -129,7 +141,50 @@ then
+ 		if [ -e /boot/usb.ncm ]
  		then
  			mkdir -p functions/ncm.usb0
++
++			# Host-side MAC. host_addr is what the host's NIC gets (so it
++			# names Linux's `enxXXXX` iface and keys Windows' network
++			# profile); left unset, the kernel picks a random one every boot.
++			# Default: a locally-administered unicast MAC derived from
++			# /device_key (S02devicekey), so it is stable per unit and two
++			# boxes on one host don't collide. /boot/usb.ncm.host_mac
++			# overrides it. (The device-side MAC is set on usb0 by
++			# S30gadget_nic, also per unit; /boot/usb.ncm.mac, if present,
++			# overrides it.) Must be set before the UDC
++			# bind below.
++			key=$(cat /device_key 2>/dev/null)
++			if [ -e /boot/usb.ncm.host_mac ]
++			then
++				host_mac=$(cat /boot/usb.ncm.host_mac)
++			elif [ -n "${key}" ]
++			then
++				h=$(printf 'ncm-host:%s' "${key}" | sha256sum | cut -c1-12)
++				b0=$(( (0x$(echo "$h" | cut -c1-2) & 0xfc) | 0x02 ))
++				host_mac=$(printf '%02x%s' "$b0" "$(echo "$h" | cut -c3-12)" | sed 's/../&:/g; s/:$//')
++			else
++				host_mac=""
++			fi
++			if [ -n "$host_mac" ]
++			then
++				echo "$host_mac" > functions/ncm.usb0/host_addr \
++					|| echo "usb.ncm: could not set host_addr ${host_mac}"
++			fi
++
  			ln -s functions/ncm.usb0 configs/c.1/
 +
 +			# MS-OS-DESC compat-id WINNCM — Windows 10 1709+ and 11 use the
@@ -196,7 +345,7 @@ index 7630ba409..4de12aecd 100755
 +			# refs: linux-usb patchwork 20190416140732 + TinyUSB #2727).
 +			# Windows caches the descriptor by (VID, PID, bcdDevice), so
 +			# bcdDevice must be bumped any time the gadget topology changes —
-+			# we pin 0x0103 via /boot/usb.bcdDevice (set during image build).
++			# we pin it via /boot/usb.bcdDevice (set during image build).
 +			echo 1       > os_desc/use
 +			echo 0xcd    > os_desc/b_vendor_code
 +			echo MSFT100 > os_desc/qw_sign
@@ -205,7 +354,7 @@ index 7630ba409..4de12aecd 100755
  		fi
  
  		# keyboard
-@@ -230,6 +256,13 @@ then
+@@ -230,6 +285,13 @@ then
  		rmdir /sys/kernel/config/usb_gadget/g0/functions/ncm.usb0
  	fi
  
@@ -219,11 +368,95 @@ index 7630ba409..4de12aecd 100755
      # adbd
       if [ -e /sys/kernel/config/usb_gadget/g0/configs/c.1/ffs.adb ]
       then
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S09ipv6 b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S09ipv6
+new file mode 100755
+index 000000000..4182112e1
+--- /dev/null
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S09ipv6
+@@ -0,0 +1,50 @@
++#!/bin/sh
++# S09ipv6 — confine IPv6 to the USB LAN (usb0) before any other iface is up.
++#
++# IPv6 is compiled into the kernel for ONE consumer: Reticulum's AutoInterface
++# on usb0 (/etc/reticulum/config). It needs a fe80:: link-local address on
++# usb0 and joins an ff12:: link-scope multicast group (UDP 29716 multicast
++# discovery, 29717 unicast discovery, 42671 data). Nothing else on the box
++# uses IPv6, so every other iface — eth0, wlan0, wlan1, sl0, a USB dongle —
++# stays IPv4-only and never gets a link-local/SLAAC address a WAN peer could
++# reach. (nftgen's ip6 table is the second layer: drop unless LAN.)
++#
++# Order matters. This runs after S08usbdev (usb0 may or may not exist yet) and
++# before S10uuid (the first `ifconfig eth0 up`), S30eth, S31slip (creates sl0)
++# and S35wifi (creates wlan0/wlan1):
++#   1. conf/default/disable_ipv6=1 — every iface registered from now on starts
++#      with IPv6 off (also one that only gets IPv6 later, when its MTU is
++#      raised to >= 1280, e.g. sl0).
++#   2. every iface that already exists, except lo and usb0, is switched off
++#      now (in practice eth0, registered by its driver at kernel boot).
++#   3. usb0 is opted back in by S30gadget_nic just before it raises usb0 (it
++#      may be created after this runs and so inherit default=1).
++# conf/all/disable_ipv6 is deliberately NOT written: on 5.10 that pushes the
++# value to every existing iface, lo and usb0 included.
++# The IPv4 counterpart is S29fw: it loads a fail-closed nftables ruleset (lo +
++# usb0 only) before S30eth/S35wifi address the WAN, until S60routing's real one.
++#
++# A kernel without IPv6 has no /proc/sys/net/ipv6 — then this is a no-op.
++
++LAN_V6="lo usb0"   # the only ifaces allowed to keep IPv6
++
++start() {
++	if [ ! -d /proc/sys/net/ipv6/conf ]; then
++		echo "S09ipv6: kernel has no IPv6; nothing to do"
++		return 0
++	fi
++	echo 1 > /proc/sys/net/ipv6/conf/default/disable_ipv6
++	for d in /proc/sys/net/ipv6/conf/*; do
++		ifc=${d##*/}
++		case " all default $LAN_V6 " in *" $ifc "*) continue ;; esac
++		echo 1 > "$d/disable_ipv6" 2>/dev/null
++	done
++	echo 0 > /proc/sys/net/ipv6/conf/lo/disable_ipv6 2>/dev/null
++	echo "S09ipv6: IPv6 off by default; kept only on: $LAN_V6"
++}
++
++case "${1:-start}" in
++	start|restart) start ;;
++	stop)          ;;    # nothing to undo; the policy must hold until power-off
++	*) echo "Usage: $0 {start|stop|restart}" >&2; exit 1 ;;
++esac
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S10uuid b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S10uuid
+index 53afed049..ab251a76b 100755
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S10uuid
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S10uuid
+@@ -30,13 +30,21 @@ then
+ 	then
+ 		hostname ${new_hostname}
+ 		echo ${new_hostname} > /etc/hostname
+-		sed -i -e "s/${old_hostname}/${new_hostname}/g" /etc/hosts
++		# Whole words only (stock replaced substrings, so an old name like
++		# "host" turned localhost into "localrnsbox"); hostnames are
++		# [A-Za-z0-9_-], so no regex metacharacters. An empty old name would
++		# make s//.../ reuse the last regex.
++		if [ -n "${old_hostname}" ]
++		then
++			sed -i -E "s/(^|[[:space:]])${old_hostname}([[:space:]]|$)/\1${new_hostname}\2/g" /etc/hosts
++		fi
+ 	fi
+ 	echo "hostname: ${new_hostname}"
+ 
+ 	if [ -e /boot/eth.mac ]
+ 	then
+-		new_ethmac=$(cat /boot/ethmac)
++		# (stock read /boot/ethmac here — a typo that left the override inert)
++		new_ethmac=$(cat /boot/eth.mac)
+ 	else
+ 		new_ethmac=$(hex2mac 48da356f$(sha512sum /device_key_legacy  | head -c 4))
+ 	fi
 diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S30gadget_nic b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S30gadget_nic
-index 6ed4bb279..85a880c0a 100755
+index 6ed4bb279..3eecd67cb 100755
 --- a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S30gadget_nic
 +++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S30gadget_nic
-@@ -1,176 +1,67 @@
+@@ -1,176 +1,91 @@
  #!/bin/sh
 +# RNSBox: bring up the CDC-NCM gadget interface as 10.42.0.1/24.
 +#
@@ -231,8 +464,14 @@ index 6ed4bb279..85a880c0a 100755
 +# udhcpd on it. We hardcode 10.42.0.1/24 so users
 +# always know where to point their browser, and let dnsmasq (from
 +# /etc/dnsmasq.conf, started by Buildroot's S80dnsmasq init script) own the
-+# DHCP+DNS scope. The MAC address is locked via /boot/usb.ncm.mac so the
-+# host-side `enxXXXX` interface name is stable across reboots.
++# DHCP+DNS scope. The device-side usb0 MAC is set here, derived per unit from
++# /device_key (optional override: /boot/usb.ncm.mac, not shipped); the
++# host-side MAC — which names the host's `enxXXXX` iface — is set by S08usbdev
++# (configfs ncm host_addr, derived per unit from /device_key;
++# /boot/usb.ncm.host_mac overrides).
++#
++# usb0 is also the ONLY non-loopback iface with IPv6 (S09ipv6 turns it off by
++# default everywhere): Reticulum's AutoInterface needs usb0's fe80:: address.
  
  . /etc/profile
  
@@ -391,9 +630,16 @@ index 6ed4bb279..85a880c0a 100755
 -	if [ -n "$usb0_info" ]
 -	then
 -		ifconfig usb0 down
-+	# Pin device-side MAC if /boot/usb.ncm.mac was shipped.
++	# Device-side MAC: /boot/usb.ncm.mac overrides; else per unit from
++	# /device_key (distinct salt from S08usbdev's host_addr). Must differ per
++	# unit: usb0's EUI-64 fe80:: is how RNS AutoInterface tells boxes apart.
++	key=$(cat /device_key 2>/dev/null)
 +	if [ -e /boot/usb.ncm.mac ]; then
 +		new_mac=$(cat /boot/usb.ncm.mac)
++	elif [ -n "$key" ]; then
++		h=$(printf 'ncm-dev:%s' "$key" | sha256sum | cut -c1-12)
++		b0=$(( (0x$(echo "$h" | cut -c1-2) & 0xfc) | 0x02 ))
++		new_mac=$(printf '%02x%s' "$b0" "$(echo "$h" | cut -c3-12)" | sed 's/../&:/g; s/:$//')
 +	else
 +		new_mac=$(hex2mac 48da356e$(sha512sum /device_key_legacy 2>/dev/null | head -c 4))
  	fi
@@ -414,7 +660,17 @@ index 6ed4bb279..85a880c0a 100755
 -	if [ -n "$usb0_info" ]
 -	then
 -		ifconfig usb1 down
--	fi
++	# Opt usb0 back in to IPv6 (S09ipv6 set default/disable_ipv6=1, which usb0
++	# inherits if it was created after S09) — before `up`, so the kernel forms
++	# the fe80:: link-local once the host brings the link up. Link-local ONLY:
++	# accept_ra/autoconf=0 so a host sharing its own IPv6 over the cable can't
++	# push a global address or a default route into the box.
++	if [ -d /proc/sys/net/ipv6/conf/usb0 ]; then
++		echo 0 > /proc/sys/net/ipv6/conf/usb0/accept_ra
++		echo 0 > /proc/sys/net/ipv6/conf/usb0/autoconf
++		echo 0 > /proc/sys/net/ipv6/conf/usb0/disable_ipv6
+ 	fi
++
 +	ip link set usb0 up
 +	ip addr add "$USB0_IPV4" dev usb0
 +	echo "S30gadget_nic: usb0 up, $USB0_IPV4"

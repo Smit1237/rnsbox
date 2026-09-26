@@ -1,27 +1,27 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: smit1237 <smit1237@gmail.com>
 Date: Wed, 23 Sep 2026 09:03:49 +0300
-Subject: [PATCH 23/23] lxmd: LXMF propagation node (opt-in)
+Subject: [PATCH 23/30] lxmd: LXMF propagation node (opt-in)
 
 Optional lxmd propagation node for operators who want to run one, off by
 default (S85lxmd reads /etc/rnsbox/lxmd.conf `enabled=no` and is gated on
 /run/clock-synced like rnsd). Attaches to the shared local Reticulum
 instance; kept RAM-conscious since the board is memory-constrained.
 ---
- .../cvitek/SG200X/overlay/etc/init.d/S85lxmd  | 127 ++++++++++++++++++
- .../cvitek/SG200X/overlay/etc/lxmd/config     |  30 +++++
+ .../cvitek/SG200X/overlay/etc/init.d/S85lxmd  | 157 ++++++++++++++++++
+ .../cvitek/SG200X/overlay/etc/lxmd/config     |  30 ++++
  .../SG200X/overlay/etc/rnsbox/lxmd.conf       |  29 ++++
- 3 files changed, 186 insertions(+)
+ 3 files changed, 216 insertions(+)
  create mode 100755 buildroot/board/cvitek/SG200X/overlay/etc/init.d/S85lxmd
  create mode 100644 buildroot/board/cvitek/SG200X/overlay/etc/lxmd/config
  create mode 100644 buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/lxmd.conf
 
 diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S85lxmd b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S85lxmd
 new file mode 100755
-index 000000000..3e4d7f5d8
+index 000000000..22f24206b
 --- /dev/null
 +++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S85lxmd
-@@ -0,0 +1,127 @@
+@@ -0,0 +1,157 @@
 +#!/bin/sh
 +# S85lxmd — dedicated LXMF Propagation Node (lxmd), shipped DISABLED by default.
 +#
@@ -35,6 +35,11 @@ index 000000000..3e4d7f5d8
 +# critical on a 245 MB box. Gates on /run/clock-synced (LXMF stamps stored
 +# messages + announces with wall-clock time) AND on a free-RAM floor, so a
 +# tight box can't OOM-kill rnsd by starting lxmd.
++#
++# Like S82rnsd: runs with umask 077 (its identity key is /etc/lxmd/identity;
++# start() tightens anything left group/world-readable) and with unbuffered
++# output fed to syslog (/var/log/messages, tag "lxmd[<pid>]") through a FIFO,
++# so $! / the pidfile is lxmd itself.
 +
 +NAME=lxmd
 +DAEMON=/usr/bin/lxmd
@@ -42,7 +47,8 @@ index 000000000..3e4d7f5d8
 +LXMD_CONFIGDIR=/etc/lxmd
 +RNS_CONFIGDIR=/etc/reticulum
 +PIDFILE=/var/run/$NAME.pid
-+LOG=/var/log/$NAME.log
++LOGPIPE=/var/run/$NAME.logpipe
++PERMS_MARK=/run/lxmd-perms-done   # this boot's full walk of $LXMD_CONFIGDIR ran
 +
 +[ -x "$DAEMON" ] || exit 0
 +
@@ -101,19 +107,43 @@ index 000000000..3e4d7f5d8
 +		return 1
 +	fi
 +
-+	mkdir -p /var/log /var/run "$LXMD_CONFIGDIR"
++	mkdir -p /var/run "$LXMD_CONFIGDIR"
++	# `find -perm` only touches what still needs it (no SD writes once tight);
++	# `! -type l`: chmod never follows a symlink out of the dir. The recursive
++	# walk (storage/ holds the propagation node's message store: thousands of
++	# files on the SD card) runs once per boot; later starts check the dir and
++	# its top level only (config, identity, storage/) — the dir itself at 0700
++	# already fences off everything below it.
++	if [ -f "$PERMS_MARK" ]; then
++		find "$LXMD_CONFIGDIR" -maxdepth 1 ! -type l -perm /077 -exec chmod go-rwx {} + 2>/dev/null
++	else
++		find "$LXMD_CONFIGDIR" ! -type l -perm /077 -exec chmod go-rwx {} + 2>/dev/null \
++			&& : > "$PERMS_MARK"
++	fi
 +
 +	printf "Starting %s: " "$NAME"
 +	# -p = propagation node; --rnsconfig points at rnsd's shared instance.
-+	# No -s: log to the size-capped /var/log tmpfs instead of the rootfs.
-+	"$DAEMON" -p --rnsconfig "$RNS_CONFIGDIR" --config "$LXMD_CONFIGDIR" >>"$LOG" 2>&1 &
-+	PID=$!
++	# No -s: log to stdout -> syslog (tmpfs, rotated) instead of a logfile on
++	# the rootfs.
++	rm -f "$LOGPIPE"
++	if command -v logger >/dev/null 2>&1 && mkfifo -m 600 "$LOGPIPE" 2>/dev/null; then
++		(
++			umask 077
++			export PYTHONUNBUFFERED=1
++			exec "$DAEMON" -p --rnsconfig "$RNS_CONFIGDIR" --config "$LXMD_CONFIGDIR"
++		) >"$LOGPIPE" 2>&1 &
++		PID=$!
++		logger -t "$NAME[$PID]" -p daemon.notice <"$LOGPIPE" &
++	else
++		( umask 077; exec "$DAEMON" -p --rnsconfig "$RNS_CONFIGDIR" --config "$LXMD_CONFIGDIR" ) >/dev/null 2>&1 &
++		PID=$!
++	fi
 +	echo "$PID" > "$PIDFILE"
 +	sleep 0.5
 +	if kill -0 "$PID" 2>/dev/null; then
 +		echo "OK (pid $PID, ${avail} MB free, shared instance)"
 +	else
-+		echo "FAIL (see $LOG)"
++		echo "FAIL (see /var/log/messages)"
 +		rm -f "$PIDFILE"
 +		return 1
 +	fi

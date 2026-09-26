@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: smit1237 <smit1237@gmail.com>
 Date: Wed, 9 Sep 2026 00:06:02 +0300
-Subject: [PATCH 07/23] buildroot: don't fetch a prebuilt target std for the
+Subject: [PATCH 07/30] buildroot: don't fetch a prebuilt target std for the
  host-rust-bin bootstrap
 
 When host-rust is built from source (BR2_PACKAGE_HOST_RUST=y), host-rust-bin

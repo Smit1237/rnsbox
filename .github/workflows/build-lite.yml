@@ -13,7 +13,7 @@ on:
         options: [lite]
         default: lite
       version:
-        description: "Release tag (blank = r<date>-<shortsha>). A GitHub Release is published only on manual runs."
+        description: "Release tag (blank = r<date>-<shortsha>). A GitHub Release is published only on manual runs of main; other branches only upload the artifact."
         type: string
         default: ""
   push:
@@ -113,15 +113,20 @@ jobs:
         if: success()
         run: |
           cd /mnt/rnsbox/LicheeRV-Nano-Build/install/soc_sg2002_licheervnano_sd/images
-          IMG=$(ls -1 *-lite.img | tail -1)
+          SRC=$(ls -1 *-lite.img | tail -1)
+          # The branch goes into the file name (rnsbox-<branch>-<date>-<sha>-lite.img),
+          # so images from different branches can't be mixed up after download.
+          BRANCH=$(printf '%s' "$GITHUB_REF_NAME" | tr -c 'A-Za-z0-9._-' '-')
+          IMG="rnsbox-${BRANCH}-${SRC}"
+          mv "$SRC" "$IMG"
           echo "compressing $IMG …"
           xz -T0 -9 -k -f "$IMG"
           sha256sum "$IMG" "$IMG.xz" | tee SHA256SUMS
           ls -lh "$IMG" "$IMG.xz"
           { echo "IMG=$IMG"; echo "IMGDIR=$PWD"; } >> "$GITHUB_ENV"
 
-      - name: Publish GitHub Release (manual runs only)
-        if: success() && github.event_name == 'workflow_dispatch'
+      - name: Publish GitHub Release (manual runs of main only)
+        if: success() && github.event_name == 'workflow_dispatch' && github.ref_name == 'main'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -148,8 +153,10 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rnsbox-lite-image
-          path: /mnt/rnsbox/LicheeRV-Nano-Build/install/soc_sg2002_licheervnano_sd/images/*-lite.img
+          name: rnsbox-lite-image   # release-from-run.yml downloads it by this name
+          path: |
+            /mnt/rnsbox/LicheeRV-Nano-Build/install/soc_sg2002_licheervnano_sd/images/*-lite.img
+            /mnt/rnsbox/LicheeRV-Nano-Build/install/soc_sg2002_licheervnano_sd/images/SHA256SUMS
           if-no-files-found: warn
           retention-days: 7
 

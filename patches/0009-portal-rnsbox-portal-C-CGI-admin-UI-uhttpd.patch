@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: smit1237 <smit1237@gmail.com>
 Date: Tue, 8 Sep 2026 22:47:49 +0300
-Subject: [PATCH 09/23] portal: rnsbox-portal C++/CGI admin UI (uhttpd)
+Subject: [PATCH 09/30] portal: rnsbox-portal C++/CGI admin UI (uhttpd)
 
 A single riscv64 C++/CGI binary served per-request by uhttpd (OpenWrt's
 tiny HTTP server), replacing the former Flask app so the web tier keeps
@@ -16,44 +16,46 @@ uhttpd replaces busybox httpd: it serves the docroot index at bare "/"
 (busybox httpd 404s it), follows the /www/cgi-bin/portal symlink to the
 extensionless CGI, and does proper redirects/error pages.
 ---
- .../board/cvitek/SG200X/busybox-extra.config  |   7 +
- .../SG200X/overlay/etc/init.d/S60routing      |   2 +-
- .../SG200X/overlay/etc/init.d/S81router       |  82 ++--
- buildroot/package/rnsbox-portal/Config.in     |  28 ++
+ .../board/cvitek/SG200X/busybox-extra.config  |  12 +
+ .../cvitek/SG200X/overlay/etc/init.d/S29fw    |  17 +
+ .../SG200X/overlay/etc/init.d/S60routing      | 279 ++++++++--
+ .../SG200X/overlay/etc/init.d/S81router       |  90 ++--
+ buildroot/package/rnsbox-portal/Config.in     |  28 +
  .../package/rnsbox-portal/rnsbox-portal.mk    |  51 ++
  buildroot/package/rnsbox-portal/src/LICENSE   |  21 +
- .../package/rnsbox-portal/src/cgi/http.cpp    | 181 +++++++
- .../package/rnsbox-portal/src/cgi/http.h      |  75 +++
- .../package/rnsbox-portal/src/cgi/main.cpp    | 107 +++++
- .../package/rnsbox-portal/src/cgi/nftgen.cpp  | 114 +++++
- .../package/rnsbox-portal/src/cgi/nftgen.h    |  20 +
- .../rnsbox-portal/src/cgi/pages/base.html     |  40 ++
- .../src/cgi/pages/dashboard.html              | 128 +++++
+ .../package/rnsbox-portal/src/cgi/http.cpp    | 253 +++++++++
+ .../package/rnsbox-portal/src/cgi/http.h      | 103 ++++
+ .../package/rnsbox-portal/src/cgi/main.cpp    | 416 +++++++++++++++
+ .../package/rnsbox-portal/src/cgi/nftgen.cpp  | 160 ++++++
+ .../package/rnsbox-portal/src/cgi/nftgen.h    |  26 +
+ .../rnsbox-portal/src/cgi/pages/base.html     |  43 ++
+ .../src/cgi/pages/dashboard.html              | 131 +++++
  .../rnsbox-portal/src/cgi/pages/login.html    |  18 +
  .../src/cgi/pages/login_base.html             |  15 +
  .../rnsbox-portal/src/cgi/pages/network.html  | 118 +++++
- .../rnsbox-portal/src/cgi/pages/wifi.html     | 129 +++++
- .../package/rnsbox-portal/src/cgi/render.cpp  |  99 ++++
- .../package/rnsbox-portal/src/cgi/render.h    |  43 ++
+ .../rnsbox-portal/src/cgi/pages/wifi.html     | 151 ++++++
+ .../package/rnsbox-portal/src/cgi/render.cpp  | 127 +++++
+ .../package/rnsbox-portal/src/cgi/render.h    |  45 ++
  .../package/rnsbox-portal/src/cgi/routes.h    |  61 +++
- .../rnsbox-portal/src/cgi/routes_dash.cpp     | 272 +++++++++++
- .../rnsbox-portal/src/cgi/routes_net.cpp      | 200 ++++++++
- .../rnsbox-portal/src/cgi/routes_wifi.cpp     | 243 ++++++++++
- .../package/rnsbox-portal/src/cgi/session.cpp | 183 +++++++
- .../package/rnsbox-portal/src/cgi/session.h   |  38 ++
- .../package/rnsbox-portal/src/cgi/store.cpp   | 444 +++++++++++++++++
- .../package/rnsbox-portal/src/cgi/store.h     |  88 ++++
- .../package/rnsbox-portal/src/cgi/sysinfo.cpp | 265 ++++++++++
- .../package/rnsbox-portal/src/cgi/sysinfo.h   |  54 +++
- .../package/rnsbox-portal/src/cgi/util.cpp    | 195 ++++++++
- .../package/rnsbox-portal/src/cgi/util.h      |  54 +++
- .../package/rnsbox-portal/src/cgi/web.cpp     |  49 ++
- buildroot/package/rnsbox-portal/src/cgi/web.h |  28 ++
- .../package/rnsbox-portal/src/cgi/wifi.cpp    | 240 ++++++++++
- .../package/rnsbox-portal/src/cgi/wifi.h      |  37 ++
+ .../rnsbox-portal/src/cgi/routes_dash.cpp     | 275 ++++++++++
+ .../rnsbox-portal/src/cgi/routes_net.cpp      | 207 ++++++++
+ .../rnsbox-portal/src/cgi/routes_wifi.cpp     | 329 ++++++++++++
+ .../package/rnsbox-portal/src/cgi/session.cpp | 204 ++++++++
+ .../package/rnsbox-portal/src/cgi/session.h   |  47 ++
+ .../package/rnsbox-portal/src/cgi/store.cpp   | 487 ++++++++++++++++++
+ .../package/rnsbox-portal/src/cgi/store.h     |  96 ++++
+ .../package/rnsbox-portal/src/cgi/sysinfo.cpp | 283 ++++++++++
+ .../package/rnsbox-portal/src/cgi/sysinfo.h   |  59 +++
+ .../package/rnsbox-portal/src/cgi/util.cpp    | 213 ++++++++
+ .../package/rnsbox-portal/src/cgi/util.h      |  54 ++
+ .../package/rnsbox-portal/src/cgi/web.cpp     |  67 +++
+ buildroot/package/rnsbox-portal/src/cgi/web.h |  35 ++
+ .../package/rnsbox-portal/src/cgi/wifi.cpp    | 282 ++++++++++
+ .../package/rnsbox-portal/src/cgi/wifi.h      |  52 ++
  .../rnsbox-portal/src/cgi/www/index.html      |   5 +
- .../rnsbox-portal/src/cgi/www/style.css       | 453 ++++++++++++++++++
- 37 files changed, 4146 insertions(+), 41 deletions(-)
+ .../rnsbox-portal/src/cgi/www/style.css       | 459 +++++++++++++++++
+ 38 files changed, 5250 insertions(+), 69 deletions(-)
+ create mode 100755 buildroot/board/cvitek/SG200X/overlay/etc/init.d/S29fw
  create mode 100644 buildroot/package/rnsbox-portal/Config.in
  create mode 100644 buildroot/package/rnsbox-portal/rnsbox-portal.mk
  create mode 100644 buildroot/package/rnsbox-portal/src/LICENSE
@@ -90,10 +92,10 @@ extensionless CGI, and does proper redirects/error pages.
  create mode 100644 buildroot/package/rnsbox-portal/src/cgi/www/style.css
 
 diff --git a/buildroot/board/cvitek/SG200X/busybox-extra.config b/buildroot/board/cvitek/SG200X/busybox-extra.config
-index a0414033c..1da780661 100644
+index a0414033c..d70569b28 100644
 --- a/buildroot/board/cvitek/SG200X/busybox-extra.config
 +++ b/buildroot/board/cvitek/SG200X/busybox-extra.config
-@@ -10,3 +10,10 @@ CONFIG_SVC=y
+@@ -10,3 +10,15 @@ CONFIG_SVC=y
  CONFIG_SVOK=y
  CONFIG_SVLOGD=y
  CONFIG_STAT=y
@@ -104,24 +106,389 @@ index a0414033c..1da780661 100644
 +# See package/uhttpd + /etc/init.d/S81router.
 +# CONFIG_HTTPD is not set
 +# CONFIG_FEATURE_HTTPD_CGI is not set
++# syslogd — rnsd / lxmd / nomadnet now log to syslog (via logger, see
++# S82rnsd). The default 256-byte read buffer truncates any message over ~220
++# chars (RNS error lines carry interface names + exception text), so raise
++# it. Costs ~4 KB of syslogd RAM.
++CONFIG_FEATURE_SYSLOGD_READ_BUFFER_SIZE=1024
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S29fw b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S29fw
+new file mode 100755
+index 000000000..2a6d62b02
+--- /dev/null
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S29fw
+@@ -0,0 +1,17 @@
++#!/bin/sh
++# S29fw — fail-closed IPv4 firewall before any uplink gets an address.
++#
++# S30eth / S35wifi address the WAN (udhcpc / static on eth0, dhcpcd on a
++# wlan0 STA), and stock S50sshd listens on 0.0.0.0:22, before S60routing loads
++# the real ruleset. Without this, WAN SSH is reachable for a few seconds on
++# every boot even with `tcp 22` removed from Open ports. (S09ipv6 is the IPv6
++# equivalent.) Loads S60routing's emergency ruleset with usb0 as the only LAN;
++# S60routing start replaces it.
++#
++# Order: after S10uuid (its `ifconfig eth0 up` sets no IPv4 address), before
++# S30eth, S31slip and S35wifi.
++case "${1:-start}" in
++	start|restart) /etc/init.d/S60routing early ;;
++	stop)          ;;    # S60routing stop leaves the box closed
++	*) echo "Usage: $0 {start|stop|restart}" >&2; exit 1 ;;
++esac
 diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S60routing b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S60routing
-index 7531b48bc..27abcfe6a 100755
+index 7531b48bc..82662caca 100755
 --- a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S60routing
 +++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S60routing
-@@ -14,7 +14,7 @@
+@@ -6,15 +6,43 @@
+ # AP iface, if any, already exists and can be folded into the LAN side).
+ # Re-runnable as `restart` whenever the portal edits the rnsbox configs.
+ #
+-# nftables ruleset comes from `python3 -m rnsbox_portal.nftgen` (single
+-# source of truth shared with the Flask UI). Pre-validate with `nft -c -f`
+-# (validate-before-swap discipline) before atomically swapping the live config so a bad
+-# generated rule can't lock us out.
++# nftables ruleset comes from `/usr/sbin/rnsbox-portal nftgen` (the C++
++# portal's generator — single source of truth shared with the web UI):
++# `table ip filter` + `table ip nat`, plus a LAN-only `table ip6 filter` when
++# the kernel has IPv6 (only usb0 has IPv6 at all — see S09ipv6). Pre-validate
++# with `nft -c -f` (validate-before-swap discipline) before atomically
++# swapping the live config so a bad generated rule can't lock us out.
++#
++# Failure handling — fail closed, never "no firewall":
++#   1. nftgen output fails nft -c -> retry once without the ip6 table
++#      (--no-ipv6); if that validates it is installed (IPv4 router intact).
++#   2. still nothing valid -> keep the previous $NFT_FILE only if it holds a
++#      filter table and was generated for the same WAN/LAN (topology tag on
++#      line 1) or is the shipped static fallback (LAN-only, closed toward
++#      every non-LAN iface); otherwise (incl. an empty/truncated file) go to
++#      step 3.
++#   3. $NFT_FILE won't LOAD (e.g. the static fallback's ip6 table on a kernel
++#      without IPv6) -> built-in IPv4-only emergency ruleset: lo + LAN +
++#      established in, LAN -> $WAN out (masqueraded), everything else dropped.
++#   4. even that fails (nf_tables unusable) -> ip_forward stays 0, so the box
++#      at least doesn't route for the LAN; logged. Whatever ruleset was live
++#      before is left as it was.
++# ip_forward is switched on only once some ruleset is loaded. Details of any
++# failure land in $NFT_ERR.
++#
++# Before this runs, S29fw (`S60routing early`) has already loaded the emergency
++# ruleset with usb0 as the only LAN: the WAN gets its address in S30eth /
++# S35wifi and stock S50sshd listens on 0.0.0.0:22 well before S60, so without
++# it IPv4 would be unfiltered for that window on every boot. `stop` loads the
++# same emergency ruleset instead of flushing, so shutdown (rcK stops S60 before
++# S50sshd) and a manual stop leave the box closed too.
+ 
  WAN_CONF=/etc/rnsbox/wan.conf
  NFT_FILE=/etc/nftables.conf
++NFT_ERR=/var/log/nftgen.err
  DNSMASQ_FILE=/etc/dnsmasq.conf
 -NFTGEN="env PYTHONPATH=/usr/lib/rnsbox-portal python3 -m rnsbox_portal.nftgen"
 +NFTGEN="/usr/sbin/rnsbox-portal nftgen"
++WAN_CANDIDATES="eth0 wlan0"
  
  USB0_LAN_IP=10.42.0.1
  USB0_LAN_DHCP_START=10.42.0.10
+@@ -50,20 +78,129 @@ read_lan() {
+ 	fi
+ }
+ 
++# note <msg> — to the console/caller and, timestamped, to $NFT_ERR.
++note() {
++	echo "S60routing: $*"
++	echo "$(date '+%F %T') S60routing: $*" >> "$NFT_ERR"
++}
++
++# nft -c accepts an empty or comment-only file (an empty batch), so a short
++# write (full fs) must be caught by content: our tag, nftgen's marker and the
++# nat table (written last of the IPv4 tables) all present.
++nft_output_ok() {
++	[ "$(head -n 1 "$1")" = "$TOPO_TAG" ] \
++	  && grep -q '^# Generated by rnsbox nftgen' "$1" \
++	  && grep -q '^table ip nat' "$1"
++}
++
+ regen_nftables() {
+-	TMP=$(mktemp /tmp/nftables.conf.XXXXXX) || return 1
+-	if ! $NFTGEN --wan "$WAN" --lan "$LAN_IFACES" > "$TMP" 2>/var/log/nftgen.err; then
+-		echo "S60routing: nftgen failed (see /var/log/nftgen.err); keeping previous $NFT_FILE"
+-		rm -f "$TMP"
+-		return 1
++	# Temp file next to $NFT_FILE, not in /tmp: the mv is then an atomic
++	# same-filesystem rename, and a full (size-capped) /tmp can't empty it.
++	TMP=$(mktemp "$NFT_FILE.XXXXXX") || return 1
++	: > "$NFT_ERR"
++	# Full ruleset first (ip6 table included when the kernel has IPv6); if nft
++	# rejects it, retry IPv4-only so an unsupported ip6 table can't cost us
++	# the whole router firewall.
++	for v6 in "" --no-ipv6; do
++		# Line 1 = $TOPO_TAG (a comment to nft; see nft_file_fits). The brace
++		# group's status is nftgen's, so its failure is still caught.
++		if ! { echo "$TOPO_TAG"; $NFTGEN --wan "$WAN" --lan "$LAN_IFACES" $v6; } > "$TMP" 2>>"$NFT_ERR" \
++		   || ! nft_output_ok "$TMP"; then
++			note "nftgen failed or wrote an incomplete ruleset (see $NFT_ERR); keeping previous $NFT_FILE"
++			rm -f "$TMP"
++			return 1
++		fi
++		if nft -c -f "$TMP" >>"$NFT_ERR" 2>&1; then
++			[ -n "$v6" ] && note "ruleset with ip6 table failed nft -c; installed IPv4-only (see $NFT_ERR)"
++			chmod 0644 "$TMP"
++			# sync before the rename, so a power cut can't leave a
++			# zero-length $NFT_FILE (ext4 delalloc).
++			sync
++			mv "$TMP" "$NFT_FILE"
++			return 0
++		fi
++	done
++	note "generated ruleset failed nft -c validation; keeping previous $NFT_FILE"
++	rm -f "$TMP"
++	return 1
++}
++
++# Last-resort ruleset (step 3 in the header). IPv4-only on purpose so it
++# loads on any nf_tables kernel; same LAN-only shape as the static fallback
++# but built from the live WAN/LAN names.
++emergency_ruleset() {
++	lan_set=$(echo "$LAN_IFACES" | sed -e 's/[^,][^,]*/"&"/g' -e 's/,/, /g')
++	cat <<EOF
++flush ruleset
++table ip filter {
++	chain input {
++		type filter hook input priority filter; policy drop;
++		ct state established,related accept
++		iifname "lo" accept
++		iifname { $lan_set } accept
++	}
++	chain forward {
++		type filter hook forward priority filter; policy drop;
++		ct state established,related accept
++		iifname { $lan_set } oifname "$WAN" accept
++	}
++	chain output { type filter hook output priority filter; policy accept; }
++}
++table ip nat {
++	chain postrouting {
++		type nat hook postrouting priority srcnat; policy accept;
++		oifname "$WAN" masquerade
++	}
++}
++EOF
++}
++
++# $NFT_FILE is safe to (re)load only if it was generated for the current
++# WAN/LAN: a stale one could still list e.g. wlan0 (an old AP-only hotspot)
++# as LAN after wlan0 became the uplink, and accept everything from it. The
++# shipped static fallback (not nftgen output) is closed toward every non-LAN
++# iface whatever the topology, so it always fits. An empty or truncated file
++# (no filter table) never counts as that fallback: nft -f of it would "load"
++# nothing and leave the box unfiltered with ip_forward=1.
++nft_file_fits() {
++	grep -q '^table ip filter' "$NFT_FILE" || return 1
++	grep -q '^# Generated by rnsbox nftgen' "$NFT_FILE" || return 0
++	[ "$(head -n 1 "$NFT_FILE")" = "$TOPO_TAG" ]
++}
++
++# Load $NFT_FILE, else the emergency ruleset. 0 once SOME ruleset is live.
++# No separate `nft flush ruleset` first: every file we load begins with
++# `flush ruleset` and nft -f is one transaction, so the swap is atomic and a
++# failed load leaves the previous ruleset in place.
++apply_nftables() {
++	if [ -r "$NFT_FILE" ] && nft_file_fits && nft -f "$NFT_FILE" >>"$NFT_ERR" 2>&1; then
++		return 0
+ 	fi
+-	if ! nft -c -f "$TMP" >>/var/log/nftgen.err 2>&1; then
+-		echo "S60routing: generated ruleset failed nft -c validation; keeping previous $NFT_FILE"
+-		rm -f "$TMP"
+-		return 1
++	if [ -r "$NFT_FILE" ] && ! nft_file_fits; then
++		note "previous $NFT_FILE is empty/incomplete or was generated for another WAN/LAN; not reusing it, loading the built-in IPv4-only emergency ruleset"
++	else
++		note "could not load $NFT_FILE (see $NFT_ERR); loading the built-in IPv4-only emergency ruleset"
+ 	fi
+-	mv "$TMP" "$NFT_FILE"
+-	chmod 0644 "$NFT_FILE"
++	# Straight from the pipe, no temp file (an empty one on a full /tmp would
++	# "load" fine). nft maps "-" to /dev/stdin; the pipeline status is nft's.
++	emergency_ruleset | nft -f - >>"$NFT_ERR" 2>&1
++}
++
++# Re-attach $1's root qdisc so it picks up default_qdisc (fq). The default is
++# chosen when an iface is first raised, and eth0/usb0/wlan0/sl0 are all up
++# before we set it — so they'd keep pfifo_fast (mq + pfifo_fast children on
++# wlan0).
++# Deleting the root makes the kernel attach the default again (mq with fq
++# children on a multi-queue device, plain fq otherwise); a default root has
++# handle 0: which tc can't delete, so swap in a handled pfifo_fast first
++# (always built in). Only touches a still-pfifo_fast root or first mq child
++# (children of unused tx queues stay pfifo_fast by design), so it's a no-op on
++# later restarts; a half-done swap is simply retried next time.
++refresh_qdisc() {
++	tc qdisc show dev "$1" 2>/dev/null \
++	  | grep -qE '^qdisc pfifo_fast [0-9a-f]+: (root|parent :1 )' || return 0
++	tc qdisc replace dev "$1" root handle 1: pfifo_fast 2>/dev/null \
++	  && tc qdisc del dev "$1" root 2>/dev/null
+ }
+ 
+ regen_dnsmasq() {
+@@ -72,7 +209,7 @@ regen_dnsmasq() {
+ 	fi
+ 	{
+ 		echo
+-		echo "# WAN=$WAN (DHCP not served here — eth0 receives a lease, doesn't serve one)"
++		echo "# WAN=$WAN (no DHCP served on the uplink — $WAN is a client there)"
+ 		echo "no-dhcp-interface=$WAN"
+ 		echo
+ 		echo "# usb0 LAN"
+@@ -98,10 +235,12 @@ regen_dnsmasq() {
+ start() {
+ 	read_wan
+ 	read_lan
++	# Stamped on line 1 of every generated $NFT_FILE (see nft_file_fits).
++	TOPO_TAG="# rnsbox-topology wan=$WAN lan=$LAN_IFACES"
+ 	echo "S60routing: WAN=$WAN LAN=$LAN_IFACES"
+ 
+ 	# --- routing knobs ---
+-	echo 1 > /proc/sys/net/ipv4/ip_forward
++	# (ip_forward is switched on further down, once a ruleset is loaded.)
+ 	echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter
+ 	echo 0 > /proc/sys/net/ipv4/conf/default/rp_filter
+ 	echo 0 > /proc/sys/net/ipv4/conf/all/accept_redirects
+@@ -113,7 +252,13 @@ start() {
+ 	# to the box's real LAN IP (10.42.0.1) don't need this; loopback ones do.
+ 	# Safe: INPUT's drop policy + the "ct status dnat" gate mean only flows
+ 	# our own prerouting DNAT created can reach a local service this way.
+-	echo 1 > "/proc/sys/net/ipv4/conf/$WAN/route_localnet" 2>/dev/null || true
++	# Only the current WAN gets it: reset it on the other WAN candidate, or a
++	# WAN switch would leave it on the old uplink.
++	for w in $WAN_CANDIDATES; do
++		[ -d "/proc/sys/net/ipv4/conf/$w" ] || continue   # no wlan0 on the -e
++		v=0; [ "$w" = "$WAN" ] && v=1
++		echo $v > "/proc/sys/net/ipv4/conf/$w/route_localnet"
++	done
+ 
+ 	# --- throughput tuning ---
+ 	for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+@@ -137,31 +282,107 @@ start() {
+ 	fi
+ 	[ -d /sys/module/sch_fq ] || modprobe sch_fq 2>/dev/null
+ 	echo fq > /proc/sys/net/core/default_qdisc 2>/dev/null
++	# default_qdisc only affects qdiscs attached from now on, and every iface
++	# already up by S60 (eth0, usb0, wlan0, the S35 AP vif, and sl0 from
++	# S31slip) got pfifo_fast when first raised. Move them all over; ifaces
++	# created later (portal SLIP re-apply, hostapd restart) get fq by themselves.
++	# refresh_qdisc only acts on a pfifo_fast root/first child, so lo
++	# (noqueue), down ifaces (noop) and ifaces already on fq are left alone.
++	if [ "$(cat /proc/sys/net/core/default_qdisc 2>/dev/null)" = "fq" ] \
++	   && command -v tc >/dev/null 2>&1; then
++		for d in /sys/class/net/*; do
++			i=${d##*/}
++			[ "$i" = lo ] || refresh_qdisc "$i"
++		done
++	fi
+ 
+ 	# --- regenerate + apply ---
+ 	regen_dnsmasq
+ 	regen_nftables
+ 
+-	nft flush ruleset 2>/dev/null
+-	if [ -r "$NFT_FILE" ]; then
+-		nft -f "$NFT_FILE"
++	if apply_nftables; then
++		echo 1 > /proc/sys/net/ipv4/ip_forward
++	else
++		echo 0 > /proc/sys/net/ipv4/ip_forward
++		note "NO nftables ruleset could be loaded — LAN routing disabled (ip_forward=0)"
+ 	fi
+ 
+-	if [ -x /etc/init.d/S80dnsmasq ]; then
+-		/etc/init.d/S80dnsmasq restart >/dev/null 2>&1 || true
+-	elif pidof dnsmasq >/dev/null 2>&1; then
+-		killall -HUP dnsmasq 2>/dev/null || true
++	restart_dnsmasq
++}
++
++# dnsmasq only reads interface= / dhcp-range= at startup (SIGHUP re-reads
++# hosts and lease-related files, not the scopes regen_dnsmasq just wrote), so
++# this has to be a real restart. Stock `S80dnsmasq restart` is stop+start with
++# no wait: start-stop-daemon -K only signals, and if the old dnsmasq is still
++# exiting when -S checks the pidfile, the start is skipped as "already
++# running" — the LAN then loses DHCP+DNS after a portal network change. So:
++# stop, wait up to 3 s for every old dnsmasq to go (SIGKILL after that: a
++# leftover would hold :53/:67 and the new one could not bind), start, verify.
++# At boot (S60 runs before S80) there is nothing to stop, so this just starts it.
++restart_dnsmasq() {
++	if [ ! -x /etc/init.d/S80dnsmasq ]; then
++		pidof dnsmasq >/dev/null 2>&1 && killall -HUP dnsmasq 2>/dev/null
++		return 0
++	fi
++	old=$(pidof dnsmasq)
++	/etc/init.d/S80dnsmasq stop >/dev/null 2>&1
++	if [ -n "$old" ]; then
++		kill $old 2>/dev/null   # also any instance the pidfile didn't name
++		i=0
++		while [ "$i" -lt 30 ]; do
++			alive=
++			for p in $old; do [ -d "/proc/$p" ] && alive="$alive $p"; done
++			[ -z "$alive" ] && break
++			sleep 0.1; i=$((i + 1))
++		done
++		if [ -n "$alive" ]; then
++			note "dnsmasq (pid$alive) ignored SIGTERM for 3 s; killing it"
++			kill -9 $alive 2>/dev/null
++			sleep 0.2
++		fi
+ 	fi
++	/etc/init.d/S80dnsmasq start >/dev/null 2>&1
++	if ! pidof dnsmasq >/dev/null 2>&1; then
++		sleep 1
++		/etc/init.d/S80dnsmasq start >/dev/null 2>&1
++		pidof dnsmasq >/dev/null 2>&1 \
++		  || note "dnsmasq did not start - no DHCP/DNS on the LAN (see /var/log/messages)"
++	fi
++}
++
++# Boot placeholder, loaded by S29fw before any uplink has an address (S30eth,
++# S35wifi) — stock S50sshd listens on 0.0.0.0:22 well before start() runs.
++# Nothing is routed yet (ip_forward=0), so this is just the emergency ruleset
++# with usb0 as the only LAN: lo + usb0 + established in, every other iface
++# dropped. start() swaps the real ruleset in atomically.
++early() {
++	read_wan
++	LAN_IFACES=usb0
++	echo 0 > /proc/sys/net/ipv4/ip_forward
++	emergency_ruleset | nft -f - >>"$NFT_ERR" 2>&1 \
++	  || note "could not load the early fail-closed ruleset (see $NFT_ERR)"
+ }
+ 
+ stop() {
+-	nft flush ruleset 2>/dev/null || true
++	# Close, don't open: `nft flush ruleset` left the WAN (e.g. sshd)
++	# unfiltered until S50sshd stop / power-off. Emergency ruleset, routing off.
++	read_wan
++	read_lan
+ 	echo 0 > /proc/sys/net/ipv4/ip_forward
++	emergency_ruleset | nft -f - >>"$NFT_ERR" 2>&1 || true
++	for w in $WAN_CANDIDATES; do
++		[ -d "/proc/sys/net/ipv4/conf/$w" ] || continue
++		echo 0 > "/proc/sys/net/ipv4/conf/$w/route_localnet"
++	done
+ }
+ 
+ case "${1:-start}" in
+ 	start)   start ;;
+ 	stop)    stop ;;
+-	restart) stop; start ;;
+-	*) echo "Usage: $0 {start|stop|restart}" >&2; exit 1 ;;
++	# Not stop+start: stop drops to the emergency ruleset with ip_forward=0,
++	# cutting LAN routing and every port forward / open port for the whole
++	# regen. start alone re-applies every knob and swaps the ruleset atomically.
++	restart) start ;;
++	early)   early ;;
++	*) echo "Usage: $0 {start|stop|restart|early}" >&2; exit 1 ;;
+ esac
 diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S81router b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S81router
-index 16a86094d..d5ad11be1 100755
+index 16a86094d..4a376e405 100755
 --- a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S81router
 +++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S81router
-@@ -1,55 +1,57 @@
+@@ -1,55 +1,65 @@
  #!/bin/sh
 -# S81router — rnsbox-portal Flask web UI, runs as root.
 +# S81router — RNSBox admin web UI: uhttpd serving the C++ CGI portal.
@@ -188,11 +555,19 @@ index 16a86094d..d5ad11be1 100755
 -	PID=$!
 -	echo "$PID" > "$PIDFILE"
 +	printf "Starting uhttpd (portal): "
-+	# -t/-T 200: the Reticulum tab's "Update rnsd" apply shells to pip (in-place
-+	# package update + rnsd restart) and can run well past uhttpd's 60 s default
-+	# script timeout; raise both the script and network idle timeouts so the
-+	# async apply isn't killed mid-flight (the browser shows a spinner meanwhile).
-+	uhttpd -p 0.0.0.0:80 -h "$DOCROOT" -x /cgi-bin -I index.html -t 200 -T 200
++	# -t/-T 300: the Reticulum tab's "Update rnsd" apply shells to pip (in-place
++	# package update + rnsd restart, rollback on failure) and can run well past
++	# uhttpd's 60 s default script timeout; raise both the script and network
++	# idle timeouts so the async apply isn't killed mid-flight (the browser
++	# shows a spinner meanwhile). Must stay above the portal's 285 s run limit
++	# for the helper, which stays above the helper's own 270 s budget — the
++	# arithmetic is in updatecheck.py (APPLY_BUDGET).
++	# -p 0.0.0.0:8081: serves ONLY the proxied HaLow modem UI (the portal CGI
++	# gates routes by SERVER_PORT), so the modem's own scripts run in a separate
++	# origin and can't drive the portal on :80. Same process, same docroot; if
++	# :8081 fails to bind, uhttpd still runs on :80 (it exits only when no
++	# socket bound at all).
++	uhttpd -p 0.0.0.0:80 -p 0.0.0.0:8081 -h "$DOCROOT" -x /cgi-bin -I index.html -t 300 -T 300
  	sleep 0.3
 -	if kill -0 "$PID" 2>/dev/null; then
 -		echo "OK (pid $PID)"
@@ -339,13 +714,14 @@ index 000000000..645d94257
 +SOFTWARE.
 diff --git a/buildroot/package/rnsbox-portal/src/cgi/http.cpp b/buildroot/package/rnsbox-portal/src/cgi/http.cpp
 new file mode 100644
-index 000000000..5657e6ec2
+index 000000000..a80e43da3
 --- /dev/null
 +++ b/buildroot/package/rnsbox-portal/src/cgi/http.cpp
-@@ -0,0 +1,181 @@
+@@ -0,0 +1,253 @@
 +// http.cpp — see http.h. Defensive CGI parsing for a WAN-facing root service.
 +#include "http.h"
 +#include <cstdio>
++#include <cstdlib>
 +#include <cstring>
 +#include <unistd.h>
 +
@@ -378,6 +754,21 @@ index 000000000..5657e6ec2
 +        }
 +    }
 +    return out;
++}
++
++std::string url_encode(const std::string& s) {
++    static const char* hex = "0123456789ABCDEF";
++    std::string o;
++    o.reserve(s.size());
++    for (unsigned char c : s) {
++        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
++            c == '-' || c == '_' || c == '.' || c == '~' || c == '/') {
++            o += (char)c;
++        } else {
++            o += '%'; o += hex[c >> 4]; o += hex[c & 0xF];
++        }
++    }
++    return o;
 +}
 +
 +void parse_urlencoded(const std::string& s, std::map<std::string, std::string>& out) {
@@ -432,6 +823,9 @@ index 000000000..5657e6ec2
 +    if (r.path.empty()) r.path = "/";
 +    r.query = env_str("QUERY_STRING");
 +    r.remote_addr = env_str("REMOTE_ADDR");
++    r.host = env_str("HTTP_HOST");
++    r.origin = env_str("HTTP_ORIGIN");
++    r.referer = env_str("HTTP_REFERER");
 +
 +    parse_urlencoded(r.query, r.args);
 +    parse_cookies(env_str("HTTP_COOKIE"), r.cookies);
@@ -467,12 +861,65 @@ index 000000000..5657e6ec2
 +    return r;
 +}
 +
++// ---- same-origin check ----
++static std::string lower(std::string s) {
++    for (char& c : s) if (c >= 'A' && c <= 'Z') c = char(c - 'A' + 'a');
++    return s;
++}
++
++// Drop a trailing default port (":80" for http, ":443" for https) so
++// "10.42.0.1:80" and "10.42.0.1" compare equal.
++static std::string strip_default_port(const std::string& auth, const std::string& scheme) {
++    const char* dp = scheme == "https" ? ":443" : ":80";
++    size_t n = strlen(dp);
++    if (auth.size() > n && auth.compare(auth.size() - n, n, dp) == 0)
++        return auth.substr(0, auth.size() - n);
++    return auth;
++}
++
++// True if `url` ("scheme://authority[/path...]", an Origin or a Referer) names
++// this box: the request's own scheme (http unless uhttpd set HTTPS), authority == Host.
++static bool url_matches_host(const std::string& url, const std::string& host) {
++    if (host.empty()) return false;
++    std::string u = lower(url);
++    // Only the scheme this request arrived on: uhttpd exports HTTPS=on for a TLS
++    // client and leaves it unset otherwise (this build has no TLS listener), so
++    // today only http:// matches. An https:// page at the same host is a
++    // different origin (some other server, e.g. a WAN 443 port forward).
++    const std::string scheme = getenv("HTTPS") ? "https" : "http";
++    const std::string prefix = scheme + "://";
++    if (u.compare(0, prefix.size(), prefix) != 0) return false;  // other scheme, "null", garbage
++    size_t a = scheme.size() + 3;
++    size_t e = u.find_first_of("/?#", a);
++    std::string auth = u.substr(a, e == std::string::npos ? std::string::npos : e - a);
++    if (auth.empty()) return false;
++    return strip_default_port(auth, scheme) == strip_default_port(lower(host), scheme);
++}
++
++bool same_origin(const Request& r) {
++    if (!r.origin.empty()) return url_matches_host(r.origin, r.host);
++    if (!r.referer.empty()) return url_matches_host(r.referer, r.host);
++    return true;   // no Origin, no Referer: non-browser client (see http.h)
++}
++
++// Header-line hygiene: CR/LF would split a value into a new header (uhttpd's
++// relay splits CGI output on '\n' and re-emits each line verbatim), NUL would
++// truncate it. Normal values never contain any of them, so this is a no-op for
++// every legitimate response.
++static std::string header_safe(const std::string& s) {
++    if (s.find_first_of(std::string("\r\n\0", 3)) == std::string::npos) return s;
++    std::string o;
++    o.reserve(s.size());
++    for (char c : s) if (c != '\r' && c != '\n' && c != '\0') o.push_back(c);
++    return o;
++}
++
 +void Response::send() const {
 +    std::string out;
 +    out.reserve(body.size() + 256);
-+    out += "Status: " + status + "\r\n";
-+    out += "Content-Type: " + content_type + "\r\n";
-+    for (const auto& h : headers) out += h + "\r\n";
++    out += "Status: " + header_safe(status) + "\r\n";
++    out += "Content-Type: " + header_safe(content_type) + "\r\n";
++    for (const auto& h : headers) out += header_safe(h) + "\r\n";
 +    // Conservative security headers (WAN-facing).
 +    out += "X-Content-Type-Options: nosniff\r\n";
 +    out += "X-Frame-Options: DENY\r\n";
@@ -526,10 +973,10 @@ index 000000000..5657e6ec2
 +}  // namespace http
 diff --git a/buildroot/package/rnsbox-portal/src/cgi/http.h b/buildroot/package/rnsbox-portal/src/cgi/http.h
 new file mode 100644
-index 000000000..99a1588e5
+index 000000000..fe960ad92
 --- /dev/null
 +++ b/buildroot/package/rnsbox-portal/src/cgi/http.h
-@@ -0,0 +1,75 @@
+@@ -0,0 +1,103 @@
 +// http.h — CGI request/response core for the RNSBox portal.
 +//
 +// WAN-facing root CGI: every parser here is written defensively — bounded
@@ -557,6 +1004,12 @@ index 000000000..99a1588e5
 +    std::string query;         // QUERY_STRING (raw)
 +    std::string body;          // request body (POST), capped at MAX_BODY
 +    std::string remote_addr;   // REMOTE_ADDR
++    // For the same-origin check. uhttpd (pinned 15346de8, proc.c proc_header_env)
++    // exports exactly these from its fixed header table; a header the client
++    // didn't send leaves the variable unset (-> empty here).
++    std::string host;          // HTTP_HOST
++    std::string origin;        // HTTP_ORIGIN
++    std::string referer;       // HTTP_REFERER
 +    bool too_large = false;    // CONTENT_LENGTH exceeded MAX_BODY
 +    std::map<std::string, std::string> cookies;  // parsed Cookie header
 +    std::map<std::string, std::string> form;     // parsed application/x-www-form-urlencoded body
@@ -572,6 +1025,10 @@ index 000000000..99a1588e5
 +// passed through literally rather than read past the end.
 +std::string url_decode(const std::string& s);
 +
++// Percent-encode for a query-string value: keeps the RFC 3986 unreserved set
++// and '/', encodes everything else (inverse of url_decode for our own values).
++std::string url_encode(const std::string& s);
++
 +// Parse "a=1&b=two%20words" into a map (last value wins). Keys/values decoded.
 +void parse_urlencoded(const std::string& s, std::map<std::string, std::string>& out);
 +
@@ -582,9 +1039,27 @@ index 000000000..99a1588e5
 +// Read the CGI environment + (for POST) stdin into a Request. Enforces MAX_BODY.
 +Request read_request();
 +
++// CSRF gate for state-changing requests (main.cpp applies it to every non-GET/
++// HEAD request, i.e. every POST). The request's own origin must be this box as
++// the browser addressed it (<request scheme>://<Host>; http:// only, since there
++// is no TLS listener):
++//   * Origin present   -> it must match (so the literal "null" never does);
++//   * else Referer set -> its scheme://host must match;
++//   * neither          -> allowed: not a browser form/fetch (browsers send Origin
++//                         on every POST), and SameSite=Lax already keeps the
++//                         session cookie off cross-site POSTs.
++// Host compare is case-insensitive and ignores the request scheme's default port.
++// Host itself is client-supplied, so main.cpp accepts only an IP literal (or
++// exactly "localhost") first (host_is_literal): Origin == Host alone is
++// satisfied by a DNS-rebinding page.
++bool same_origin(const Request& r);
++
 +// --- response helpers (write to stdout, CGI style) ---
 +
 +// A response accumulates headers then a body, emitted once via send().
++// send() strips CR/LF/NUL from the status, Content-Type and every extra header,
++// so no value (a redirect target, a proxied modem header, ...) can ever split
++// into a second header line or end the header block early.
 +struct Response {
 +    std::string status = "200 OK";
 +    std::string content_type = "text/html; charset=utf-8";
@@ -607,15 +1082,20 @@ index 000000000..99a1588e5
 +#endif
 diff --git a/buildroot/package/rnsbox-portal/src/cgi/main.cpp b/buildroot/package/rnsbox-portal/src/cgi/main.cpp
 new file mode 100644
-index 000000000..930c78cd1
+index 000000000..b4cc3f601
 --- /dev/null
 +++ b/buildroot/package/rnsbox-portal/src/cgi/main.cpp
-@@ -0,0 +1,107 @@
+@@ -0,0 +1,416 @@
 +// main.cpp — RNSBox portal CGI. One binary at /cgi-bin/portal/*, PATH_INFO = route.
 +// Pages are rendered server-side (render::layout wraps a .html content block from
 +// PAGES_DIR); form POSTs are POST-redirect-GET with a one-shot flash. A handful of
 +// endpoints stay JSON for the pages' own AJAX (rnstatus, wifi scan/status,
-+// dashboard auto-refresh, live HaLow modem). Dual-mode: `nftgen` CLI at boot.
++// dashboard auto-refresh, live HaLow modem). Mutating routes are POST-only and
++// every POST is same-origin checked, both here before dispatch (POST_ONLY below).
++// Before either: the Host must be an IP literal or exactly "localhost"
++// (host_is_literal; the dnsmasq aliases such as setup.lan only redirect to the
++// IP), and the modem UI lives alone on its own port/origin (MODEM_PORT).
++// Dual-mode: `nftgen` CLI at boot.
 +#include "http.h"
 +#include "session.h"
 +#include "util.h"
@@ -623,10 +1103,193 @@ index 000000000..930c78cd1
 +#include "render.h"
 +#include "routes.h"
 +#include "nftgen.h"
++#include "store.h"
++#include "wifi.h"
++#include <cctype>
 +#include <cstdio>
 +#include <cstdlib>
 +#include <cstring>
 +#include <unistd.h>
++
++// ---- method policy ----
++// Every state-changing route. They are POST-only: any other method gets 405
++// before the handler runs (a GET used to run them with empty fields — e.g.
++// /wifi/mode -> "off" — and SameSite=Lax still sends the cookie on a top-level
++// cross-site GET, so a plain link was a CSRF). Keep in sync with the dispatch
++// table below; everything not listed here is a read.
++static const char* const POST_ONLY[] = {
++    "/logout",
++    "/network/wan",
++    "/network/portforward/add",
++    "/network/portforward/delete",
++    "/network/openport/add",
++    "/network/openport/delete",
++    "/wifi/connect",
++    "/wifi/ap",
++    "/wifi/mode",
++    "/wifi/txpower",
++    "/reticulum/config",
++    "/reticulum/restart",
++    "/reticulum/autorestart",
++    "/reticulum/autoupdate",
++    "/reticulum/checkupdate",
++    "/reticulum/applyupdate",
++    "/reticulum/slip",
++    "/reticulum/halow/add",
++    "/settings/password",
++    "/settings/hostname",
++    "/settings/time/browser",
++    "/settings/ntp",
++    "/settings/ntp/restart",
++};
++
++static bool is_post_only(const std::string& p) {
++    for (const char* r : POST_ONLY)
++        if (p == r) return true;
++    return false;
++}
++
++// ---- Host allowlist (DNS-rebinding guard) ----
++// same_origin() compares Origin with Host, and a DNS-rebinding page controls both
++// (evil.example re-resolved to 10.42.0.1 -> Origin and Host are both evil.example,
++// and the default admin/admin gets it a session). So only an IPv4/IPv6 literal
++// (no DNS involved) or exactly "localhost" (never resolved via DNS by a browser;
++// SSH tunnels) is an origin. No Host = non-browser client. No other name is: the
++// box has no mDNS/LLMNR responder, so rnsbox.local or a bare hostname is answered
++// by whoever claims it on any network the client is on. The dnsmasq.conf portal
++// aliases are redirect-only entry points (GET/HEAD -> the same path on the IP);
++// every other name (rnsbox.fritz.box, a DDNS name) is refused: open the portal
++// by IP then.
++static std::string lc(std::string s) {
++    for (char& c : s) if (c >= 'A' && c <= 'Z') c = char(c - 'A' + 'a');
++    return s;
++}
++
++// IP literal (no DNS involved), exactly "localhost", or no Host at all
++// (non-browser client).
++static bool host_is_literal(const std::string& host_hdr) {
++    if (host_hdr.empty()) return true;
++    std::string h = lc(host_hdr);
++    if (h[0] == '[') {                                  // IPv6 literal "[fe80::1]:80"
++        size_t e = h.find(']');
++        if (e == std::string::npos || e == 1) return false;
++        for (size_t i = 1; i < e; ++i)
++            if (!(isxdigit((unsigned char)h[i]) || h[i] == ':' || h[i] == '.')) return false;
++        return true;
++    }
++    size_t colon = h.rfind(':');
++    if (colon != std::string::npos) h.erase(colon);     // any port
++    // "localhost" never goes to DNS in a browser (RFC 6761: Chromium/Firefox hardcode
++    // it to loopback, Safari reads /etc/hosts), so a rebinding page can't hold that
++    // origin; it is how an SSH tunnel is opened (ssh -L 8080:127.0.0.1:80 ->
++    // http://localhost:8080/). Exact name only, not *.localhost: WebKit/system
++    // resolvers may send those to (possibly hostile) DNS.
++    if (h == "localhost") return true;
++    return store::valid_ipv4(h);
++}
++
++// dnsmasq.conf address= names: redirect-only entry points, never an origin.
++static bool host_is_alias(const std::string& host_hdr) {
++    std::string h = lc(host_hdr);
++    size_t colon = h.rfind(':');
++    if (colon != std::string::npos) h.erase(colon);
++    if (!h.empty() && h.back() == '.') h.pop_back();    // "setup.lan."
++    static const char* const ALIASES[] = {              // keep in sync with dnsmasq.conf address=
++        "rnsbox.local", "setup.rnsbox", "setup.lan", "router.rnsbox",
++    };
++    for (const char* a : ALIASES) if (h == a) return true;
++    return false;
++}
++
++// ---- modem UI origin ----
++// The proxied modem web UI is the modem's own HTML + inline scripts. Served from
++// the portal's origin, any script in it (a hostile modem, or a stored XSS in data
++// the modem heard over the air) would ride the admin session and pass
++// same_origin() on every mutating route. So the modem routes live only on a
++// second uhttpd listener (S81router: -p 0.0.0.0:8081), a separate origin: a
++// modem-page POST to the portal port carries Origin http://host:8081 != Host and
++// gets 403, and the browser won't let it read portal responses. The session
++// cookie is not port-scoped (and is HttpOnly), so a logged-in admin stays logged
++// in there. Each port serves only its own routes; a GET for the other side's is
++// redirected, anything else is 404.
++static const char MODEM_PORT[] = "8081";
++
++static bool is_modem_route(const std::string& p) {
++    return p == "/modem" || p == "/modem/" || p.rfind("/modem/api/", 0) == 0;
++}
++
++// "http://<host as the browser addressed it>[:port]" for a cross-port redirect.
++// Host was checked to be an IP literal (or "localhost") already; still keep only
++// host-name bytes so nothing odd reaches the Location header. No usable Host ->
++// the address uhttpd accepted on.
++static std::string origin_on_port(const http::Request& req, const char* port) {
++    std::string h = req.host;
++    if (!h.empty() && h[0] == '[') {
++        size_t e = h.find(']');
++        h = (e == std::string::npos) ? std::string() : h.substr(0, e + 1);
++    } else {
++        size_t c = h.find(':');
++        if (c != std::string::npos) h.resize(c);
++    }
++    for (unsigned char c : h)
++        if (!(isalnum(c) || c == '.' || c == '-' || c == '[' || c == ']' || c == ':')) { h.clear(); break; }
++    if (h.empty()) {
++        const char* a = getenv("SERVER_ADDR");
++        h = (a && *a) ? a : "10.42.0.1";
++        if (h.find(':') != std::string::npos) h = "[" + h + "]";   // IPv6 listener
++    }
++    return std::string("http://") + h + (port ? std::string(":") + port : std::string());
++}
++
++// Port the browser addressed, from Host ("" = scheme default).
++static std::string host_port(const std::string& h) {
++    size_t from = 0;
++    if (!h.empty() && h[0] == '[') { from = h.find(']'); if (from == std::string::npos) return std::string(); }
++    size_t c = h.find(':', from);
++    return c == std::string::npos ? std::string() : h.substr(c + 1);
++}
++
++// Host as the browser addressed it vs. the port a direct hit on this listener carries
++// ("" = scheme default). A loopback name (the box is never localhost/127.x to the
++// browser: an SSH tunnel) or any other port (a tunnel, or an upstream NAT on another
++// public port) means a cross-port redirect would land on the admin's own machine or
++// the NAT's same-numbered port, not on us, and hand it the session cookie.
++static bool host_is_mapped(const std::string& host_hdr, const std::string& hp, const char* direct_port) {
++    if (host_hdr.empty()) return false;              // non-browser: origin_on_port uses SERVER_ADDR
++    std::string h = lc(host_hdr);
++    if (h[0] == '[') { size_t e = h.find(']'); h = e == std::string::npos ? h : h.substr(0, e + 1); }
++    else { size_t c = h.find(':'); if (c != std::string::npos) h.resize(c); }
++    if (h == "localhost" || h.rfind("127.", 0) == 0 || h == "[::1]") return true;
++    if (!strcmp(direct_port, "80")) return !(hp.empty() || hp == "80");
++    return hp != direct_port;
++}
++
++// A WAN port forward of tcp <wan_port> (DNAT runs before INPUT) means a browser
++// on the WAN that we redirect to that port reaches the forward's target, not
++// us, and hands it the session cookie (cookies aren't port-scoped).
++// store::add_portforward refuses new ones; this catches forwards left from an
++// older version or added by hand. Only matters for WAN-origin requests: callers
++// skip it for from_lan() ones, which our DNAT never touches.
++static bool tcp_forwarded(int wan_port) {
++    for (const auto& f : store::read_portforwards())
++        if (f.proto == "tcp" && f.wan_port == wan_port) return true;
++    return false;
++}
++
++// Request from a LAN segment or the box itself? Our prerouting DNAT matches only
++// iifname "<WAN>" (nftgen) and keeps the source address, so for these clients a
++// redirect to another port of the same Host reaches us, never a forward's target.
++// usb0 is 10.42.0.1/24 (S30gadget_nic); the hotspot is ap_ip/24 (S35wifi) while
++// it is up (/run/wifi-ap-iface). uhttpd listens on IPv4 only (S81router).
++static bool from_lan(const http::Request& req) {
++    const std::string& ra = req.remote_addr;
++    if (!store::valid_ipv4(ra)) return false;
++    auto net24 = [](const std::string& ip) { return ip.substr(0, ip.rfind('.') + 1); };
++    if (ra.rfind("127.", 0) == 0 || net24(ra) == "10.42.0.") return true;
++    if (util::trim(util::read_file("/run/wifi-ap-iface", 64)).empty()) return false;
++    std::string ap = wifi::read_conf()["ap_ip"];
++    return store::valid_ipv4(ap) && net24(ap) == net24(ra);
++}
 +
 +// ---- auth routes ----
 +static void r_login(const http::Request& req, http::Response& res) {
@@ -634,25 +1297,31 @@ index 000000000..930c78cd1
 +        std::string user = util::trim(req.f("username"));
 +        std::string pass = req.f("password");
 +        std::string next = req.f("next");
++        bool next_ok = web::is_local_next(next);   // local portal path only (no open redirect)
 +        if (session::verify_password(user, pass)) {
 +            res.set_cookie(session::start(user));
-+            std::string dest = web::base();   // no trailing slash (a trailing slash turns the CGI path into a dir lookup)
-+            if (next.size() > 1 && next[0] == '/' && next[1] != '/') dest = next;  // local only
-+            res.redirect(dest);
++            // default: the dashboard. base() and base()+"/" both reach it (an empty
++            // PATH_INFO is read as "/"; the nav's Dashboard link uses the slash form)
++            res.redirect(next_ok ? next : web::base());
 +            return;
 +        }
 +        ::sleep(1);  // brute-force speed bump
-+        render::redirect_flash(res, web::base() + "/login", "error", "Invalid credentials");
++        std::string again = web::base() + "/login";
++        if (next_ok) again += "?next=" + http::url_encode(next);   // keep the deep link across a typo
++        render::redirect_flash(res, again, "error", "Invalid credentials");
 +        return;
 +    }
++    std::string next = req.a("next");
 +    std::string h = render::page_file("login");
 +    h = web::replace_all(h, "__ACTION__", web::base() + "/login");
-+    h = web::replace_all(h, "__NEXT__", http::html_escape(req.a("next")));
++    h = web::replace_all(h, "__NEXT__", web::is_local_next(next) ? http::html_escape(next) : std::string());
 +    res.body = render::login_layout(req, res, h);
 +}
 +
-+static void r_logout(const http::Request&, http::Response& res) {
-+    res.set_cookie(session::clear());
++// POST-only (see POST_ONLY). Ends the session only for the holder of the live
++// token (session::clear checks it) — a cookieless request just gets bounced.
++static void r_logout(const http::Request& req, http::Response& res) {
++    res.set_cookie(session::clear(req.cookie(session::COOKIE_NAME)));
 +    res.redirect(web::base() + "/login");
 +}
 +
@@ -674,7 +1343,122 @@ index 000000000..930c78cd1
 +        return 0;
 +    }
 +
++    // Host not an IP literal / "localhost" (DNS rebinding): refuse everything, reads included.
++    if (!host_is_literal(req.host)) {
++        if ((req.method == "GET" || req.method == "HEAD") && host_is_alias(req.host)) {
++            // Friendly name: bounce to the IP origin. Never serve content or set
++            // a cookie on a name. Safe even if an attacker claims the name: for
++            // a rebinding page this is a cross-origin redirect (unreadable, and
++            // no SameSite=Lax cookie for the IP on a cross-site subresource).
++            const char* a = getenv("SERVER_ADDR");
++            std::string ip = (a && *a) ? a : "10.42.0.1";
++            if (ip.find(':') != std::string::npos) ip = "[" + ip + "]";   // IPv6 listener
++            const char* sp = getenv("SERVER_PORT");
++            std::string port = (sp && *sp && strcmp(sp, "80") != 0) ? std::string(":") + sp : std::string();
++            std::string to = "http://" + ip + port + web::base() + req.path;
++            if (!req.query.empty()) to += "?" + req.query;
++            res.redirect(to);
++        } else {
++            res.status = "403 Forbidden";
++            res.content_type = "text/plain";
++            res.body = "Unknown host name. Open the portal by IP: http://10.42.0.1/ "
++                       "(through an SSH tunnel: http://127.0.0.1:<local port>/).\n";
++        }
++        res.send();
++        return 0;
++    }
++
 +    const std::string& p = req.path;
++
++    // Port gate: modem routes only on MODEM_PORT, everything else only off it.
++    // Must run before the 405 + same-origin gates: a POST on :8081 to e.g.
++    // /reticulum/config would pass same_origin() against its own Host.
++    const char* sp = getenv("SERVER_PORT");               // uhttpd proc.c: local port, decimal
++    bool on_modem_port = sp && strcmp(sp, MODEM_PORT) == 0;
++    if (on_modem_port != is_modem_route(p)) {
++        const std::string hp = host_port(req.host);
++        if (req.method == "GET" && on_modem_port) {         // e.g. require_auth's /login redirect -> portal port
++            if ((!req.host.empty() && (hp.empty() || hp == "80")) || (!from_lan(req) && tcp_forwarded(80)) ||
++                host_is_mapped(req.host, hp, MODEM_PORT)) {
++                // The browser already asked for port 80 but a WAN port forward
++                // delivered it to :8081; redirecting again would loop forever.
++                // (No Host at all: origin_on_port falls back to SERVER_ADDR.)
++                // Or WAN tcp 80 is forwarded elsewhere: the redirect would hand
++                // that host the session cookie (see tcp_forwarded). Or the Host
++                // is a tunnel/mapping (host_is_mapped): its :80 isn't ours.
++                res.status = "404 Not Found";
++                res.content_type = "text/plain";
++                res.body = "Port 8081 only serves the HaLow modem page; the portal is on port 80. "
++                           "From the WAN, open tcp 80 (Network -> Open ports) and remove any WAN tcp 80 port forward. "
++                           "Through an SSH tunnel, open the portal on your tunnel for the box's port 80 "
++                           "(e.g. http://127.0.0.1:<local port>/).\n";
++            } else {
++                std::string to = origin_on_port(req, nullptr) + web::base() + p;
++                if (!req.query.empty()) to += "?" + req.query;
++                res.redirect(to);
++            }
++        } else if (req.method == "GET" && (p == "/modem" || p == "/modem/")) {
++            if (hp == MODEM_PORT) {
++                // The browser already asked for :8081 but a port forward (ours,
++                // left from an older version, or the upstream router's) delivered
++                // it to :80; redirecting again would loop forever. WAN tcp 8081
++                // can't be port-forwarded (store::add_portforward reserves it), and
++                // our DNAT runs before the INPUT accept, so an existing one must go.
++                res.status = "404 Not Found";
++                res.content_type = "text/plain";
++                res.body = std::string("The HaLow modem page is served on port 8081. From the WAN, ") +
++                           (tcp_forwarded(atoi(MODEM_PORT))
++                                ? "delete the WAN tcp 8081 port forward (Network -> Port forwards), then open "
++                                : "open ") +
++                           "tcp 8081 or tcp 80 (Network -> Open ports); a port forward to port 80 can't carry it.\n";
++            } else if (!from_lan(req) && tcp_forwarded(atoi(MODEM_PORT))) {
++                res.status = "404 Not Found";
++                res.content_type = "text/plain";
++                res.body = "WAN tcp 8081 is port-forwarded (the portal reserves it for the modem page); "
++                           "remove that forward (Network -> Port forwards) to use the modem page.\n";
++            } else if (host_is_mapped(req.host, hp, "80")) {
++                res.content_type = "text/html; charset=utf-8";   // 200: let the user choose where the cookie goes
++                std::string url = http::html_escape(origin_on_port(req, MODEM_PORT) + web::base() + "/modem/");
++                res.body = "<!doctype html><title>HaLow modem page</title><p>The HaLow modem page is served on "
++                           "port 8081 of the box, which this address (an SSH tunnel or port mapping) doesn't reach. "
++                           "Through SSH, also forward it: <code>ssh -L 8081:127.0.0.1:8081 root@&lt;box&gt;</code>, "
++                           "then open <a href=\"" + url + "\">" + url + "</a> (adjust the port if you mapped it elsewhere). "
++                           "From the WAN, open tcp 8081 (Network -&gt; Open ports) on the address that reaches the box's port 8081.</p>\n";
++            } else {
++                res.redirect(origin_on_port(req, MODEM_PORT) + web::base() + "/modem/");
++            }
++        } else {
++            res.status = "404 Not Found";
++            res.content_type = "application/json";
++            res.body = "{\"error\":\"not found\"}";
++        }
++        res.send();
++        return 0;
++    }
++
++    // Mutating route, wrong method: refuse before any handler runs.
++    if (is_post_only(p) && req.method != "POST") {
++        res.status = "405 Method Not Allowed";
++        res.headers.push_back("Allow: POST");
++        res.content_type = "application/json";
++        res.body = "{\"error\":\"method not allowed\"}";
++        res.send();
++        return 0;
++    }
++
++    // CSRF: every request that may change state (POST incl. /login and the
++    // /modem/api/* proxy; also any other non-GET/HEAD method) must come from
++    // the portal's own origin. See http::same_origin for the exact rule. Host
++    // was checked to be an IP literal or "localhost" above (host_is_literal):
++    // Origin == Host alone is satisfied by a DNS-rebinding page.
++    if (req.method != "GET" && req.method != "HEAD" && !http::same_origin(req)) {
++        res.status = "403 Forbidden";
++        res.content_type = "application/json";
++        res.body = "{\"error\":\"cross-origin request refused\"}";
++        res.send();
++        return 0;
++    }
++
 +    if      (p == "/login")                      r_login(req, res);
 +    else if (p == "/logout")                     r_logout(req, res);
 +    else if (p == "/")                           routes::dashboard_page(req, res);
@@ -720,21 +1504,23 @@ index 000000000..930c78cd1
 +}
 diff --git a/buildroot/package/rnsbox-portal/src/cgi/nftgen.cpp b/buildroot/package/rnsbox-portal/src/cgi/nftgen.cpp
 new file mode 100644
-index 000000000..fb7f3b91f
+index 000000000..bf67a3db4
 --- /dev/null
 +++ b/buildroot/package/rnsbox-portal/src/cgi/nftgen.cpp
-@@ -0,0 +1,114 @@
-+// nftgen.cpp — see nftgen.h. Native port of nftgen.py; output is byte-identical.
+@@ -0,0 +1,160 @@
++// nftgen.cpp — see nftgen.h. Native port of nftgen.py; the ip filter/nat
++// tables are byte-identical to it, the ip6 filter table was added after.
 +#include "nftgen.h"
 +#include "store.h"
 +#include <cstdio>
 +#include <cstring>
 +#include <map>
 +#include <set>
++#include <unistd.h>
 +
 +namespace nftgen {
 +
-+std::string generate(const std::string& wan, const std::vector<std::string>& lans) {
++std::string generate(const std::string& wan, const std::vector<std::string>& lans, bool with_ipv6) {
 +    auto forwards = store::read_portforwards();
 +    auto openports = store::read_openports();
 +
@@ -769,6 +1555,10 @@ index 000000000..fb7f3b91f
 +    if (!openports.empty()) {
 +        std::map<std::string, std::set<int>> pp;   // proto -> sorted unique ports
 +        for (const auto& op : openports) pp[op.proto].insert(op.port);
++        // The HaLow modem page is the same portal on a second uhttpd port (main.cpp
++        // MODEM_PORT, S81router -p :8081): opening the web UI (tcp 80) on the WAN
++        // opens it too, so the "Open modem web UI" link keeps working from the WAN.
++        if (pp.count("tcp") && pp["tcp"].count(80)) pp["tcp"].insert(8081);
 +        for (const auto& kv : pp) {
 +            std::string ports;
 +            for (auto it = kv.second.begin(); it != kv.second.end(); ++it) {
@@ -810,16 +1600,51 @@ index 000000000..fb7f3b91f
 +    add("\t\toifname \"" + wan + "\" masquerade");
 +    add("\t}");
 +    add("}");
++
++    if (with_ipv6) {
++        // IPv6 is only there for Reticulum's AutoInterface on usb0 (fe80::
++        // link-local + ff12:: multicast; UDP 29716/29717/42671) and S09ipv6
++        // disables it on every non-LAN iface. This table is the second layer:
++        // nothing but lo + the LAN reaches the box over IPv6, nothing is routed.
++        add("");
++        add("table ip6 filter {");
++        add("\tset lan_ifaces { type ifname; elements = { " + lan_set + " } }\n");
++
++        add("\tchain input {");
++        add("\t\ttype filter hook input priority filter; policy drop;");
++        add("\t\tct state invalid drop");
++        add("\t\tct state established,related accept");
++        add("\t\tiifname \"lo\" accept");
++        add("\t\t# neighbour discovery + MLD (multicast group joins) on the LAN;");
++        add("\t\t# conntrack leaves these untracked, so they need an explicit accept");
++        add("\t\tiifname @lan_ifaces icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, "
++            "mld-listener-query, mld-listener-report, mld-listener-done, mld2-listener-report } accept");
++        add("\t\t# LAN: full surface (Reticulum AutoInterface discovery/data, SSH, ...)");
++        add("\t\tiifname @lan_ifaces accept");
++        add("\t}\n");
++
++        add("\tchain forward {");
++        add("\t\ttype filter hook forward priority filter; policy drop;");
++        add("\t}\n");
++
++        add("\tchain output { type filter hook output priority filter; policy accept; }");
++        add("}");
++    }
 +    return L;
 +}
 +
 +int cli_main(int argc, char** argv) {
 +    std::string wan, lan = "usb0";
++    // ip6 table only on a kernel that has IPv6 (the rootfs can outlive the
++    // kernel it shipped with) — nft would reject `table ip6` otherwise and
++    // S60routing's nft -c would throw away the whole ruleset.
++    bool v6 = access("/proc/sys/net/ipv6", F_OK) == 0;
 +    for (int i = 2; i < argc; ++i) {   // argv[1] == "nftgen"
 +        if (!strcmp(argv[i], "--wan") && i + 1 < argc) wan = argv[++i];
 +        else if (!strcmp(argv[i], "--lan") && i + 1 < argc) lan = argv[++i];
++        else if (!strcmp(argv[i], "--no-ipv6")) v6 = false;
 +    }
-+    if (wan.empty()) { fprintf(stderr, "usage: rnsbox-portal nftgen --wan <iface> [--lan a,b]\n"); return 2; }
++    if (wan.empty()) { fprintf(stderr, "usage: rnsbox-portal nftgen --wan <iface> [--lan a,b] [--no-ipv6]\n"); return 2; }
 +    std::vector<std::string> lans;
 +    size_t i = 0;
 +    while (i < lan.size()) {
@@ -832,23 +1657,31 @@ index 000000000..fb7f3b91f
 +        if (a != std::string::npos) lans.push_back(t.substr(a, b - a + 1));
 +        i = c + 1;
 +    }
-+    std::string out = generate(wan, lans);
-+    fwrite(out.data(), 1, out.size(), stdout);
++    std::string out = generate(wan, lans, v6);
++    // S60routing trusts this exit status: a short write (ENOSPC) must fail,
++    // or an empty file passes `nft -c` (empty batch) and gets installed.
++    if (fwrite(out.data(), 1, out.size(), stdout) != out.size() || fflush(stdout) != 0) {
++        perror("nftgen: write");
++        return 1;
++    }
 +    return 0;
 +}
 +
 +}  // namespace nftgen
 diff --git a/buildroot/package/rnsbox-portal/src/cgi/nftgen.h b/buildroot/package/rnsbox-portal/src/cgi/nftgen.h
 new file mode 100644
-index 000000000..3316725d9
+index 000000000..82bf77889
 --- /dev/null
 +++ b/buildroot/package/rnsbox-portal/src/cgi/nftgen.h
-@@ -0,0 +1,20 @@
+@@ -0,0 +1,26 @@
 +// nftgen.h — nftables ruleset generator (native port of nftgen.py).
 +// Single source of truth for /etc/nftables.conf, used two ways:
 +//   - the portal's apply path (config change), and
 +//   - the boot path: `rnsbox-portal nftgen --wan eth0 --lan usb0[,wlan1]`
 +//     invoked by /etc/init.d/S60routing.
++// Emits `table ip filter` + `table ip nat` (the router) and, when with_ipv6,
++// a drop-policy `table ip6 filter` that only admits the LAN ifaces (IPv6 is
++// there solely for Reticulum's AutoInterface link-local traffic on usb0).
 +#ifndef RNSBOX_NFTGEN_H
 +#define RNSBOX_NFTGEN_H
 +
@@ -857,19 +1690,22 @@ index 000000000..3316725d9
 +
 +namespace nftgen {
 +
-+std::string generate(const std::string& wan_iface, const std::vector<std::string>& lan_ifaces);
++std::string generate(const std::string& wan_iface, const std::vector<std::string>& lan_ifaces,
++                     bool with_ipv6 = true);
 +
-+// CLI: parse --wan/--lan from argv, print the ruleset to stdout. Returns exit code.
++// CLI: parse --wan/--lan[/--no-ipv6] from argv, print the ruleset to stdout.
++// The ip6 table is emitted only if the kernel has IPv6 (/proc/sys/net/ipv6)
++// and --no-ipv6 wasn't given. Returns exit code.
 +int cli_main(int argc, char** argv);
 +
 +}  // namespace nftgen
 +#endif
 diff --git a/buildroot/package/rnsbox-portal/src/cgi/pages/base.html b/buildroot/package/rnsbox-portal/src/cgi/pages/base.html
 new file mode 100644
-index 000000000..641aff9c0
+index 000000000..32ef813c0
 --- /dev/null
 +++ b/buildroot/package/rnsbox-portal/src/cgi/pages/base.html
-@@ -0,0 +1,40 @@
+@@ -0,0 +1,43 @@
 +<!doctype html>
 +<html lang="en">
 +<head>
@@ -887,7 +1723,10 @@ index 000000000..641aff9c0
 +  </div>
 +  <nav class="topnav">
 +    <span class="user">__USER__</span>
-+    <a class="logout" href="__BASE__/logout">Logout</a>
++    <!-- POST form, not a link: /logout is POST-only (a GET must not change state) -->
++    <form class="logout-form" method="post" action="__BASE__/logout">
++      <button type="submit" class="logout">Logout</button>
++    </form>
 +  </nav>
 +</header>
 +<div class="page">
@@ -912,10 +1751,10 @@ index 000000000..641aff9c0
 +</html>
 diff --git a/buildroot/package/rnsbox-portal/src/cgi/pages/dashboard.html b/buildroot/package/rnsbox-portal/src/cgi/pages/dashboard.html
 new file mode 100644
-index 000000000..847919685
+index 000000000..c5049831a
 --- /dev/null
 +++ b/buildroot/package/rnsbox-portal/src/cgi/pages/dashboard.html
-@@ -0,0 +1,128 @@
+@@ -0,0 +1,131 @@
 +<div class="dash-head">
 +  <h2>Dashboard</h2>
 +  <div class="autoref">
@@ -986,6 +1825,9 @@ index 000000000..847919685
 +  function $(id){ return document.getElementById(id); }
 +  function setText(id,t){ var e=$(id); if(e) e.textContent=t; }
 +  function setHTML(id,h){ var e=$(id); if(e) e.innerHTML=h; }
++  // Everything dynamic that goes through setHTML() is escaped with esc() first
++  // (the JSON carries iface state, update versions from PyPI, etc.).
++  function esc(s){ return (''+(s==null?'':s)).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); }
 +  function patch(d){
 +    var s=d.sys||{}, m=s.mem||{}, wif=d.wan_if||{}, lif=d.lan_if||{}, rn=d.rnsd||{}, up=d.update||{};
 +    setText('d-uptime', s.uptime||'');
@@ -996,26 +1838,26 @@ index 000000000..847919685
 +      var f=$('d-ram-fill'); if(f){ f.style.width=pct+'%'; f.className='meter-fill '+(pct>=90?'crit':pct>=75?'warn':'ok'); }
 +      setText('d-ram-note', pct+'% used · '+m.buffcache_mb+' MB buff/cache (reclaimable)');
 +    }
-+    setHTML('d-wan-state', wif.state==='up'?'<span class="badge ok">UP</span>':'<span class="badge err">'+(wif.state||'DOWN')+'</span>');
++    setHTML('d-wan-state', wif.state==='up'?'<span class="badge ok">UP</span>':'<span class="badge err">'+esc(wif.state||'DOWN')+'</span>');
 +    setText('d-wan-addr', (wif.addrs&&wif.addrs.length)?wif.addrs.join(', '):'(none)');
 +    setText('d-wan-gw', d.gateway||'(none)');
 +    setText('d-wan-dns', (d.dns&&d.dns.length)?d.dns.join(', '):'(none)');
 +    setText('d-wan-rxtx', (wif.rx||'0')+' / '+(wif.tx||'0'));
 +    if($('d-lan-state')){
-+      setHTML('d-lan-state', lif.state==='up'?'<span class="badge ok">UP</span>':'<span class="badge warn">'+(lif.state||'DOWN')+'</span>');
++      setHTML('d-lan-state', lif.state==='up'?'<span class="badge ok">UP</span>':'<span class="badge warn">'+esc(lif.state||'DOWN')+'</span>');
 +      setText('d-lan-addr', (lif.addrs&&lif.addrs.length)?lif.addrs.join(', '):'(none)');
 +      setText('d-lan-rxtx', (lif.rx||'0')+' / '+(lif.tx||'0'));
 +    }
 +    setHTML('d-rnsd-status', rn.running
-+      ? '<span class="badge ok">RUNNING</span> (pid '+rn.pid+')'+(rn.rss_mb?' · '+rn.rss_mb+' MB RSS':'')
++      ? '<span class="badge ok">RUNNING</span> (pid '+esc(rn.pid)+')'+(rn.rss_mb?' · '+esc(rn.rss_mb)+' MB RSS':'')
 +      : '<span class="badge err">STOPPED</span>');
-+    var vh='Reticulum (rnsd) <strong>'+(up.installed||'unknown')+'</strong>';
-+    if(up.update_available) vh+=' <span class="badge warn">update available: '+up.latest+'</span>';
++    var vh='Reticulum (rnsd) <strong>'+esc(up.installed||'unknown')+'</strong>';
++    if(up.update_available) vh+=' <span class="badge warn">update available: '+esc(up.latest)+'</span>';
 +    else if(up.latest && !up.error) vh+=' <span class="badge ok">up to date</span>';
 +    setHTML('d-rnsd-version', vh);
 +  }
 +  function refreshData(){
-+    return fetch('__BASE__/dashboard/data').then(function(r){return r.json();}).then(patch).catch(function(){});
++    return fetch('__BASE__/dashboard/data').then(function(r){return r.json();}).then(function(d){ if(d && !d.error) patch(d); }).catch(function(){});
 +  }
 +  var sel=$('autoref'), timer=null, KEY='rnsbox-autoref';
 +  function tick(){
@@ -1091,12 +1933,12 @@ index 000000000..8f75d1e7e
 +</html>
 diff --git a/buildroot/package/rnsbox-portal/src/cgi/pages/network.html b/buildroot/package/rnsbox-portal/src/cgi/pages/network.html
 new file mode 100644
-index 000000000..ef2618131
+index 000000000..56add6596
 --- /dev/null
 +++ b/buildroot/package/rnsbox-portal/src/cgi/pages/network.html
 @@ -0,0 +1,118 @@
 +<h2>Network</h2>
-+<p class="muted">WAN: <strong>__WAN__</strong> &middot; LAN: <strong>usb0</strong> &middot; default gateway: <strong>__GATEWAY__</strong></p>
++<p class="muted">WAN: <strong>__WAN__</strong> &middot; LAN: <strong>__LAN__</strong> &middot; default gateway: <strong>__GATEWAY__</strong></p>
 +
 +<section class="card">
 +  <h3>WAN uplink</h3>
@@ -1169,7 +2011,7 @@ index 000000000..ef2618131
 +
 +<section class="card">
 +  <h3>Open ports (services on this router exposed on WAN)</h3>
-+  <p class="muted">Allows inbound connections on the WAN to services bound on this device. <strong>SSH (22)</strong> and the <strong>web UI (80)</strong> are open by default &mdash; remove them to close WAN access (the LAN/<code>usb0</code> side always stays open). Add rnsd's TCPServerInterface port (4242) here for external Reticulum peers.</p>
++  <p class="muted">Allows inbound connections on the WAN to services bound on this device. <strong>SSH (22)</strong> and the <strong>web UI (80)</strong> are open by default (the web UI also carries the HaLow modem page on 8081) &mdash; remove them to close WAN access (the LAN side &mdash; <code>usb0</code>, plus the WiFi hotspot while it is on &mdash; always stays open). Add rnsd's TCPServerInterface port (4242) here for external Reticulum peers.</p>
 +  <table class="data">
 +    <thead>
 +      <tr><th>Proto</th><th>Port</th><th>Comment</th><th></th></tr>
@@ -1215,10 +2057,10 @@ index 000000000..ef2618131
 +</section>
 diff --git a/buildroot/package/rnsbox-portal/src/cgi/pages/wifi.html b/buildroot/package/rnsbox-portal/src/cgi/pages/wifi.html
 new file mode 100644
-index 000000000..fddb1daee
+index 000000000..a81eb9402
 --- /dev/null
 +++ b/buildroot/package/rnsbox-portal/src/cgi/pages/wifi.html
-@@ -0,0 +1,129 @@
+@@ -0,0 +1,151 @@
 +<h2>WiFi</h2>
 +
 +<section class="card">
@@ -1256,8 +2098,8 @@ index 000000000..fddb1daee
 +    <tbody></tbody>
 +  </table>
 +  <form method="post" action="__BASE__/wifi/connect" class="row-form" style="margin-top:10px">
-+    <input name="ssid" id="ssid" type="text" placeholder="SSID" value="__STA_SSID__" required>
-+    <input name="psk" id="sta_psk" type="password" placeholder="password (blank = open)">
++    <input name="ssid" id="ssid" type="text" placeholder="SSID" value="__STA_SSID__" maxlength="32" required>
++    <input name="psk" id="sta_psk" type="password" placeholder="password (blank = open)" minlength="8" maxlength="63">
 +    <button type="button" class="btn" onclick="togglePw('sta_psk', this)">Show</button>
 +    <button type="submit" class="btn-primary">Connect</button>
 +  </form>
@@ -1268,13 +2110,17 @@ index 000000000..fddb1daee
 +  <p class="muted">Runs concurrently with the client connection (AIC8800
 +  single radio, time-shared). AP clients are NAT'd to the WAN and get DHCP
 +  from the AP subnet in <code>/etc/rnsbox/wifi.conf</code>.</p>
++  __AP_PSK_NOTE__
 +  <form method="post" action="__BASE__/wifi/ap">
 +    <label><input type="checkbox" name="ap_enable" __AP_ENABLE_CHECKED__> Enable hotspot</label>
-+    <label>SSID <input type="text" name="ap_ssid" value="__AP_SSID__"></label>
-+    <label>Password (≥8 chars)
-+      <input type="password" id="ap_psk" name="ap_psk" value="__AP_PSK__">
++    <label>SSID <input type="text" name="ap_ssid" value="__AP_SSID__" maxlength="32"></label>
++    <label>Password (8–63 characters — required to enable the hotspot)
++      <input type="password" id="ap_psk" name="ap_psk" value="__AP_PSK__" minlength="8" maxlength="63" autocomplete="new-password">
 +      <button type="button" class="btn" onclick="togglePw('ap_psk', this)">Show</button>
 +    </label>
++    <p class="muted">The hotspot ships with <strong>no password</strong> and stays off
++    until you choose one: 8–63 printable ASCII characters, without <code>#</code> or
++    <code>"</code>. The old published default <code>changeme123</code> is refused.</p>
 +    <label>Channel__AP_CHANNEL_LOCK__
 +      <select name="ap_channel" __AP_CHANNEL_DISABLED__>
 +        __AP_CHANNEL_OPTIONS__
@@ -1316,7 +2162,7 @@ index 000000000..fddb1daee
 +
 +<script>
 +// True when the box is in concurrent sta+ap mode: the client is 2.4 GHz-only,
-+// so 5 GHz scan results are shown but not selectable.
++// so 5/6 GHz scan results are shown but not selectable.
 +var CONCURRENT = __CONCURRENT_JS__;
 +// Show/hide a password field. Flips the input type and the button label.
 +function togglePw(id, btn){
@@ -1327,40 +2173,60 @@ index 000000000..fddb1daee
 +}
 +function doScan(){
 +  var msg=document.getElementById('scanmsg'); msg.textContent='scanning…';
-+  fetch('__BASE__/wifi/scan').then(r=>r.json()).then(function(nets){
++  fetch('__BASE__/wifi/scan').then(function(r){
++    if(r.status===401) throw new Error('session expired — please log in again');
++    return r.json();
++  }).then(function(nets){
 +    var tbl=document.getElementById('scantbl'), tb=tbl.querySelector('tbody');
-+    tb.innerHTML='';
-+    if(!nets.length){ msg.textContent='no networks found'; return; }
++    while(tb.firstChild) tb.removeChild(tb.firstChild);
++    if(!Array.isArray(nets) || !nets.length){ msg.textContent='no networks found'; return; }
 +    msg.textContent=nets.length+' found'; tbl.style.display='';
++    // Built with DOM nodes + textContent ONLY: SSIDs come from anyone in radio
++    // range and iw prints < > " ' verbatim, so no scan field may ever reach
++    // innerHTML.
++    function td(tr, text){ var c=document.createElement('td'); c.textContent=text; tr.appendChild(c); return c; }
 +    nets.forEach(function(n){
 +      var tr=document.createElement('tr');
 +      var band=n.band?(n.band+' GHz'):'';
-+      var block5=CONCURRENT && n.band==='5';   // 5 GHz not joinable while concurrent
-+      var btn=block5
-+        ? '<span class="muted" title="2.4 GHz only in concurrent mode">5&nbsp;GHz</span>'
-+        : '<button type="button" class="btn">Use</button>';
-+      tr.innerHTML='<td>'+(n.ssid||'(hidden)')+'</td><td>'+n.signal+' dBm</td><td>'+
-+        (n.channel||'')+'</td><td>'+band+'</td><td>'+n.security+'</td><td>'+btn+'</td>';
-+      if(block5){ tr.style.opacity='0.45'; }
-+      else { tr.querySelector('button').onclick=function(){ document.getElementById('ssid').value=n.ssid; }; }
++      // 5/6 GHz not joinable while concurrent (the STA is pinned to 2.4 GHz)
++      var blockHi=CONCURRENT && (n.band==='5' || n.band==='6');
++      td(tr, n.ssid||'(hidden)');
++      td(tr, (n.signal||'?')+' dBm');
++      td(tr, n.channel||'');
++      td(tr, band);
++      td(tr, n.security||'');
++      var last=td(tr, '');
++      if(blockHi){
++        var s=document.createElement('span');
++        s.className='muted'; s.title='2.4 GHz only in concurrent mode'; s.textContent=band;
++        last.appendChild(s);
++        tr.style.opacity='0.45';
++      } else {
++        var b=document.createElement('button');
++        b.type='button'; b.className='btn'; b.textContent='Use';
++        b.onclick=function(){ document.getElementById('ssid').value=n.ssid||''; };
++        last.appendChild(b);
++      }
 +      tb.appendChild(tr);
 +    });
-+  }).catch(function(){ msg.textContent='scan failed'; });
++  }).catch(function(e){ msg.textContent=(e && e.message && /session/.test(e.message)) ? e.message : 'scan failed'; });
 +}
 +</script>
 \ No newline at end of file
 diff --git a/buildroot/package/rnsbox-portal/src/cgi/render.cpp b/buildroot/package/rnsbox-portal/src/cgi/render.cpp
 new file mode 100644
-index 000000000..44d1a6cdf
+index 000000000..3308c8fe6
 --- /dev/null
 +++ b/buildroot/package/rnsbox-portal/src/cgi/render.cpp
-@@ -0,0 +1,99 @@
+@@ -0,0 +1,127 @@
 +// render.cpp — see render.h.
 +#include "render.h"
 +#include "web.h"
 +#include "session.h"
 +#include "util.h"
 +#include <cstdlib>
++#include <utility>
++#include <vector>
 +
 +namespace {
 +
@@ -1385,8 +2251,30 @@ index 000000000..44d1a6cdf
 +    return o;
 +}
 +
-+std::string all(std::string s, const std::string& from, const std::string& to) {
-+    return web::replace_all(std::move(s), from, to);
++// Single-pass token fill for the chrome templates. Tokens are matched in the
++// template text only — never inside an inserted value — so a value that itself
++// contains a token (e.g. the valid hostname "__CONTENT__", or a flash message
++// echoing an SSID "__FLASH__") is emitted literally instead of being expanded
++// again, as chained replace_all() calls would.
++typedef std::vector<std::pair<std::string, std::string>> Tokens;
++
++std::string fill(const std::string& t, const Tokens& kv) {
++    std::string o;
++    size_t n = t.size();
++    for (const auto& e : kv) n += e.second.size();
++    o.reserve(n);
++    size_t i = 0;
++    while (i < t.size()) {
++        size_t p = t.find("__", i);
++        if (p == std::string::npos) { o.append(t, i, std::string::npos); break; }
++        o.append(t, i, p - i);
++        const std::pair<std::string, std::string>* hit = nullptr;
++        for (const auto& e : kv)
++            if (t.compare(p, e.first.size(), e.first) == 0) { hit = &e; break; }
++        if (hit) { o += hit->second; i = p + hit->first.size(); }
++        else     { o += '_'; i = p + 1; }   // step one char so "___X__" still finds "__X__"
++    }
++    return o;
 +}
 +
 +// Read + clear the one-shot flash cookie; returns the rendered <div> (or "").
@@ -1418,31 +2306,35 @@ index 000000000..44d1a6cdf
 +    std::string host = util::trim(util::read_file("/proc/sys/kernel/hostname", 128));
 +    session::Info s = session::check(req.cookie(session::COOKIE_NAME));
 +
-+    std::string h = page_file("base");
-+    h = all(std::move(h), "__BASE__", web::base());
-+    h = all(std::move(h), "__TITLE__", esc(title));
-+    h = all(std::move(h), "__HOSTNAME__", esc(host));
-+    h = all(std::move(h), "__USER__", esc(s.user));
++    // Every value except CONTENT (the route's own, already-escaped HTML) is
++    // escaped here. BASE is uhttpd's SCRIPT_NAME (not client-controlled, and
++    // unchanged by esc() for a normal path) — escaped anyway, it lands in attrs.
++    Tokens kv = {
++        {"__BASE__",     esc(web::base())},
++        {"__TITLE__",    esc(title)},
++        {"__HOSTNAME__", esc(host)},
++        {"__USER__",     esc(s.user)},
++    };
 +    // Active-nav: exactly one id gets "active", the rest collapse to "".
 +    static const char* ids[] = {"dashboard", "network", "wifi", "reticulum", "settings", "donate"};
-+    for (const char* id : ids) {
-+        std::string tok = std::string("__ACT_") + id + "__";
-+        h = all(std::move(h), tok, (active && std::string(active) == id) ? "active" : "");
-+    }
-+    h = all(std::move(h), "__FLASH__", take_flash(req, res));
-+    h = all(std::move(h), "__CONTENT__", content);
-+    return h;
++    for (const char* id : ids)
++        kv.push_back({std::string("__ACT_") + id + "__",
++                      (active && std::string(active) == id) ? "active" : ""});
++    kv.push_back({"__FLASH__", take_flash(req, res)});
++    kv.push_back({"__CONTENT__", content});
++    return fill(page_file("base"), kv);
 +}
 +
 +std::string login_layout(const http::Request& req, http::Response& res,
 +                         const std::string& content) {
 +    std::string host = util::trim(util::read_file("/proc/sys/kernel/hostname", 128));
-+    std::string h = page_file("login_base");
-+    h = all(std::move(h), "__BASE__", web::base());
-+    h = all(std::move(h), "__HOSTNAME__", esc(host));
-+    h = all(std::move(h), "__FLASH__", take_flash(req, res));
-+    h = all(std::move(h), "__CONTENT__", content);
-+    return h;
++    Tokens kv = {
++        {"__BASE__",     esc(web::base())},
++        {"__HOSTNAME__", esc(host)},
++        {"__FLASH__",    take_flash(req, res)},
++        {"__CONTENT__",  content},
++    };
++    return fill(page_file("login_base"), kv);
 +}
 +
 +void redirect_flash(http::Response& res, const std::string& location,
@@ -1456,10 +2348,10 @@ index 000000000..44d1a6cdf
 +}  // namespace render
 diff --git a/buildroot/package/rnsbox-portal/src/cgi/render.h b/buildroot/package/rnsbox-portal/src/cgi/render.h
 new file mode 100644
-index 000000000..db6499521
+index 000000000..490d2cff5
 --- /dev/null
 +++ b/buildroot/package/rnsbox-portal/src/cgi/render.h
-@@ -0,0 +1,43 @@
+@@ -0,0 +1,45 @@
 +// render.h — server-side page rendering: base chrome, flash messages, PRG.
 +//
 +// The portal renders full HTML server-side (like the old Flask/Jinja app),
@@ -1486,8 +2378,10 @@ index 000000000..db6499521
 +// Wrap `content` in the base chrome (topbar + sidebar + footer). `active` is the
 +// sidebar id to highlight: "dashboard" | "network" | "wifi" | "reticulum" |
 +// "settings" | "donate". Consumes + clears the one-shot flash cookie (rendering
-+// it above the content) and sets the clearing Set-Cookie on `res`. `title` and
-+// the session user are HTML-escaped.
++// it above the content) and sets the clearing Set-Cookie on `res`. Every chrome
++// value except `content` (title, hostname, session user, flash text) is
++// HTML-escaped here, and tokens are filled in one pass — a value containing
++// "__SOMETHING__" is never expanded again.
 +std::string layout(const http::Request& req, http::Response& res,
 +                   const std::string& title, const char* active,
 +                   const std::string& content);
@@ -1572,10 +2466,10 @@ index 000000000..ac8300cba
 +#endif
 diff --git a/buildroot/package/rnsbox-portal/src/cgi/routes_dash.cpp b/buildroot/package/rnsbox-portal/src/cgi/routes_dash.cpp
 new file mode 100644
-index 000000000..1988c44ee
+index 000000000..d39964fde
 --- /dev/null
 +++ b/buildroot/package/rnsbox-portal/src/cgi/routes_dash.cpp
-@@ -0,0 +1,272 @@
+@@ -0,0 +1,275 @@
 +// routes_dash.cpp — Dashboard tab (the login landing page): server-rendered
 +// summary + a compact JSON endpoint (/dashboard/data) for the client-side
 +// auto-refresh. Ports the old Flask dashboard()/dashboard_data() faithfully.
@@ -1660,7 +2554,9 @@ index 000000000..1988c44ee
 +static std::string halow_script_html(const std::string& base) {
 +    std::string s = R"JS(<script>
 +(function(){
-+  function esc(s){ return (''+(s==null?'':s)).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];}); }
++  // Every modem-supplied string (hostname, fw, speeds…) goes through esc()
++  // before innerHTML; numbers only via num()/unit(), which admit digits only.
++  function esc(s){ return (''+(s==null?'':s)).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); }
 +  function num(v){ if(v==null) return null; var m=(''+v).match(/-?\d+(\.\d+)?/); return m?parseFloat(m[0]):null; }
 +  function unit(v,u){ if(v==null||v==='') return '?'; return /^-?\d+(\.\d+)?$/.test(''+v)? v+' '+u : esc(v); }
 +  function sig(v,u,g,a){ if(v==null) return '<span class="muted">—</span>'; var c=v>=g?'sig-g':(v>=a?'sig-a':'sig-r'); return '<span class="'+c+'">'+v+' '+u+'</span>'; }
@@ -1670,6 +2566,7 @@ index 000000000..1988c44ee
 +    var badge=document.getElementById('halow-badge'), body=document.getElementById('halow-body');
 +    if(!badge) return;
 +    return fetch('__BASE__/reticulum/halow').then(function(r){return r.json();}).then(function(d){
++      if(d.error){ badge.className='badge warn'; badge.textContent='login expired'; return; }   // 401 JSON
 +      if(!d.enabled){ var c=document.getElementById('halow-card'); if(c) c.hidden=true; return; }
 +      if(!d.reachable){
 +        badge.className='badge '+(d.sl0_up?'err':'warn');
@@ -1850,10 +2747,10 @@ index 000000000..1988c44ee
 +}  // namespace routes
 diff --git a/buildroot/package/rnsbox-portal/src/cgi/routes_net.cpp b/buildroot/package/rnsbox-portal/src/cgi/routes_net.cpp
 new file mode 100644
-index 000000000..d5eb54987
+index 000000000..ff30a015b
 --- /dev/null
 +++ b/buildroot/package/rnsbox-portal/src/cgi/routes_net.cpp
-@@ -0,0 +1,200 @@
+@@ -0,0 +1,207 @@
 +// routes_net.cpp — Network tab: server-rendered page + POST-redirect-GET forms.
 +#include "routes.h"
 +#include "render.h"
@@ -1886,6 +2783,11 @@ index 000000000..d5eb54987
 +    std::string h = render::page_file("network");
 +    h = R(std::move(h), "__BASE__", base);
 +    h = R(std::move(h), "__WAN__", E(w.interface));
++    // Real LAN set (usb0 + the hotspot iface while it's up) — the same list
++    // nftables treats as the full-access management side.
++    std::string lan;
++    for (const auto& l : sysinfo::lan_ifaces()) { if (!lan.empty()) lan += ", "; lan += E(l); }
++    h = R(std::move(h), "__LAN__", lan);
 +    h = R(std::move(h), "__GATEWAY__", net.default_gateway.empty() ? "(none)" : E(net.default_gateway));
 +    h = R(std::move(h), "__SEL_ETH0__",  w.interface == "eth0"  ? "selected" : "");
 +    h = R(std::move(h), "__SEL_WLAN0__", w.interface == "wlan0" ? "selected" : "");
@@ -1921,7 +2823,8 @@ index 000000000..d5eb54987
 +    rows.clear();
 +    auto ops = store::read_openports();
 +    if (ops.empty()) {
-+        rows = "<tr><td colspan=\"4\" class=\"muted\">No open ports &mdash; WAN access is closed (the LAN/usb0 side stays open).</td></tr>";
++        rows = "<tr><td colspan=\"4\" class=\"muted\">No open ports &mdash; WAN access is closed (the LAN side &mdash; " +
++               lan + " &mdash; stays open).</td></tr>";
 +    } else {
 +        for (size_t i = 0; i < ops.size(); ++i) {
 +            const auto& o = ops[i];
@@ -1934,19 +2837,6 @@ index 000000000..d5eb54987
 +        }
 +    }
 +    h = R(std::move(h), "__OPENPORTS_ROWS__", rows);
-+
-+    // DHCP leases
-+    rows.clear();
-+    auto leases = sysinfo::dnsmasq_leases();
-+    if (leases.empty()) {
-+        rows = "<tr><td colspan=\"4\" class=\"muted\">No active leases.</td></tr>";
-+    } else {
-+        for (const auto& l : leases) {
-+            rows += "<tr><td>" + E(l.ip) + "</td><td><code>" + E(l.mac) + "</code></td>"
-+                    "<td>" + E(l.name) + "</td><td>" + E(l.expires) + "</td></tr>";
-+        }
-+    }
-+    h = R(std::move(h), "__LEASES_ROWS__", rows);
 +
 +    // All interfaces
 +    rows.clear();
@@ -1961,6 +2851,20 @@ index 000000000..d5eb54987
 +                "<td>" + E(i.mtu) + "</td><td>" + E(i.rx) + " / " + E(i.tx) + "</td></tr>";
 +    }
 +    h = R(std::move(h), "__IFACES_ROWS__", rows);
++
++    // DHCP leases — substituted LAST: the names come from LAN clients, and a
++    // hostname spelled like a __TOKEN__ must not get expanded by a later pass.
++    rows.clear();
++    auto leases = sysinfo::dnsmasq_leases();
++    if (leases.empty()) {
++        rows = "<tr><td colspan=\"4\" class=\"muted\">No active leases.</td></tr>";
++    } else {
++        for (const auto& l : leases) {
++            rows += "<tr><td>" + E(l.ip) + "</td><td><code>" + E(l.mac) + "</code></td>"
++                    "<td>" + E(l.name) + "</td><td>" + E(l.expires) + "</td></tr>";
++        }
++    }
++    h = R(std::move(h), "__LEASES_ROWS__", rows);
 +
 +    res.body = render::layout(req, res, "Network", "network", h);
 +}
@@ -2056,10 +2960,10 @@ index 000000000..d5eb54987
 +}  // namespace routes
 diff --git a/buildroot/package/rnsbox-portal/src/cgi/routes_wifi.cpp b/buildroot/package/rnsbox-portal/src/cgi/routes_wifi.cpp
 new file mode 100644
-index 000000000..402bd3089
+index 000000000..085532141
 --- /dev/null
 +++ b/buildroot/package/rnsbox-portal/src/cgi/routes_wifi.cpp
-@@ -0,0 +1,243 @@
+@@ -0,0 +1,329 @@
 +// routes_wifi.cpp — WiFi tab: server-rendered page + PRG forms + scan/status JSON.
 +#include "routes.h"
 +#include "render.h"
@@ -2165,7 +3069,7 @@ index 000000000..402bd3089
 +    if (concurrent) {
 +        note = "<p class=\"muted\">Concurrent mode is on, so the client is restricted to\n"
 +               "  <strong>2.4&nbsp;GHz</strong> networks (same radio as the hotspot).\n"
-+               "  5&nbsp;GHz networks are shown greyed out — they can't be joined until you\n"
++               "  5/6&nbsp;GHz networks are shown greyed out — they can't be joined until you\n"
 +               "  switch to <em>Client only</em> mode.</p>";
 +    }
 +    h = R(std::move(h), "__CONCURRENT_NOTE__", note);
@@ -2176,6 +3080,14 @@ index 000000000..402bd3089
 +    h = R(std::move(h), "__AP_ENABLE_CHECKED__", (m == "ap" || m == "sta+ap") ? "checked" : "");
 +    h = R(std::move(h), "__AP_SSID__", E(cfg["ap_ssid"]));
 +    h = R(std::move(h), "__AP_PSK__",  E(cfg["ap_psk"]));
++    // Mode says hotspot-on but S35wifi refuses a weak PSK (e.g. a box still on
++    // the old 'changeme123' default) — explain the missing AP.
++    std::string psk_note;
++    if ((m == "ap" || m == "sta+ap") && !wifi::ap_psk_ok(cfg["ap_psk"]))
++        psk_note = "<div class=\"flash warn\">The hotspot is switched on but is <strong>not running</strong>:\n"
++                   "  its password is empty, too short, or the old published default\n"
++                   "  <code>changeme123</code>. Set a new one below and apply.</div>";
++    h = R(std::move(h), "__AP_PSK_NOTE__", psk_note);
 +
 +    std::string lock = concurrent ? " <span class=\"muted\">(locked — follows client link)</span>" : "";
 +    h = R(std::move(h), "__AP_CHANNEL_LOCK__", lock);
@@ -2225,6 +3137,21 @@ index 000000000..402bd3089
 +
 +// ---- POST-redirect-GET handlers ----
 +
++// Shared error text for an SSID/password wifi.conf can't store (see
++// wifi::conf_value_ok): nothing is written when this fires.
++static const char* BAD_FIELD_MSG =
++    "SSID and password must not contain line breaks, control characters, '#' or '\"', "
++    "or start/end with a space (the WiFi config file can't store them)";
++
++// Why the hotspot can't be switched on with this stored/typed PSK ("" = OK).
++static std::string ap_psk_problem(const std::string& psk) {
++    if (psk == wifi::OLD_DEFAULT_AP_PSK)
++        return "'changeme123' was the published factory default — choose your own hotspot password (8-63 characters)";
++    if (!wifi::ap_psk_ok(psk))
++        return "The hotspot needs a password of 8-63 printable ASCII characters";
++    return "";
++}
++
 +void wifi_connect(const Request& req, Response& res) {
 +    if (!web::require_auth(req, res, false)) return;
 +    std::string ssid = util::trim(req.f("ssid"));
@@ -2233,11 +3160,33 @@ index 000000000..402bd3089
 +        render::redirect_flash(res, wifi_redirect(), "error", "SSID required");
 +        return;
 +    }
++    if (!wifi::conf_value_ok(ssid) || !wifi::conf_value_ok(psk)) {
++        render::redirect_flash(res, wifi_redirect(), "error", BAD_FIELD_MSG);
++        return;
++    }
++    if (ssid.size() > 32) {
++        render::redirect_flash(res, wifi_redirect(), "error", "SSID is at most 32 bytes");
++        return;
++    }
++    if (!psk.empty() && (psk.size() < 8 || psk.size() > 63)) {   // wpa_supplicant rejects these
++        render::redirect_flash(res, wifi_redirect(), "error",
++            "WiFi password must be 8-63 characters (leave it blank for an open network)");
++        return;
++    }
 +    auto cur = wifi::read_conf();
 +    std::string mode = (cur["mode"] == "ap" || cur["mode"] == "sta+ap") ? "sta+ap" : "sta";
-+    wifi::write_conf({{"mode", mode}, {"sta_ssid", ssid}, {"sta_psk", psk}});
++    if (!wifi::write_conf({{"mode", mode}, {"sta_ssid", ssid}, {"sta_psk", psk}})) {
++        render::redirect_flash(res, wifi_redirect(), "error", "Could not save the WiFi config");
++        return;
++    }
 +    wifi::apply();
-+    render::redirect_flash(res, wifi_redirect(), "success", "Connecting to '" + ssid + "'…");
++    // Joining still works with a weak stored hotspot PSK — S35wifi just keeps
++    // the AP off (and logs why). Say so instead of a silent missing hotspot.
++    if (mode == "sta+ap" && !wifi::ap_psk_ok(cur["ap_psk"]))
++        render::redirect_flash(res, wifi_redirect(), "warn",
++            "Connecting to '" + ssid + "'… The hotspot stays off until you set a hotspot password (8-63 characters) below.");
++    else
++        render::redirect_flash(res, wifi_redirect(), "success", "Connecting to '" + ssid + "'…");
 +}
 +
 +void wifi_ap(const Request& req, Response& res) {
@@ -2245,8 +3194,23 @@ index 000000000..402bd3089
 +    std::string ssid = util::trim(req.f("ap_ssid"));
 +    std::string psk = req.f("ap_psk");
 +    bool enable = req.f("ap_enable") == "on";
-+    if (enable && (ssid.empty() || psk.size() < 8)) {
-+        render::redirect_flash(res, wifi_redirect(), "error", "AP needs an SSID and a password of at least 8 chars");
++    if (!wifi::conf_value_ok(ssid) || !wifi::conf_value_ok(psk)) {
++        render::redirect_flash(res, wifi_redirect(), "error", BAD_FIELD_MSG);
++        return;
++    }
++    if (ssid.size() > 32) {
++        render::redirect_flash(res, wifi_redirect(), "error", "Hotspot SSID is at most 32 bytes");
++        return;
++    }
++    if (enable && ssid.empty()) {
++        render::redirect_flash(res, wifi_redirect(), "error", "The hotspot needs an SSID");
++        return;
++    }
++    // Never turn the AP on with no/short/published password (the image ships
++    // ap_psk empty; S35wifi enforces the same rule at start).
++    std::string why = enable ? ap_psk_problem(psk) : std::string();
++    if (!why.empty()) {
++        render::redirect_flash(res, wifi_redirect(), "error", why);
 +        return;
 +    }
 +    auto cur = wifi::read_conf();
@@ -2270,7 +3234,10 @@ index 000000000..402bd3089
 +        updates["ap_channel"] = chan;
 +        updates["ap_htmode"] = htmode;
 +    }
-+    wifi::write_conf(updates);
++    if (!wifi::write_conf(updates)) {
++        render::redirect_flash(res, wifi_redirect(), "error", "Could not save the WiFi config");
++        return;
++    }
 +    wifi::apply();
 +    render::redirect_flash(res, wifi_redirect(), "success", "AP settings applied");
 +}
@@ -2278,8 +3245,28 @@ index 000000000..402bd3089
 +void wifi_mode(const Request& req, Response& res) {
 +    if (!web::require_auth(req, res, false)) return;
 +    std::string mode = req.f("mode");
-+    if (mode != "off" && mode != "sta" && mode != "ap" && mode != "sta+ap") mode = "off";
-+    wifi::write_conf({{"mode", mode}});
++    // Reject rather than default to "off": turning the radio off can drop a
++    // wlan0 WAN, so only an explicit, valid choice may change the mode.
++    if (mode != "off" && mode != "sta" && mode != "ap" && mode != "sta+ap") {
++        render::redirect_flash(res, wifi_redirect(), "error", "Unknown WiFi mode");
++        return;
++    }
++    // ap / sta+ap switch the hotspot on with the STORED ssid/password — hold
++    // them to the same rule as the Hotspot form.
++    if (mode == "ap" || mode == "sta+ap") {
++        auto cur = wifi::read_conf();
++        std::string why = cur["ap_ssid"].empty() ? std::string("The hotspot needs an SSID")
++                                                 : ap_psk_problem(cur["ap_psk"]);
++        if (!why.empty()) {
++            render::redirect_flash(res, wifi_redirect(), "error",
++                why + " — set it in the Hotspot section below, then enable the hotspot there.");
++            return;
++        }
++    }
++    if (!wifi::write_conf({{"mode", mode}})) {
++        render::redirect_flash(res, wifi_redirect(), "error", "Could not save the WiFi config");
++        return;
++    }
 +    wifi::apply();
 +    render::redirect_flash(res, wifi_redirect(), "success", "WiFi mode set to " + mode);
 +}
@@ -2297,7 +3284,10 @@ index 000000000..402bd3089
 +            return;
 +        }
 +    }
-+    wifi::write_conf({{"tx_power", tp}});
++    if (!wifi::write_conf({{"tx_power", tp}})) {
++        render::redirect_flash(res, wifi_redirect(), "error", "Could not save the WiFi config");
++        return;
++    }
 +    wifi::apply();
 +    render::redirect_flash(res, wifi_redirect(), "success", std::string("TX power set to ") + (tp == "auto" ? "auto" : tp + " dBm"));
 +}
@@ -2306,10 +3296,10 @@ index 000000000..402bd3089
 \ No newline at end of file
 diff --git a/buildroot/package/rnsbox-portal/src/cgi/session.cpp b/buildroot/package/rnsbox-portal/src/cgi/session.cpp
 new file mode 100644
-index 000000000..4511610e4
+index 000000000..bdf1c87b7
 --- /dev/null
 +++ b/buildroot/package/rnsbox-portal/src/cgi/session.cpp
-@@ -0,0 +1,183 @@
+@@ -0,0 +1,204 @@
 +// session.cpp — see session.h.
 +#include "session.h"
 +#include "util.h"
@@ -2454,21 +3444,36 @@ index 000000000..4511610e4
 +}
 +
 +// ---- session token file: "user\ntoken\nexpiry" ----
++// expiry is on CLOCK_BOOTTIME (seconds since boot), not the wall clock: the board
++// has no RTC and boots at 1970 until NTP (or Settings -> "Sync clock to browser")
++// steps it, and that step must neither kill a live session nor revive a dead one.
++// The file lives on /run (tmpfs), so a boot-relative stamp never outlives its boot.
++static long boot_now() {
++    struct timespec ts;
++    if (clock_gettime(CLOCK_BOOTTIME, &ts) != 0) return -1;
++    return (long)ts.tv_sec;
++}
++
 +static std::string cookie(const std::string& token, long max_age) {
 +    return std::string(COOKIE_NAME) + "=" + token +
 +           "; HttpOnly; SameSite=Lax; Path=/; Max-Age=" + std::to_string(max_age);
 +}
 +
-+std::string start(const std::string& user) {
-+    std::string token = util::random_hex(24);   // 48 hex chars
-+    long expiry = (long)::time(nullptr) + SESSION_TTL;
++static void write_session(const std::string& user, const std::string& token, long expiry) {
 +    std::string body = user + "\n" + token + "\n" + std::to_string(expiry) + "\n";
 +    util::write_file_atomic(SESSION_FILE, body, 0600);
++}
++
++std::string start(const std::string& user) {
++    std::string token = util::random_hex(24);   // 48 hex chars
++    write_session(user, token, boot_now() + SESSION_TTL);
 +    return cookie(token, SESSION_TTL);
 +}
 +
-+std::string clear() {
-+    ::unlink(SESSION_FILE);
++std::string clear(const std::string& cookie_token) {
++    // check() only says valid for the holder of the live token, so a cookieless
++    // or stale-cookie /logout leaves the (single, global) session alone.
++    if (check(cookie_token).valid) ::unlink(SESSION_FILE);
 +    return cookie("", 0);
 +}
 +
@@ -2485,8 +3490,14 @@ index 000000000..4511610e4
 +    std::string user  = body.substr(0, n1);
 +    std::string token = body.substr(n1 + 1, n2 - n1 - 1);
 +    long expiry = strtol(body.c_str() + n2 + 1, nullptr, 10);
-+    if ((long)::time(nullptr) >= expiry) { ::unlink(SESSION_FILE); return info; }
++    // Token first: a request that doesn't hold the live token never touches the
++    // file (no unlink).
 +    if (!util::const_time_eq(cookie_token, token)) return info;
++    // Fails closed if clock_gettime ever fails. An expiry more than one TTL out
++    // can't have come from start() (e.g. a wall-clock stamp left by an older
++    // portal binary): treat it as expired too.
++    long now = boot_now();
++    if (now < 0 || now >= expiry || expiry > now + SESSION_TTL) { ::unlink(SESSION_FILE); return info; }
 +    info.valid = true;
 +    info.user = user;
 +    return info;
@@ -2495,18 +3506,24 @@ index 000000000..4511610e4
 +}  // namespace session
 diff --git a/buildroot/package/rnsbox-portal/src/cgi/session.h b/buildroot/package/rnsbox-portal/src/cgi/session.h
 new file mode 100644
-index 000000000..c50d2cb93
+index 000000000..2320a65ba
 --- /dev/null
 +++ b/buildroot/package/rnsbox-portal/src/cgi/session.h
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,47 @@
 +// session.h — dead-simple auth + session for a tiny-device admin UI.
 +//
 +//  * password: verify against the existing werkzeug pbkdf2 hash in auth.json,
 +//    using the box's OpenSSL (no bundled crypto).
 +//  * session : an opaque random token written to a /run file and compared;
-+//    logout deletes it, reboot clears it (tmpfs). No signing.
-+//  * CSRF    : the cookie is SameSite=Lax, so browsers won't attach it to a
-+//    cross-site POST — no token machinery needed.
++//    logout (by the token's holder) deletes it, reboot clears it (tmpfs). No
++//    signing. Expiry is kept on CLOCK_BOOTTIME, so the NTP / browser-time step
++//    of the RTC-less box (it boots at 1970) neither ends a live session nor
++//    revives an expired one.
++//  * CSRF    : mutating routes are POST-only (main.cpp answers anything else
++//    with 405 before the handler runs) and every POST must pass a same-origin
++//    Origin/Referer check (http::same_origin); on top of that the cookie is
++//    SameSite=Lax, so browsers won't attach it to a cross-site POST. No token
++//    machinery needed.
 +#ifndef RNSBOX_SESSION_H
 +#define RNSBOX_SESSION_H
 +
@@ -2532,17 +3549,20 @@ index 000000000..c50d2cb93
 +
 +// --- session token file ---
 +std::string start(const std::string& user); // writes token file; returns Set-Cookie value
-+std::string clear();                          // deletes token file; returns expiring Set-Cookie
++// Logout: deletes the token file ONLY if `cookie_token` is the live, unexpired
++// session (so an unauthenticated request can't end someone else's session);
++// always returns the expiring Set-Cookie to clear the caller's own cookie.
++std::string clear(const std::string& cookie_token);
 +Info check(const std::string& cookie_token);  // valid iff cookie matches the live token
 +
 +}  // namespace session
 +#endif
 diff --git a/buildroot/package/rnsbox-portal/src/cgi/store.cpp b/buildroot/package/rnsbox-portal/src/cgi/store.cpp
 new file mode 100644
-index 000000000..db2ce2131
+index 000000000..87107d401
 --- /dev/null
 +++ b/buildroot/package/rnsbox-portal/src/cgi/store.cpp
-@@ -0,0 +1,444 @@
+@@ -0,0 +1,487 @@
 +// store.cpp — see store.h. Formats mirror store.py exactly.
 +#include "store.h"
 +#include "util.h"
@@ -2622,6 +3642,18 @@ index 000000000..db2ce2131
 +    return util::trim(o);
 +}
 +
++bool conf_value_ok(const std::string& s) {
++    for (unsigned char c : s)
++        if (c < 0x20 || c == 0x7f) return false;   // incl. CR, LF, NUL, TAB
++    return true;
++}
++
++static bool all_digits(const std::string& s) {
++    if (s.empty()) return false;
++    for (char c : s) if (c < '0' || c > '9') return false;
++    return true;
++}
++
 +// ---- port forwards ----
 +std::vector<PortForward> read_portforwards() {
 +    std::vector<PortForward> out;
@@ -2661,6 +3693,15 @@ index 000000000..db2ce2131
 +    if (pf.wan_port < 1 || pf.wan_port > 65535) { err = "wan_port out of range"; return false; }
 +    if (pf.lan_port < 1 || pf.lan_port > 65535) { err = "lan_port out of range"; return false; }
 +    if (!valid_ipv4(pf.lan_ip)) { err = "lan_ip is not a valid IPv4 address"; return false; }
++    if (!conf_value_ok(pf.comment)) { err = "comment must not contain line breaks or control characters"; return false; }
++    // WAN ports the box serves itself. Prerouting DNAT runs before INPUT, so a
++    // forward would silently take them over. The portal's cross-port redirects
++    // (main.cpp MODEM_PORT) would then send the admin, session cookie included
++    // (cookies aren't port-scoped), to the forward's target.
++    if (pf.proto == "tcp" && pf.wan_port == 8081) { err = "WAN tcp 8081 is reserved for the HaLow modem page"; return false; }
++    if (pf.proto == "tcp" && pf.wan_port == 80)
++        for (const auto& op : read_openports())
++            if (op.proto == "tcp" && op.port == 80) { err = "WAN tcp 80 is the web UI (Open ports) - remove it there first"; return false; }
 +    auto items = read_portforwards();
 +    PortForward n = pf;
 +    n.comment = sanitize_comment(pf.comment);
@@ -2709,6 +3750,7 @@ index 000000000..db2ce2131
 +bool add_openport(const OpenPort& op, std::string& err) {
 +    if (op.proto != "tcp" && op.proto != "udp") { err = "proto must be tcp or udp"; return false; }
 +    if (op.port < 1 || op.port > 65535) { err = "port out of range"; return false; }
++    if (!conf_value_ok(op.comment)) { err = "comment must not contain line breaks or control characters"; return false; }
 +    auto items = read_openports();
 +    OpenPort n = op;
 +    n.comment = sanitize_comment(op.comment);
@@ -2751,15 +3793,27 @@ index 000000000..db2ce2131
 +    return c;
 +}
 +
-+bool write_wan(const WanConfig& cfg, std::string& err) {
++bool write_wan(const WanConfig& in, std::string& err) {
++    WanConfig cfg = in;
 +    if (cfg.interface != "eth0" && cfg.interface != "wlan0") { err = "WAN interface must be eth0 or wlan0"; return false; }
 +    if (cfg.mode != "dhcp" && cfg.mode != "static") { err = "WAN mode must be dhcp or static"; return false; }
 +    if (cfg.mode == "static") {
++        if (!conf_value_ok(cfg.address) || !conf_value_ok(cfg.prefix) ||
++            !conf_value_ok(cfg.gateway) || !conf_value_ok(cfg.dns)) {
++            err = "static fields must not contain line breaks or control characters"; return false;
++        }
 +        if (!valid_ipv4(cfg.address)) { err = "static address is not a valid IPv4"; return false; }
-+        int pfx = -1; to_int(cfg.prefix, pfx);
++        int pfx = -1;
++        if (all_digits(cfg.prefix)) to_int(cfg.prefix, pfx);   // no sign / junk ("+24", "24x")
 +        if (pfx < 0 || pfx > 32) { err = "prefix must be 0-32"; return false; }
 +        if (!cfg.gateway.empty() && !valid_ipv4(cfg.gateway)) { err = "gateway is not a valid IPv4"; return false; }
-+        if (!valid_dns_list(cfg.dns)) { err = "dns must be space-separated IPv4 addresses"; return false; }
++        // The Network tab says "space- or comma-separated": accept commas, then
++        // store the canonical single-space list S30eth iterates over.
++        std::string d = cfg.dns;
++        for (char& c : d) if (c == ',') c = ' ';
++        if (!valid_dns_list(d)) { err = "dns must be space- or comma-separated IPv4 addresses"; return false; }
++        cfg.dns.clear();
++        for (const auto& ip : split_ws(d)) { if (!cfg.dns.empty()) cfg.dns += " "; cfg.dns += ip; }
 +    }
 +    std::string o =
 +        "# WAN uplink config — managed by the rnsbox-portal Network tab.\n"
@@ -2833,7 +3887,9 @@ index 000000000..db2ce2131
 +    std::string norm;
 +    norm.reserve(text.size());
 +    for (char c : text) { if (c != '\r') norm.push_back(c); }
-+    if (!util::write_file_atomic(RETICULUM_CONFIG, norm, 0644)) { err = "write failed"; return false; }
++    // 0600: it may hold IFAC passphrases or rpc_key, and every reader
++    // (rnsd, rnstatus, lxmd, nomadnet, the portal) runs as root.
++    if (!util::write_file_atomic(RETICULUM_CONFIG, norm, 0600)) { err = "write failed"; return false; }
 +    return true;
 +}
 +
@@ -2900,8 +3956,11 @@ index 000000000..db2ce2131
 +    std::string en = cron_truthy(c.enabled) ? "yes" : "no";
 +    std::string dev = c.device.empty() ? "/dev/ttyS1" : c.device;
 +    if (!valid_tty(dev)) { err = "bad device path"; return false; }
-+    int baud = atoi(c.baud.c_str());
-+    if (baud < 1 || baud > 4000000) { err = "baud out of range (1-4000000)"; return false; }
++    // Digits only (atoi would take "1500000<junk>"); ceiling = the UART's
++    // 25 MHz/16 base rate — anything above can't be generated.
++    int baud = 0;
++    if (all_digits(c.baud) && c.baud.size() <= 8) baud = atoi(c.baud.c_str());
++    if (baud < 1 || baud > SLIP_MAX_BAUD) { err = "baud out of range (1-" + std::to_string(SLIP_MAX_BAUD) + ")"; return false; }
 +    std::string lip = c.local_ip.empty() ? "192.168.7.1" : c.local_ip;
 +    std::string pip = c.peer_ip.empty() ? "192.168.7.2" : c.peer_ip;
 +    if (!valid_ipv4(lip) || !valid_ipv4(pip)) { err = "bad IP address"; return false; }
@@ -2963,6 +4022,10 @@ index 000000000..db2ce2131
 +bool add_halow_interface(const std::string& name_in, const std::string& host, int port, std::string& msg) {
 +    if (!valid_ipv4(host)) { msg = "bad modem IP"; return false; }
 +    if (port < 1 || port > 65535) { msg = "bad port"; return false; }
++    // The name lands in a "[[name]]" header line: a CR/LF would start new
++    // config lines (e.g. a spawned-command interface). It can come from the
++    // modem's own hostname via the page JS, so never trust it.
++    if (!conf_value_ok(name_in)) { msg = "interface name must not contain line breaks or control characters"; return false; }
 +    auto lines = read_lines(RETICULUM_CONFIG);
 +    if (lines.empty()) { msg = "no reticulum config"; return false; }
 +    if (reticulum_has_tcp_client(host, port)) { msg = "already"; return false; }
@@ -2981,7 +4044,7 @@ index 000000000..db2ce2131
 +    lines.push_back("    target_port = " + std::to_string(port));
 +    std::string o;
 +    for (const auto& l : lines) o += l + "\n";
-+    if (!util::write_file_atomic(RETICULUM_CONFIG, o, 0644)) { msg = "write failed"; return false; }
++    if (!util::write_file_atomic(RETICULUM_CONFIG, o, 0600)) { msg = "write failed"; return false; }  // see write_reticulum_config
 +    msg = name;
 +    return true;
 +}
@@ -2989,10 +4052,10 @@ index 000000000..db2ce2131
 +}  // namespace store
 diff --git a/buildroot/package/rnsbox-portal/src/cgi/store.h b/buildroot/package/rnsbox-portal/src/cgi/store.h
 new file mode 100644
-index 000000000..6b4d1acc7
+index 000000000..c3aa335f8
 --- /dev/null
 +++ b/buildroot/package/rnsbox-portal/src/cgi/store.h
-@@ -0,0 +1,88 @@
+@@ -0,0 +1,96 @@
 +// store.h — read/write the flat /etc/rnsbox/*.conf files, byte-compatible with
 +// store.py so Python (nftgen, boot scripts) and this CGI can share them.
 +#ifndef RNSBOX_STORE_H
@@ -3034,7 +4097,12 @@ index 000000000..6b4d1acc7
 +// --- validation helpers ---
 +bool valid_ipv4(const std::string& s);
 +bool valid_dns_list(const std::string& s);        // space-separated IPv4s (may be empty)
-+std::string sanitize_comment(const std::string& s); // strip control chars + '#' + trim
++std::string sanitize_comment(const std::string& s); // strip '#' + trim (control chars are rejected first)
++// True if s may be stored as ONE value/entry in our line-per-entry conf files:
++// no CR/LF/NUL/TAB or other C0/DEL control char. A CR/LF would inject a whole
++// extra line (e.g. a second mode= or a new [[interface]]). Callers reject with
++// an error flash and write nothing.
++bool conf_value_ok(const std::string& s);
 +
 +// --- port forwards ---
 +std::vector<PortForward> read_portforwards();
@@ -3048,7 +4116,7 @@ index 000000000..6b4d1acc7
 +
 +// --- WAN ---
 +WanConfig read_wan();
-+bool write_wan(const WanConfig& cfg, std::string& err);         // validates all fields
++bool write_wan(const WanConfig& cfg, std::string& err);         // validates all fields; dns may be comma- or space-separated
 +
 +// --- cron (rnsd auto-restart), preserving the update_check key ---
 +int  read_rnsd_restart_days();                 // 0..7 (0 = off)
@@ -3072,21 +4140,24 @@ index 000000000..6b4d1acc7
 +    std::string peer_ip = "192.168.7.2";
 +};
 +SlipConfig read_slip();
-+bool write_slip(const SlipConfig& c, std::string& err);
++bool write_slip(const SlipConfig& c, std::string& err);   // baud 1..SLIP_MAX_BAUD
++// SG2002 UART: 25 MHz base clock / 16 = 1 562 500 baud is the ceiling.
++constexpr int SLIP_MAX_BAUD = 1562500;
 +
 +// Append a TCPClientInterface for the HaLow modem to the reticulum config.
 +// Returns true + sets msg to the interface name; false + msg="already" if the
-+// target is already present, else msg=error.
++// target is already present, else msg=error (incl. a name with control chars —
++// it is written into a [[section]] header line).
 +bool add_halow_interface(const std::string& name, const std::string& host, int port, std::string& msg);
 +
 +}  // namespace store
 +#endif
 diff --git a/buildroot/package/rnsbox-portal/src/cgi/sysinfo.cpp b/buildroot/package/rnsbox-portal/src/cgi/sysinfo.cpp
 new file mode 100644
-index 000000000..e681f598e
+index 000000000..77e89fece
 --- /dev/null
 +++ b/buildroot/package/rnsbox-portal/src/cgi/sysinfo.cpp
-@@ -0,0 +1,265 @@
+@@ -0,0 +1,283 @@
 +// sysinfo.cpp — see sysinfo.h. Port of sysinfo.py.
 +#include "sysinfo.h"
 +#include "util.h"
@@ -3279,10 +4350,17 @@ index 000000000..e681f598e
 +}
 +
 +static std::string find_rnsd_pid() {
-+    // 1. pidfile (authoritative — S82rnsd writes /var/run/rnsd.pid).
++    // 1. pidfile (authoritative — S82rnsd writes /var/run/rnsd.pid). Digits
++    // only: the pid is emitted raw into JSON ("pid":N) and a /proc path, so a
++    // junk pidfile ("self", "../x") must not pass the exists() test.
 +    std::string pid = slurp_trim("/var/run/rnsd.pid");
-+    if (!pid.empty() && exists("/proc/" + pid)) return pid;
-+    // 2. /proc cmdline scan (rnsd's comm is "python3", so `pidof rnsd` fails).
++    bool pid_num = !pid.empty() && pid.size() <= 10;
++    for (char c : pid) if (!isdigit((unsigned char)c)) pid_num = false;
++    if (pid_num && exists("/proc/" + pid)) return pid;
++    // 2. /proc cmdline scan (pidfile lost/stale). rnsd's argv is
++    // "/usr/bin/python /usr/bin/rnsd --config /etc/reticulum". Its syslog
++    // companion, `logger -t rnsd[<pid>] ...` (S82rnsd), must never match
++    // here: keep these patterns clear of a bare "rnsd[" tag.
 +    if (DIR* d = opendir("/proc")) {
 +        std::string found;
 +        while (struct dirent* e = readdir(d)) {
@@ -3322,6 +4400,17 @@ index 000000000..e681f598e
 +    return r;
 +}
 +
++std::vector<std::string> lan_ifaces() {
++    std::vector<std::string> out = {"usb0"};
++    // Same test as S60routing read_lan(): name from the file, iface must exist.
++    // Name charset-checked too (it becomes part of a /sys path and the page).
++    std::string ap = util::trim(util::read_file("/run/wifi-ap-iface", 64));
++    bool sane = !ap.empty() && ap.size() <= 15 && ap != "usb0";
++    for (char c : ap) if (!(isalnum((unsigned char)c) || c == '-' || c == '_' || c == '.')) sane = false;
++    if (sane && ap != "." && ap != ".." && is_dir("/sys/class/net/" + ap)) out.push_back(ap);
++    return out;
++}
++
 +std::vector<Lease> dnsmasq_leases() {
 +    std::vector<Lease> out;
 +    for (const char* path : {"/var/lib/misc/dnsmasq.leases", "/tmp/dnsmasq.leases"}) {
@@ -3354,10 +4443,10 @@ index 000000000..e681f598e
 +}  // namespace sysinfo
 diff --git a/buildroot/package/rnsbox-portal/src/cgi/sysinfo.h b/buildroot/package/rnsbox-portal/src/cgi/sysinfo.h
 new file mode 100644
-index 000000000..1121d67ec
+index 000000000..fe714ee90
 --- /dev/null
 +++ b/buildroot/package/rnsbox-portal/src/cgi/sysinfo.h
-@@ -0,0 +1,54 @@
+@@ -0,0 +1,59 @@
 +// sysinfo.h — read-only views over /proc, /sys, and a few command outputs.
 +// C++ port of the former sysinfo.py (hot path: hit on every page render, so
 +// native rather than a python spawn). halow_status() stays a python helper —
@@ -3404,6 +4493,11 @@ index 000000000..1121d67ec
 +};
 +Rnsd rnsd_status(bool with_raw = false);
 +
++// LAN-side interfaces exactly as S60routing puts them in nftables' @lan_ifaces:
++// usb0 always, plus the hotspot iface S35wifi records in /run/wifi-ap-iface
++// while an AP is up (and the iface exists).
++std::vector<std::string> lan_ifaces();
++
 +struct Lease { std::string expires, mac, ip, name, client_id; };
 +std::vector<Lease> dnsmasq_leases();
 +
@@ -3414,10 +4508,10 @@ index 000000000..1121d67ec
 +#endif
 diff --git a/buildroot/package/rnsbox-portal/src/cgi/util.cpp b/buildroot/package/rnsbox-portal/src/cgi/util.cpp
 new file mode 100644
-index 000000000..19c7a50e6
+index 000000000..1c644db6d
 --- /dev/null
 +++ b/buildroot/package/rnsbox-portal/src/cgi/util.cpp
-@@ -0,0 +1,195 @@
+@@ -0,0 +1,213 @@
 +// util.cpp — see util.h.
 +#include "util.h"
 +#include <cstdio>
@@ -3466,6 +4560,16 @@ index 000000000..19c7a50e6
 +    return true;
 +}
 +
++// Seconds on CLOCK_MONOTONIC, for run()'s deadline. Not time(): "Sync clock to
++// browser" (date -s), or an NTP step, can run while a child is out, and a
++// wall-clock deadline would then look long expired and SIGKILL a child that
++// already finished (time_browser's own `date -s` included).
++static time_t mono_now() {
++    struct timespec ts;
++    if (::clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return ::time(nullptr);   // never on Linux
++    return ts.tv_sec;
++}
++
 +RunResult run(const std::vector<std::string>& argv, const std::string& input,
 +              int timeout_s, size_t out_cap) {
 +    RunResult rr;
@@ -3505,11 +4609,11 @@ index 000000000..19c7a50e6
 +    }
 +    ::close(inpipe[1]);
 +
-+    // Read output with a wall-clock deadline enforced via alarm-free polling:
++    // Read output with a monotonic deadline enforced via alarm-free polling:
 +    // set the read fd non-blocking and loop until child exits or timeout.
 +    ::fcntl(outpipe[0], F_SETFL, O_NONBLOCK);
-+    time_t deadline = ::time(nullptr) + timeout_s;
-+    bool killed = false;
++    time_t deadline = mono_now() + timeout_s;
++    bool killed = false, reaped = false;
 +    char buf[8192];
 +    int status = 0;
 +    for (;;) {
@@ -3523,6 +4627,7 @@ index 000000000..19c7a50e6
 +        // n < 0: EAGAIN or error
 +        pid_t w = ::waitpid(pid, &status, WNOHANG);
 +        if (w == pid) { // child gone; drain any remaining then break
++            reaped = true;
 +            while ((n = ::read(outpipe[0], buf, sizeof(buf))) > 0) {
 +                size_t room = out_cap > rr.out.size() ? out_cap - rr.out.size() : 0;
 +                if (!room) break;
@@ -3530,15 +4635,22 @@ index 000000000..19c7a50e6
 +            }
 +            break;
 +        }
-+        if (::time(nullptr) >= deadline) { ::kill(pid, SIGKILL); killed = true; break; }
++        if (mono_now() >= deadline) { ::kill(pid, SIGKILL); killed = true; break; }
 +        ::usleep(20 * 1000);
 +    }
 +    ::close(outpipe[0]);
-+    if (killed) { ::waitpid(pid, &status, 0); rr.timed_out = true; rr.exit_code = -1; }
-+    else {
-+        if (!WIFEXITED(status) && !WIFSIGNALED(status)) ::waitpid(pid, &status, 0);
-+        rr.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
++    // EOF usually arrives before the child is reaped. Reap it here, still under
++    // the deadline: `status` would otherwise stay at its initial 0, which reads
++    // as "exited 0", so every failing command looked like a success.
++    while (!reaped && !killed) {
++        pid_t w = ::waitpid(pid, &status, WNOHANG);
++        if (w == pid) { reaped = true; break; }
++        if (w < 0) break;
++        if (mono_now() >= deadline) { ::kill(pid, SIGKILL); killed = true; break; }
++        ::usleep(20 * 1000);
 +    }
++    if (killed) { ::waitpid(pid, &status, 0); rr.timed_out = true; rr.exit_code = -1; }
++    else rr.exit_code = (reaped && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
 +    return rr;
 +}
 +
@@ -3675,10 +4787,10 @@ index 000000000..24a31c71e
 +#endif
 diff --git a/buildroot/package/rnsbox-portal/src/cgi/web.cpp b/buildroot/package/rnsbox-portal/src/cgi/web.cpp
 new file mode 100644
-index 000000000..8882ac7f7
+index 000000000..d7067899f
 --- /dev/null
 +++ b/buildroot/package/rnsbox-portal/src/cgi/web.cpp
-@@ -0,0 +1,49 @@
+@@ -0,0 +1,67 @@
 +// web.cpp — see web.h.
 +#include "web.h"
 +#include "session.h"
@@ -3700,9 +4812,27 @@ index 000000000..8882ac7f7
 +        res.content_type = "application/json";
 +        res.body = "{\"error\":\"auth required\"}";
 +    } else {
-+        res.redirect(base() + "/login");
++        std::string loc = base() + "/login";
++        // Come back here after signing in. GET only: replaying a POST target as
++        // a GET after login would just hit the dispatcher's 405. The dashboard
++        // (base itself) is the default anyway, so it needs no next.
++        if (req.method == "GET" && req.path != "/") {
++            std::string here = base() + req.path;
++            if (!req.query.empty()) here += "?" + req.query;
++            if (is_local_next(here)) loc += "?next=" + http::url_encode(here);
++        }
++        res.redirect(loc);
 +    }
 +    return false;
++}
++
++bool is_local_next(const std::string& next) {
++    std::string b = base();
++    if (next != b && next.compare(0, b.size() + 1, b + "/") != 0) return false;
++    if (next.find("//") != std::string::npos) return false;   // "//host" = protocol-relative
++    for (unsigned char c : next)
++        if (c == '\\' || c < 0x20 || c == 0x7f) return false;  // browsers read '\' as '/'
++    return true;
 +}
 +
 +std::string replace_all(std::string s, const std::string& from, const std::string& to) {
@@ -3730,10 +4860,10 @@ index 000000000..8882ac7f7
 +}  // namespace web
 diff --git a/buildroot/package/rnsbox-portal/src/cgi/web.h b/buildroot/package/rnsbox-portal/src/cgi/web.h
 new file mode 100644
-index 000000000..1c42ceca3
+index 000000000..02bb2e627
 --- /dev/null
 +++ b/buildroot/package/rnsbox-portal/src/cgi/web.h
-@@ -0,0 +1,28 @@
+@@ -0,0 +1,35 @@
 +// web.h — shared helpers for route handlers (auth gate, base URL, apply).
 +#ifndef RNSBOX_WEB_H
 +#define RNSBOX_WEB_H
@@ -3747,8 +4877,15 @@ index 000000000..1c42ceca3
 +std::string base();
 +
 +// Gate a route on a valid session. On failure, fills res (302 to login for a
-+// page, 401 JSON for an API route) and returns false.
++// page, 401 JSON for an API route) and returns false. A page GET redirects to
++// login?next=<this path+query>, so a deep link lands back where it pointed.
 +bool require_auth(const http::Request& req, http::Response& res, bool json);
++
++// True if `next` is a safe post-login redirect target: a local portal path —
++// exactly base() or base()+"/..." — with no backslash, no "//" anywhere and no
++// control byte (< 0x20 or 0x7f). Blocks open redirects ("/\evil", "//evil",
++// "http://...") and header injection through the Location value.
++bool is_local_next(const std::string& next);
 +
 +// Replace every occurrence of `from` with `to`.
 +std::string replace_all(std::string s, const std::string& from, const std::string& to);
@@ -3764,10 +4901,10 @@ index 000000000..1c42ceca3
 +#endif
 diff --git a/buildroot/package/rnsbox-portal/src/cgi/wifi.cpp b/buildroot/package/rnsbox-portal/src/cgi/wifi.cpp
 new file mode 100644
-index 000000000..545e75839
+index 000000000..99d69141c
 --- /dev/null
 +++ b/buildroot/package/rnsbox-portal/src/cgi/wifi.cpp
-@@ -0,0 +1,240 @@
+@@ -0,0 +1,282 @@
 +// wifi.cpp — see wifi.h. Native port of wifi.py (iw parsing by hand, no regex).
 +#include "wifi.h"
 +#include "util.h"
@@ -3777,6 +4914,8 @@ index 000000000..545e75839
 +#include <cstdlib>
 +#include <cstring>
 +#include <dirent.h>
++#include <sys/stat.h>
++#include <unistd.h>
 +#include <algorithm>
 +#include <vector>
 +
@@ -3823,9 +4962,29 @@ index 000000000..545e75839
 +    return cfg;
 +}
 +
-+void write_conf(const std::map<std::string, std::string>& updates) {
++bool conf_value_ok(const std::string& s) {
++    for (unsigned char c : s)
++        if (c < 0x20 || c == 0x7f || c == '#' || c == '"') return false;
++    if (!s.empty() && (isspace((unsigned char)s.front()) || isspace((unsigned char)s.back())))
++        return false;
++    // read_conf() also strips a matching pair of surrounding single quotes
++    // (S35wifi doesn't) — refuse the one value that would read back differently.
++    if (s.size() >= 2 && s.front() == '\'' && s.back() == '\'') return false;
++    return true;
++}
++
++bool ap_psk_ok(const std::string& psk) {
++    if (psk.size() < 8 || psk.size() > 63) return false;          // WPA2 passphrase length
++    for (unsigned char c : psk) if (c < 0x20 || c > 0x7e) return false;   // printable ASCII
++    return conf_value_ok(psk) && psk != OLD_DEFAULT_AP_PSK;
++}
++
++bool write_conf(const std::map<std::string, std::string>& updates) {
 +    auto cfg = read_conf();
-+    for (const auto& kv : updates) if (cfg.count(kv.first)) cfg[kv.first] = kv.second;
++    for (const auto& kv : updates) {
++        if (!conf_value_ok(kv.second)) return false;   // no line injection / truncation
++        if (cfg.count(kv.first)) cfg[kv.first] = kv.second;
++    }
 +    std::string o =
 +        "# RNSBox WiFi config — managed by rnsbox-portal.\n"
 +        "# mode: off | sta | ap | sta+ap\n\n";
@@ -3834,12 +4993,21 @@ index 000000000..545e75839
 +    for (const char* k : {"sta_ssid", "sta_psk", "sta_hidden", "sta_country"})
 +        o += std::string(k) + "=" + cfg[k] + "\n";
 +    o += "\n# --- AP (hotspot) ---\n";
++    o += "# ap_psk: 8..63 chars — the hotspot will not start without one.\n";
 +    for (const char* k : {"ap_ssid", "ap_psk", "ap_channel", "ap_htmode", "ap_hidden",
 +                          "ap_ip", "ap_dhcp_start", "ap_dhcp_end"})
 +        o += std::string(k) + "=" + cfg[k] + "\n";
-+    o += "\n# --- TX power (radio-wide): auto = chip max, or 1..20 dBm ---\n";
++    o += "\n# --- TX power (radio-wide): auto = chip max, or 1..18 dBm ---\n";
 +    o += "tx_power=" + cfg["tx_power"] + "\n";
-+    util::write_file_atomic(CONF, o, 0644);
++    // The file holds both WiFi passwords: 0600, never wider than it already is
++    // (the old portal wrote 0644 — this narrows those on the next save).
++    int mode = 0600;
++    struct stat st;
++    if (::stat(CONF, &st) == 0) mode &= (int)(st.st_mode & 0777);
++    // Drop a stale .tmp so write_file_atomic's O_CREAT makes it fresh at `mode`
++    // (an existing one would keep its old, possibly 0644, mode until chmod).
++    ::unlink((std::string(CONF) + ".tmp").c_str());
++    return util::write_file_atomic(CONF, o, mode);
 +}
 +
 +// ---- iw output parsing helpers ----
@@ -3886,7 +5054,18 @@ index 000000000..545e75839
 +        cp += 8;
 +    }
 +    n.ssid = line_value(block, "SSID:");
-+    if (!n.channel.empty()) n.band = (atoi(n.channel.c_str()) <= 14) ? "2.4" : "5";
++    // Band (and, when there's no "DS Parameter set: channel N" — i.e. every
++    // 5/6 GHz BSS — the channel too) from the "freq: 5240" line (iw 6.x prints
++    // "5240.0"). Band comes from freq first: 6 GHz channel numbers overlap the
++    // 2.4 GHz ones, so "channel <= 14" alone can't tell them apart.
++    int f = (int)atof(line_value(block, "freq:").c_str());
++    int ch = 0;
++    if (f == 2484)                  { n.band = "2.4"; ch = 14; }
++    else if (f >= 2412 && f < 2484) { n.band = "2.4"; ch = (f - 2407) / 5; }
++    else if (f > 5925 && f <= 7125) { n.band = "6";   ch = (f - 5950) / 5; }
++    else if (f > 5000 && f <= 5925) { n.band = "5";   ch = (f - 5000) / 5; }
++    if (n.channel.empty() && ch > 0) n.channel = std::to_string(ch);
++    if (n.band.empty() && !n.channel.empty()) n.band = (atoi(n.channel.c_str()) <= 14) ? "2.4" : "5";
 +    return n;
 +}
 +
@@ -4010,10 +5189,10 @@ index 000000000..545e75839
 +}  // namespace wifi
 diff --git a/buildroot/package/rnsbox-portal/src/cgi/wifi.h b/buildroot/package/rnsbox-portal/src/cgi/wifi.h
 new file mode 100644
-index 000000000..54b1548c2
+index 000000000..57fe5b968
 --- /dev/null
 +++ b/buildroot/package/rnsbox-portal/src/cgi/wifi.h
-@@ -0,0 +1,37 @@
+@@ -0,0 +1,52 @@
 +// wifi.h — AIC8800 WiFi management (W variant): config + `iw` parsing.
 +// Native C++ port of the former wifi.py. No-radio boards: present()==false.
 +#ifndef RNSBOX_WIFI_H
@@ -4029,7 +5208,22 @@ index 000000000..54b1548c2
 +
 +bool present();                                       // any wlan* in /sys/class/net
 +std::map<std::string, std::string> read_conf();       // keys + defaults
-+void write_conf(const std::map<std::string, std::string>& updates);  // merge + atomic write
++// Merge + atomic write, mode 0600 (the file holds sta_psk/ap_psk; an existing
++// stricter mode is kept). Returns false — and writes NOTHING — if any value
++// fails conf_value_ok() or the write fails.
++bool write_conf(const std::map<std::string, std::string>& updates);
++
++// Can `s` round-trip through wifi.conf as one value? Both readers (read_conf()
++// and S35wifi's cfg()) cut a value at '#', drop '"' and trim surrounding
++// whitespace, and a CR/LF (or any control char) would inject a whole extra
++// key=value line — so any of those would silently change an SSID/password.
++bool conf_value_ok(const std::string& s);
++
++// Hotspot WPA2 passphrase policy — mirrored by S35wifi's ap_psk_ok(): 8..63
++// printable ASCII, storable (conf_value_ok), and not the old published factory
++// default (anyone could read it in the source).
++constexpr const char* OLD_DEFAULT_AP_PSK = "changeme123";
++bool ap_psk_ok(const std::string& psk);
 +
 +// Live radio status (parsed from `iw`). Used both server-side (wifi_page render)
 +// and, serialized, by the /wifi/status AJAX endpoint.
@@ -4046,7 +5240,7 @@ index 000000000..54b1548c2
 +Status status();             // gather live status
 +std::string status_json();   // status() serialized to JSON (present/mode/sta/ap/...)
 +
-+std::string scan_json();     // JSON array of {ssid,signal,channel,band,security}
++std::string scan_json();     // JSON array of {ssid,signal,channel,band,security}; band "2.4"|"5"|"6"
 +void apply();                // S35wifi restart + S60routing restart
 +
 +}  // namespace wifi
@@ -4064,10 +5258,10 @@ index 000000000..d5ef38c06
 +<body><a href="/cgi-bin/portal">RNSBox admin &rarr;</a></body></html>
 diff --git a/buildroot/package/rnsbox-portal/src/cgi/www/style.css b/buildroot/package/rnsbox-portal/src/cgi/www/style.css
 new file mode 100644
-index 000000000..599bcf43e
+index 000000000..56ceb7c26
 --- /dev/null
 +++ b/buildroot/package/rnsbox-portal/src/cgi/www/style.css
-@@ -0,0 +1,453 @@
+@@ -0,0 +1,459 @@
 +/* RNSBox portal — OpenWrt-inspired admin UI */
 +:root {
 +  --bg:        #f3f4f6;
@@ -4116,12 +5310,18 @@ index 000000000..599bcf43e
 +.topbar .brand-host { color: #9fbed0; font-size: 13px; }
 +.topbar .topnav { display: flex; align-items: center; gap: 14px; }
 +.topbar .user { color: #9fbed0; font-size: 13px; }
++/* Logout is a one-button POST form styled to look like the old link:
++   transparent background + normal weight undo the generic `button` rule. */
++.topbar .logout-form { display: inline; margin: 0; }
 +.topbar .logout {
 +  color: #fff;
++  background: transparent;
 +  padding: 5px 12px;
 +  border: 1px solid rgba(255,255,255,0.25);
 +  border-radius: 3px;
 +  font-size: 13px;
++  font-weight: 400;
++  cursor: pointer;
 +}
 +.topbar .logout:hover { background: var(--primary-2); text-decoration: none; }
 +

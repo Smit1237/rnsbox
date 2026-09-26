@@ -1,25 +1,25 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: smit1237 <smit1237@gmail.com>
 Date: Tue, 8 Sep 2026 22:47:49 +0300
-Subject: [PATCH 10/23] nomadnet: LXMF/pages node (opt-in)
+Subject: [PATCH 10/30] nomadnet: LXMF/pages node (opt-in)
 
 Add the python-lxmf and python-nomadnet recipes and bump python-urwid to
 2.6.16 (nomadnet floor), selecting its wcwidth and typing_extensions imports.
 S83nomadnet runs the LXMF/pages node but is disabled by default via
 /etc/rnsbox/nomadnet.conf.
 ---
- .../SG200X/overlay/etc/init.d/S83nomadnet     | 101 ++++++++++++++++++
- .../SG200X/overlay/etc/rnsbox/nomadnet.conf   |  20 ++++
+ .../SG200X/overlay/etc/init.d/S83nomadnet     | 137 ++++++++++++++++++
+ .../SG200X/overlay/etc/rnsbox/nomadnet.conf   |  20 +++
  buildroot/package/python-lxmf/Config.in       |  11 ++
  .../package/python-lxmf/python-lxmf.hash      |   4 +
- buildroot/package/python-lxmf/python-lxmf.mk  |  18 ++++
- buildroot/package/python-nomadnet/Config.in   |  16 +++
+ buildroot/package/python-lxmf/python-lxmf.mk  |  18 +++
+ buildroot/package/python-nomadnet/Config.in   |  16 ++
  .../python-nomadnet/python-nomadnet.hash      |   3 +
- .../python-nomadnet/python-nomadnet.mk        |  14 +++
+ .../python-nomadnet/python-nomadnet.mk        |  14 ++
  buildroot/package/python-urwid/Config.in      |   2 +
  .../package/python-urwid/python-urwid.hash    |   8 +-
- .../package/python-urwid/python-urwid.mk      |  19 +++-
- 11 files changed, 209 insertions(+), 7 deletions(-)
+ .../package/python-urwid/python-urwid.mk      |  19 ++-
+ 11 files changed, 245 insertions(+), 7 deletions(-)
  create mode 100755 buildroot/board/cvitek/SG200X/overlay/etc/init.d/S83nomadnet
  create mode 100644 buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/nomadnet.conf
  create mode 100644 buildroot/package/python-lxmf/Config.in
@@ -31,10 +31,10 @@ S83nomadnet runs the LXMF/pages node but is disabled by default via
 
 diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S83nomadnet b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S83nomadnet
 new file mode 100755
-index 000000000..238a02573
+index 000000000..868954e4c
 --- /dev/null
 +++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S83nomadnet
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,137 @@
 +#!/bin/sh
 +# S83nomadnet — Nomadnet daemon (LXMF propagation node + nomadnet pages
 +# server). Shipped DISABLED by default — most RNSBox owners only want
@@ -44,13 +44,21 @@ index 000000000..238a02573
 +# Like S82rnsd, gates on /run/clock-synced. Nomadnet stamps every LXMF
 +# message + announce with wall-clock time; a 1970 clock makes peers
 +# reject everything we send.
++#
++# Also like S82rnsd: runs with umask 077 (its identity key lives under
++# $configdir/storage; start() tightens anything left group/world-readable)
++# and with unbuffered stdout/stderr fed to syslog (/var/log/messages, tag
++# "nomadnet[<pid>]") through a FIFO, so $! / the pidfile is nomadnet itself.
++# --console: log to stdout (-> syslog) instead of $configdir/logfile on the SD
++# card; --config (not --configdir) is nomadnet's flag.
 +
 +NAME=nomadnet
 +DAEMON=/usr/bin/nomadnet
 +CONF=/etc/rnsbox/nomadnet.conf
 +PIDFILE=/var/run/$NAME.pid
-+LOG=/var/log/$NAME.log
++LOGPIPE=/var/run/$NAME.logpipe
 +DEFAULT_CONFIGDIR=/var/lib/nomadnetwork
++PERMS_MARK=/run/nomadnet-perms-done   # configdir whose full walk ran this boot
 +
 +[ -x "$DAEMON" ] || exit 0
 +
@@ -79,7 +87,7 @@ index 000000000..238a02573
 +		return 0
 +	fi
 +
-+	mkdir -p /var/log /var/run "$configdir"
++	mkdir -p /var/run "$configdir"
 +
 +	if [ -f "$PIDFILE" ] && kill -0 "$(cat $PIDFILE)" 2>/dev/null; then
 +		echo "S83nomadnet: already running (pid $(cat $PIDFILE))"
@@ -92,15 +100,43 @@ index 000000000..238a02573
 +		return 1
 +	fi
 +
++	# identity + peer data live under storage/ (only that subtree, in case
++	# configdir was pointed at a shared dir); `! -type l`: never follow links.
++	# The recursive walk (the LXMF message store can hold thousands of files
++	# on the SD card) runs once per boot per configdir ($PERMS_MARK holds the
++	# dir it covered); later starts check storage/ and its top level only —
++	# storage/ itself at 0700 already fences off everything below it.
++	if [ -d "$configdir/storage" ]; then
++		done_dir=
++		{ read -r done_dir <"$PERMS_MARK"; } 2>/dev/null
++		if [ "$done_dir" = "$configdir" ]; then
++			find "$configdir/storage" -maxdepth 1 ! -type l -perm /077 -exec chmod go-rwx {} + 2>/dev/null
++		else
++			find "$configdir/storage" ! -type l -perm /077 -exec chmod go-rwx {} + 2>/dev/null \
++				&& echo "$configdir" > "$PERMS_MARK"
++		fi
++	fi
++
 +	printf "Starting %s: " "$NAME"
-+	"$DAEMON" --daemon --configdir "$configdir" >>"$LOG" 2>&1 &
-+	PID=$!
++	rm -f "$LOGPIPE"
++	if command -v logger >/dev/null 2>&1 && mkfifo -m 600 "$LOGPIPE" 2>/dev/null; then
++		(
++			umask 077
++			export PYTHONUNBUFFERED=1
++			exec "$DAEMON" --daemon --console --config "$configdir"
++		) >"$LOGPIPE" 2>&1 &
++		PID=$!
++		logger -t "$NAME[$PID]" -p daemon.notice <"$LOGPIPE" &
++	else
++		( umask 077; exec "$DAEMON" --daemon --console --config "$configdir" ) >/dev/null 2>&1 &
++		PID=$!
++	fi
 +	echo "$PID" > "$PIDFILE"
 +	sleep 0.3
 +	if kill -0 "$PID" 2>/dev/null; then
 +		echo "OK (pid $PID, configdir $configdir)"
 +	else
-+		echo "FAIL (see $LOG)"
++		echo "FAIL (see /var/log/messages)"
 +		rm -f "$PIDFILE"
 +		return 1
 +	fi

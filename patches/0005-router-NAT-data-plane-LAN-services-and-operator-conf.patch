@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: smit1237 <smit1237@gmail.com>
 Date: Tue, 8 Sep 2026 22:47:48 +0300
-Subject: [PATCH 05/23] router: NAT data plane, LAN services and operator
+Subject: [PATCH 05/30] router: NAT data plane, LAN services and operator
  config
 
 S60routing sets the routing sysctls (ip_forward, BBR/fq, route_localnet),
@@ -10,46 +10,57 @@ module with validate-before-swap, and applies it. S30eth addresses eth0 by
 DHCP or static per /etc/rnsbox/wan.conf. Ship the dnsmasq/dhcpcd/nftables
 fallback/fstab configuration and the wan/portforward/openports operator files.
 ---
- .../cvitek/SG200X/overlay/etc/dhcpcd.conf     |  40 +++++
- .../cvitek/SG200X/overlay/etc/dnsmasq.conf    |  20 +++
- .../board/cvitek/SG200X/overlay/etc/fstab     |  17 ++
- .../cvitek/SG200X/overlay/etc/init.d/S30eth   |  93 +++++++---
- .../SG200X/overlay/etc/init.d/S60routing      | 167 ++++++++++++++++++
+ .../cvitek/SG200X/overlay/etc/dhcpcd.conf     |  45 ++++
+ .../cvitek/SG200X/overlay/etc/dnsmasq.conf    |  31 +++
+ .../board/cvitek/SG200X/overlay/etc/fstab     |  29 +++
+ .../cvitek/SG200X/overlay/etc/init.d/S30eth   | 199 ++++++++++++++++--
+ .../SG200X/overlay/etc/init.d/S41dhcpcd       |  16 ++
+ .../SG200X/overlay/etc/init.d/S60routing      | 167 +++++++++++++++
  .../board/cvitek/SG200X/overlay/etc/inittab   |  10 +-
- .../cvitek/SG200X/overlay/etc/nftables.conf   |  46 +++++
+ .../cvitek/SG200X/overlay/etc/nftables.conf   |  78 +++++++
  .../SG200X/overlay/etc/rnsbox/openports.conf  |  14 ++
  .../overlay/etc/rnsbox/portforward.conf       |  12 ++
- .../cvitek/SG200X/overlay/etc/rnsbox/wan.conf |  24 +++
- 10 files changed, 419 insertions(+), 24 deletions(-)
+ .../cvitek/SG200X/overlay/etc/rnsbox/wan.conf |  27 +++
+ .../etc/sysctl.d/10-rnsbox-hardening.conf     |  11 +
+ .../overlay/usr/share/udhcpc/default.script   |  56 +++--
+ 13 files changed, 652 insertions(+), 43 deletions(-)
  create mode 100644 buildroot/board/cvitek/SG200X/overlay/etc/dhcpcd.conf
  create mode 100644 buildroot/board/cvitek/SG200X/overlay/etc/dnsmasq.conf
  create mode 100644 buildroot/board/cvitek/SG200X/overlay/etc/fstab
+ create mode 100755 buildroot/board/cvitek/SG200X/overlay/etc/init.d/S41dhcpcd
  create mode 100755 buildroot/board/cvitek/SG200X/overlay/etc/init.d/S60routing
  create mode 100644 buildroot/board/cvitek/SG200X/overlay/etc/nftables.conf
  create mode 100644 buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/openports.conf
  create mode 100644 buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/portforward.conf
  create mode 100644 buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/wan.conf
+ create mode 100644 buildroot/board/cvitek/SG200X/overlay/etc/sysctl.d/10-rnsbox-hardening.conf
 
 diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/dhcpcd.conf b/buildroot/board/cvitek/SG200X/overlay/etc/dhcpcd.conf
 new file mode 100644
-index 000000000..880f344fc
+index 000000000..7e13f82e9
 --- /dev/null
 +++ b/buildroot/board/cvitek/SG200X/overlay/etc/dhcpcd.conf
-@@ -0,0 +1,40 @@
+@@ -0,0 +1,45 @@
 +# dhcpcd config for the RNSBox router.
 +#
-+# Goal: a single persistent dhcpcd that owns eth0 (WAN) only, never touches
-+# usb0 (LAN, dnsmasq territory), IPv4 only, and never falls back to
-+# IPv4LL/APIPA — we'd rather have no IP than a 169.254.x.x address that
-+# the kernel will helpfully install a default route through.
++# Goal: dhcpcd serves ONLY the WiFi client iface wlan0 (W variant). It runs
++# solely as S35wifi's per-interface instance (`dhcpcd -b -n wlan0`), and only
++# while wlan0 is the STA (mode sta / sta+ap). Nothing runs a dhcpcd manager:
++# in mode=ap wlan0 is the hotspot, and a manager would DHCP on it (see the
++# overlay's S41dhcpcd stub). It never touches eth0 — S30eth owns eth0
++# (udhcpc or static) and only when eth0 is the WAN — nor usb0/wlan1 (LAN,
++# dnsmasq territory) nor sl0 (point-to-point modem link). IPv4 only, and never
++# an IPv4LL/APIPA fallback — we'd rather have no IP than a 169.254.x.x address
++# that the kernel will helpfully install a default route through.
 +
 +hostname
 +clientid
 +
-+# `persistent` keeps the daemon resident across NOCARRIER, so when the
-+# Ethernet cable is plugged in (or finally provides enough power for a
-+# stable link) we get a lease automatically without re-launching anything.
-+persistent
++# No `persistent`: when S35wifi stops the client (`dhcpcd -x wlan0`, on a
++# WiFi mode change) dhcpcd must de-configure wlan0 and run its STOP hook, which
++# removes the lease address, its routes and the wlan0.dhcp openresolv entry.
++# (`persistent` only skips that on exit; the per-interface daemon stays
++# resident across WiFi link loss either way.)
 +
 +option rapid_commit
 +option domain_name_servers, domain_name, domain_search
@@ -57,8 +68,9 @@ index 000000000..880f344fc
 +require dhcp_server_identifier
 +slaac private
 +
-+# We have no IPv6 upstream by default; matches the kernel sysctls and
-+# the nftables rules. (Reticulum doesn't need it.)
++# IPv6 exists in the kernel only for usb0 (Reticulum AutoInterface, link-local);
++# S09ipv6 disables it on every other iface. dhcpcd must never try DHCPv6 or
++# router solicitation on the WAN.
 +noipv6
 +noipv6rs
 +
@@ -67,50 +79,74 @@ index 000000000..880f344fc
 +# predecessor board.
 +noipv4ll
 +
-+# Allowed WAN interfaces. /etc/init.d/S30eth invokes dhcpcd with the
-+# chosen iface name explicitly; the allowinterfaces list still gates
-+# which devices dhcpcd will ever touch. Listing both eth0 + wlan0
-+# means a runtime WAN switch (edit /etc/rnsbox/wan.conf, restart
-+# S30eth) works without re-editing this file.
-+#
-+# usb0 = LAN side, dnsmasq's territory.
-+allowinterfaces eth0 wlan0
-+denyinterfaces lo usb0
++# The only iface dhcpcd may manage. eth0 used to be listed too, so the
++# manager daemon ran a second DHCP client on eth0 next to S30eth's udhcpc —
++# a cable plugged in while WAN=wlan0 then added an eth0 default route that
++# hijacked the WAN. No manager runs any more (S41dhcpcd is a stub), so both
++# lists are belt-and-braces; deny wins over allow.
++allowinterfaces wlan0
++denyinterfaces lo eth0 usb0 wlan1 sl0
 diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/dnsmasq.conf b/buildroot/board/cvitek/SG200X/overlay/etc/dnsmasq.conf
 new file mode 100644
-index 000000000..b952b8f5a
+index 000000000..522c6c794
 --- /dev/null
 +++ b/buildroot/board/cvitek/SG200X/overlay/etc/dnsmasq.conf
-@@ -0,0 +1,20 @@
+@@ -0,0 +1,31 @@
 +# NOTE: this file is REGENERATED AT BOOT by /etc/init.d/S60routing
 +# based on /etc/rnsbox/wan.conf. Manual edits below the "AUTOGEN MARKER"
 +# line are clobbered every boot.
 +#
-+# To change the WAN interface, edit /etc/rnsbox/wan.conf and run
-+#   /etc/init.d/S60routing restart
++# To change the WAN interface, use the portal Network tab, or edit
++# /etc/rnsbox/wan.conf and run
++#   /etc/init.d/S30eth restart && /etc/init.d/S60routing restart
 +
 +# Shared (interface-agnostic) settings.
++# filter-AAAA: the box has no IPv6 uplink (IPv6 exists only as link-local on
++# usb0, for Reticulum's AutoInterface), so never hand LAN clients AAAA records
++# they can't reach. No enable-ra / DHCPv6 ranges either — dnsmasq does no IPv6
++# address assignment.
 +filter-AAAA
 +cache-size=1000
 +no-hosts
 +# bind-dynamic = bind per-interface as they come up, not wildcard-at-start.
 +# Lets the autogen section below reference usb0 even if it appears late.
 +bind-dynamic
-+# DNS upstream follows /etc/resolv.conf (dhcpcd manages it via openresolv).
++# DNS upstream follows /etc/resolv.conf (both via openresolv: eth0 by
++# udhcpc/S30eth, wlan0 by dhcpcd).
 +
 +# Friendly hostnames for the portal regardless of which LAN the client is on.
++# They only redirect to the IP (http://10.42.0.1/): the portal serves content
++# on an IP literal only (DNS-rebinding guard). Keep in sync with main.cpp
++# host_is_alias ALIASES: a name missing there gets a 403 from the portal.
++# (rnsbox.local only works where the client asks unicast DNS for .local names;
++# macOS, iOS and Linux use mDNS for those.)
 +address=/rnsbox.local/setup.rnsbox/setup.lan/router.rnsbox/10.42.0.1
 +
 +# --- AUTOGEN MARKER --- per-LAN scopes appended at boot below ---
 diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/fstab b/buildroot/board/cvitek/SG200X/overlay/etc/fstab
 new file mode 100644
-index 000000000..c0f0c8e38
+index 000000000..4a0b317d7
 --- /dev/null
 +++ b/buildroot/board/cvitek/SG200X/overlay/etc/fstab
-@@ -0,0 +1,17 @@
+@@ -0,0 +1,29 @@
 +# RNSBox overlay: extend microSD life by mounting log/state dirs
 +# as tmpfs (writes never hit flash) and applying noatime where they would.
 +# `/` is remounted rw,noatime by inittab si1 — see /etc/inittab.
++#
++# /var/log, /var/cache, /var/spool, /var/tmp (and /var/lib/misc) are Buildroot
++# skeleton symlinks to ../tmp, and /var/lock -> ../run/lock, so the /tmp and
++# /run tmpfs below already cover them. Do NOT add separate tmpfs lines for
++# those paths: mount follows the symlink and stacks a second tmpfs on top of
++# /tmp (the old /var/log + /var/cache lines did exactly that, and the last
++# one left every log sharing a 512 KB tmpfs).
++#
++# /tmp is sized for what lands there: syslog (/var/log/messages, rotated by
++# syslogd at 200 KB x 2 — rnsd/lxmd/nomadnet log into it), the other small
++# init-script logs and the dnsmasq leases. The size is a cap, not a
++# reservation — tmpfs only uses RAM for what is actually stored. (The cron
++# spool is on /run, see S84cron.)
++# /tmp is mode 1777, so the sticky-dir symlink/FIFO protections are switched on
++# in /etc/sysctl.d/10-rnsbox-hardening.conf.
 +
 +# <file system>	<mount pt>	<type>	<options>	<dump>	<pass>
 +/dev/root	/		ext2	rw,noauto,noatime			0	1
@@ -120,24 +156,38 @@ index 000000000..c0f0c8e38
 +
 +# Memory-backed mounts — kill SD writes from the chatty paths.
 +tmpfs		/dev/shm	tmpfs	mode=0777				0	0
-+tmpfs		/tmp		tmpfs	mode=1777				0	0
++tmpfs		/tmp		tmpfs	mode=1777,size=16M			0	0
 +tmpfs		/run		tmpfs	mode=0755,nosuid,nodev			0	0
-+tmpfs		/var/log	tmpfs	mode=0755,size=4M			0	0
-+tmpfs		/var/lock	tmpfs	mode=1777,size=512k			0	0
-+tmpfs		/var/cache	tmpfs	mode=0755,size=512k			0	0
 diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S30eth b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S30eth
-index d30bc52c1..dd620e707 100755
+index d30bc52c1..5bf026886 100755
 --- a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S30eth
 +++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S30eth
-@@ -1,33 +1,84 @@
+@@ -1,33 +1,190 @@
  #!/bin/sh
-+# S30eth — bring up the WAN interface (eth0) with either a DHCP lease or a
-+# static address, per /etc/rnsbox/wan.conf.
++# S30eth — bring up the WAN on eth0 with either a DHCP lease or a static
++# address, per /etc/rnsbox/wan.conf — but ONLY when eth0 is the WAN
++# (interface=eth0, the default).
 +#
-+# DHCP path: busybox udhcpc (its default.script writes the lease addr/route +
-+#   /etc/resolv.conf). Backgrounded; persists, retries on late carrier.
-+# Static path: `ip` assigns addr/route directly and we write resolv.conf
-+#   ourselves (dnsmasq + the box's own resolver follow it).
++# DHCP path: busybox udhcpc (its default.script sets the lease addr/route and
++#   registers the lease DNS with openresolv as "eth0"). Backgrounded;
++#   persists, retries on late carrier. It doesn't notice a cable moved to
++#   another network, so S46wanwatch runs `renew` when the carrier comes back:
++#   udhcpc restarts asking for its old address — a brief WAN re-acquire; the
++#   same network re-grants the same address, another one leases a new one.
++# Static path: `ip` assigns addr/route directly and we register the static
++#   DNS with openresolv as "eth0" ourselves.
++# Either way resolv.conf is generated by openresolv from its database, the
++#   same one dhcpcd feeds for a wlan0 STA — so neither writer's regeneration
++#   drops the other's servers (dnsmasq + the box's own resolver follow it).
++#
++# interface=wlan0 (W variant; S35wifi + dhcpcd address wlan0): eth0 is left
++#   unconfigured — no DHCP client, no address, no route. Otherwise a cable in
++#   eth0 would add udhcpc's metric-0 default route and hijack the WiFi WAN.
++#   udhcpc here is eth0's only DHCP client (dhcpcd.conf no longer lists eth0).
++#
++# `restart` (the portal runs it, then S60routing, on every WAN save) always
++# tears eth0 down first, so eth0 <-> wlan0 and dhcp <-> static switches end
++# clean both ways.
 +#
 +# /boot/eth.nodhcp still forces "leave eth0 alone" (legacy escape hatch).
  
@@ -145,6 +195,7 @@ index d30bc52c1..dd620e707 100755
  
 +WAN_CONF=/etc/rnsbox/wan.conf
 +RESOLV=/etc/resolv.conf
++REQUEST_IP=                  # set by renew: the address udhcpc asks for (-r)
 +
 +cfg() {
 +	# value for key $1 from wan.conf (strip comments/space); empty if absent
@@ -153,9 +204,79 @@ index d30bc52c1..dd620e707 100755
 +	  | sed -E 's/[[:space:]]*$//'
 +}
 +
++wan_iface() {
++	# Same rules as S60routing read_wan(): the interface= key, else a legacy
++	# bare "eth0"/"wlan0" line, else eth0.
++	w=$(cfg interface | tr -d '[:space:]')
++	[ -z "$w" ] && w=$(grep -vE '^[[:space:]]*#|^[[:space:]]*$|=' "$WAN_CONF" 2>/dev/null | head -1 | tr -d '[:space:]')
++	case "$w" in eth0|wlan0) echo "$w" ;; *) echo eth0 ;; esac
++}
++
++eth0_udhcpc_pids() {
++	# Every udhcpc bound to eth0 (argv has " -i eth0 "), whatever the pidfile says.
++	for pid in $(pidof udhcpc); do
++		case "$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)" in
++			*" -i eth0 "*) echo "$pid" ;;
++		esac
++	done
++}
++
++stop_dhcp() {
++	# Kill every udhcpc bound to eth0, not just the one in our pidfile — a
++	# stray client (repeated `start`, stale pidfile) would otherwise keep
++	# re-adding its lease + default route behind our back.
++	# udhcpc runs without -R, so it leaves its lease/route behind on SIGTERM —
++	# stop() flushes eth0 afterwards.
++	for pid in $(eth0_udhcpc_pids); do
++		kill "$pid" 2>/dev/null
++	done
++	rm -f /run/udhcpc.eth0.pid
++}
++
++# dhcp_wan — true when start() would run udhcpc: no /boot/eth.nodhcp,
++# interface=eth0, and not static with an address (an empty static address
++# falls back to DHCP).
++dhcp_wan() {
++	[ ! -e /boot/eth.nodhcp ] && [ "$(wan_iface)" = eth0 ] || return 1
++	[ "$(cfg mode)" != static ] || [ -z "$(cfg address)" ]
++}
++
++# renew — S46wanwatch runs this when eth0's carrier comes back (cable
++# re-plugged, maybe into another network). udhcpc doesn't watch carrier, so
++# the old lease + default route would otherwise stay until T1/T2. Restart
++# it, as dhcpcd does on carrier-up, asking for the address eth0 held (-r:
++# busybox puts it in the DISCOVER as the requested-IP option, nothing more).
++# The same network re-grants it; another network ignores the hint and offers
++# its own address. Either way the WAN is back after a brief outage; a silent
++# network leaves udhcpc retrying in the background, as at boot. No-op unless
++# eth0 is the DHCP WAN. Nothing for S60routing to redo: the ruleset names
++# ifaces, not addresses.
++renew() {
++	dhcp_wan || return 0
++	REQUEST_IP=$(ip -4 -o addr show dev eth0 2>/dev/null | awk '{sub("/.*", "", $4); print $4; exit}')
++	echo "eth0 renew: restarting udhcpc${REQUEST_IP:+, asking for $REQUEST_IP}"
++	stop
++	start
++}
++
++strip_resolv() {
++	# Drop eth0's entry from openresolv's database (udhcpc's default.script and
++	# start_static both register as "eth0"); openresolv regenerates resolv.conf
++	# from what's left, e.g. dhcpcd's wlan0.dhcp. No-op if eth0 had no entry.
++	resolvconf -d eth0 -f 2>/dev/null
++}
++
 +start_dhcp() {
++	stop_dhcp   # never run two clients on eth0 (e.g. `start` issued twice)
 +	# -t tries, -T timeout, -A wait-before-retry, -b background after lease fail
-+	(udhcpc -i eth0 -t 10 -T 1 -A 5 -b -p /run/udhcpc.eth0.pid) &
++	# -x hostname: send DHCP option 12 (udhcpc sends none by default). dhcpcd's
++	#   `hostname` used to cover eth0 back when dhcpcd also ran there; without
++	#   it the upstream router's lease/DNS no longer knows the box by name. An
++	#   empty value is skipped by udhcpc, not fatal. (Keep "-i eth0" followed
++	#   by another argument: stop_dhcp matches " -i eth0 ".)
++	# -r (renew only): the address to ask for, see renew.
++	(udhcpc -i eth0 -x hostname:"$(hostname)" -t 10 -T 1 -A 5 -b -p /run/udhcpc.eth0.pid \
++	  ${REQUEST_IP:+-r "$REQUEST_IP"}) &
 +	echo "dhcp"
 +}
 +
@@ -171,16 +292,19 @@ index d30bc52c1..dd620e707 100755
 +	ip addr add "$addr/$prefix" dev eth0 2>/dev/null
 +	ip link set eth0 up 2>/dev/null
 +	if [ -n "$gw" ]; then
-+		ip route del default 2>/dev/null
-+		ip route add default via "$gw" dev eth0 2>/dev/null
++		# replace (not del+add): swaps out any metric-0 default but leaves
++		# dhcpcd's wlan0 default (metric 3000+) alone if the STA is also up.
++		ip route replace default via "$gw" dev eth0 2>/dev/null
 +	fi
-+	# Write resolv.conf for the static DNS servers. /etc/resolv.conf is a
-+	# symlink into /tmp; rewrite the target so dnsmasq (upstream) + the box's
-+	# own resolver pick the static servers up. Tag the lines so a later DHCP
-+	# run on another iface can distinguish them.
++	# Register the static DNS servers with openresolv as the eth0 entry, so
++	# dnsmasq (upstream) + the box's own resolver use them and a dhcpcd event on
++	# a wlan0 STA (resolvconf -a wlan0.dhcp) can't regenerate them away.
++	# Exclusive: only the operator's servers are listed while this is set.
++	# The touch lets openresolv back up an empty file, not a stale
++	# /etc/resolv.conf.bak from an earlier boot.
 +	if [ -n "$dns" ]; then
-+		: > "$RESOLV"
-+		for s in $dns; do echo "nameserver $s  # eth0-static" >> "$RESOLV"; done
++		[ -e "$RESOLV" ] || : > "$RESOLV"
++		for s in $dns; do echo "nameserver $s"; done | IF_EXCLUSIVE=yes resolvconf -a eth0
 +	fi
 +	echo "static $addr/$prefix gw=${gw:-none} dns=${dns:-none}"
 +}
@@ -190,11 +314,23 @@ index d30bc52c1..dd620e707 100755
 -	if [ ! -e /boot/eth.nodhcp ]
 -	then
 -		(udhcpc -i eth0 -t 10 -T 1 -A 5 -b -p /run/udhcpc.eth0.pid) &
++	# openresolv restores /etc/resolv.conf.bak (on the SD rootfs) whenever its
++	# database empties; the live resolv.conf is in /tmp, so a .bak left from an
++	# earlier boot is always stale. Drop it before anything registers this boot
++	# (/run/resolvconf, openresolv's state dir, doesn't exist yet then).
++	[ -d /run/resolvconf ] || rm -f /etc/resolv.conf.bak
 +	if [ -e /boot/eth.nodhcp ]; then
 +		echo "skipped (/boot/eth.nodhcp present)"
 +		return
  	fi
 -	echo "OK"
++	iface=$(wan_iface)
++	if [ "$iface" != "eth0" ]; then
++		# (stop's strip_resolv already regenerated resolv.conf from dhcpcd's
++		# wlan0 entry when the WAN moved off eth0.)
++		echo "skipped (WAN=$iface — eth0 left unconfigured)"
++		return
++	fi
 +	mode=$(cfg mode); [ -z "$mode" ] && mode=dhcp
 +	case "$mode" in
 +		static) start_static ;;
@@ -205,20 +341,21 @@ index d30bc52c1..dd620e707 100755
  stop() {
 -	kill `cat /run/udhcpc.eth0.pid`
 -	rm /run/udhcpc.eth0.pid
--}
--
++	# Stop the DHCP client(s), whatever wan.conf says now (the WAN may have
++	# just been switched away from eth0).
++	stop_dhcp
++	# Drop any static addressing too, so a mode switch starts clean. Removing
++	# eth0's last IPv4 address also removes every route through it, the
++	# default route included.
++	ip addr flush dev eth0 2>/dev/null
++	strip_resolv
+ }
+ 
 -restart() {
 -	start
 -	stop
-+	# Stop the DHCP client if one is running.
-+	if [ -f /run/udhcpc.eth0.pid ]; then
-+		kill "$(cat /run/udhcpc.eth0.pid)" 2>/dev/null
-+		rm -f /run/udhcpc.eth0.pid
-+	fi
-+	# Drop any static addressing too, so a mode switch starts clean.
-+	ip addr flush dev eth0 2>/dev/null
- }
- 
+-}
+-
 -if [ "${1}" = "start" ]
 -then
 -	start
@@ -233,7 +370,31 @@ index d30bc52c1..dd620e707 100755
 +	start)   start ;;
 +	stop)    stop ;;
 +	restart) stop; start ;;        # NB: real order (old S30eth had it backwards)
-+	*)       echo "Usage: $0 {start|stop|restart}" >&2; exit 1 ;;
++	renew)   renew ;;
++	dhcpwan) dhcp_wan ;;           # exit 0 iff eth0 is the DHCP WAN (S46wanwatch)
++	*)       echo "Usage: $0 {start|stop|restart|renew|dhcpwan}" >&2; exit 1 ;;
++esac
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S41dhcpcd b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S41dhcpcd
+new file mode 100755
+index 000000000..c8514d64a
+--- /dev/null
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S41dhcpcd
+@@ -0,0 +1,16 @@
++#!/bin/sh
++# RNSBox: no dhcpcd manager daemon. S35wifi starts a per-interface
++# `dhcpcd -b -n wlan0` only when wlan0 is a WiFi client (mode sta / sta+ap)
++# and stops it with `dhcpcd -x wlan0`. A manager (dhcpcd -f with no iface)
++# would activate wlan0 even when it is the hotspot (mode=ap: hostapd gives it
++# carrier). It would then send DHCP to hotspot clients, and any client that
++# answered could push a default route and upstream DNS (openresolv ->
++# dnsmasq) onto the box. At boot in sta mode it also ran a second DHCP client
++# on wlan0 that `dhcpcd -x wlan0` did not stop.
++#
++# This overlay file replaces the dhcpcd package's S41dhcpcd (the overlay is
++# copied in target-finalize, after packages install).
++case "$1" in
++	start|stop|restart|reload|force-reload) exit 0 ;;
++	*) echo "Usage: $0 {start|stop|restart|reload|force-reload}"; exit 1 ;;
 +esac
 diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S60routing b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S60routing
 new file mode 100755
@@ -438,55 +599,87 @@ index 5017cc5bb..01260105c 100644
  #ca::ctrlaltdel:/sbin/reboot
 diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/nftables.conf b/buildroot/board/cvitek/SG200X/overlay/etc/nftables.conf
 new file mode 100644
-index 000000000..44f06e3f0
+index 000000000..d7a10da0d
 --- /dev/null
 +++ b/buildroot/board/cvitek/SG200X/overlay/etc/nftables.conf
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,78 @@
 +# /etc/nftables.conf — REGENERATED AT BOOT by /etc/init.d/S60routing.
 +#
-+# This static fallback is only used if S60routing's call to
-+# `python3 -m rnsbox_portal.nftgen` fails (defensive: keeps SSH + NAT
-+# working even if the portal package is broken). The fallback intentionally
-+# has NO port forwards and NO non-SSH WAN-exposed services.
++# What ships here is only a static FALLBACK: it is what S60routing loads if
++# `/usr/sbin/rnsbox-portal nftgen` fails before it has ever produced a ruleset
++# (a broken portal binary on first boot). Once nftgen succeeds this file is
++# replaced by its output, and later failures keep the last good generated file
++# if it was generated for the same WAN/LAN (else the emergency ruleset).
++#
++# It fails CLOSED toward the WAN and needs no WAN iface name:
++#   - LAN ifaces (usb0; wlan1 = the concurrent-mode hotspot vif, only ever an
++#     AP) keep full access, so SSH / the web UI stay reachable over USB-C to
++#     repair things. An AP-only hotspot runs on wlan0, which a static file
++#     can't tell apart from a wlan0 WAN, so it counts as non-LAN here;
++#   - every other iface (eth0, wlan0, sl0, ...) reaches nothing on the box:
++#     no port forwards, no open ports and — unlike the generated ruleset — no
++#     WAN SSH;
++#   - LAN clients keep internet: forwarded + masqueraded out of eth0 and
++#     wlan0 (the only possible WANs, whichever it is). Nothing else, e.g. sl0
++#     (the HaLow modem), is reachable from the LAN.
++# The ip6 table needs a kernel with IPv6 (nft -f is all-or-nothing). If this
++# whole file fails to load, S60routing installs its built-in IPv4-only
++# emergency ruleset instead (same LAN-only policy); see S60routing.
 +#
 +# Re-render the live config (after editing /etc/rnsbox/*.conf) via:
 +#   /etc/init.d/S60routing restart
-+#
-+# Topology assumption: WAN=eth0, LAN=usb0. If WAN is different the
-+# fallback won't masquerade correctly — boot S60routing to regenerate.
 +
 +flush ruleset
 +
-+table inet filter {
++table ip filter {
++	set lan_ifaces { type ifname; elements = { "usb0", "wlan1" } }
++
 +	chain input {
 +		type filter hook input priority filter; policy drop;
 +		ct state invalid drop
 +		ct state established,related accept
 +		iifname "lo" accept
-+		icmp type echo-request limit rate 10/second accept
-+		icmpv6 type { echo-request, nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert } accept
 +		# LAN: full surface (HTTP UI, SSH, DHCP, DNS, etc.)
-+		iifname "usb0" accept
-+		# WAN: SSH only by default
-+		iifname "eth0" tcp dport 22 accept
++		iifname @lan_ifaces accept
 +	}
++
 +	chain forward {
 +		type filter hook forward priority filter; policy drop;
 +		ct state invalid drop
 +		ct state established,related accept
-+		iifname "usb0" oifname "eth0" accept
++		# LAN -> uplink. Only eth0/wlan0 can ever be the WAN (S60routing
++		# WAN_CANDIDATES), so name them: sl0 (the HaLow modem) and any other
++		# iface stay unreachable from the LAN, as in the generated ruleset.
++		iifname @lan_ifaces oifname { "eth0", "wlan0" } accept
 +	}
++
 +	chain output { type filter hook output priority filter; policy accept; }
 +}
 +
 +table ip nat {
-+	chain prerouting {
-+		type nat hook prerouting priority dstnat; policy accept;
-+	}
 +	chain postrouting {
 +		type nat hook postrouting priority srcnat; policy accept;
-+		oifname "eth0" masquerade
++		oifname { "eth0", "wlan0" } masquerade
 +	}
++}
++
++table ip6 filter {
++	set lan_ifaces { type ifname; elements = { "usb0", "wlan1" } }
++
++	chain input {
++		type filter hook input priority filter; policy drop;
++		ct state invalid drop
++		ct state established,related accept
++		iifname "lo" accept
++		iifname @lan_ifaces icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, mld-listener-query, mld-listener-report, mld-listener-done, mld2-listener-report } accept
++		iifname @lan_ifaces accept
++	}
++
++	chain forward {
++		type filter hook forward priority filter; policy drop;
++	}
++
++	chain output { type filter hook output priority filter; policy accept; }
 +}
 diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/openports.conf b/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/openports.conf
 new file mode 100644
@@ -528,18 +721,21 @@ index 000000000..3826c60fb
 +#   /etc/init.d/S60routing restart
 diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/wan.conf b/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/wan.conf
 new file mode 100644
-index 000000000..2edba0da8
+index 000000000..c1d3f39ae
 --- /dev/null
 +++ b/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/wan.conf
-@@ -0,0 +1,24 @@
+@@ -0,0 +1,27 @@
 +# WAN uplink config — managed by the rnsbox-portal Network tab.
 +#
-+# Flat key=value. Parsed by both the Flask portal (store.py) and the shell
-+# init scripts (S30eth addresses eth0; S60routing picks the NAT iface).
++# Flat key=value. Parsed by both the C++ portal (store.cpp, in
++# /usr/sbin/rnsbox-portal — it rewrites this file on save) and the shell init
++# scripts (S30eth addresses eth0 only when interface=eth0; S60routing picks
++# the NAT iface).
 +#
 +# interface:  which iface acts as WAN (default route + NAT masquerade attach here)
 +#   eth0    - onboard RJ45 (the only working option on the Nano-e SKU; default)
-+#   wlan0   - WiFi client (W variant only; addressed by S35wifi/dhcpcd, not here)
++#   wlan0   - WiFi client (W variant only; addressed by S35wifi/dhcpcd, not here).
++#             eth0 is then left unconfigured (no DHCP client, no address).
 +#
 +# mode:  how eth0 gets its IPv4 address
 +#   dhcp    - lease from the upstream router (default)
@@ -556,6 +752,111 @@ index 000000000..2edba0da8
 +
 +interface=eth0
 +mode=dhcp
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/sysctl.d/10-rnsbox-hardening.conf b/buildroot/board/cvitek/SG200X/overlay/etc/sysctl.d/10-rnsbox-hardening.conf
+new file mode 100644
+index 000000000..1d12a856a
+--- /dev/null
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/sysctl.d/10-rnsbox-hardening.conf
+@@ -0,0 +1,11 @@
++# RNSBox: standard protections for sticky world-writable dirs. The kernel
++# default for all four is 0. /tmp is a mode-1777 tmpfs, and /var/log,
++# /var/spool, /var/cache and /var/lib/misc are symlinks to it. Root init
++# scripts append to fixed names there (e.g. /var/log/slip.log,
++# /var/log/cron.log). These settings stop a non-root process (dnsmasq runs as
++# nobody) from planting a symlink, hardlink, FIFO or regular file there for
++# root to open. Applied by /etc/init.d/S02sysctl, long before S80dnsmasq.
++fs.protected_symlinks = 1
++fs.protected_hardlinks = 1
++fs.protected_regular = 2
++fs.protected_fifos = 2
+diff --git a/buildroot/board/cvitek/SG200X/overlay/usr/share/udhcpc/default.script b/buildroot/board/cvitek/SG200X/overlay/usr/share/udhcpc/default.script
+index b55b2c74e..f2c92ef45 100755
+--- a/buildroot/board/cvitek/SG200X/overlay/usr/share/udhcpc/default.script
++++ b/buildroot/board/cvitek/SG200X/overlay/usr/share/udhcpc/default.script
+@@ -12,6 +12,13 @@ then
+ 	RESOLV_CONF="/etc/resolv.conf.dhcp"
+ fi
+ [ -e $RESOLV_CONF ] || touch $RESOLV_CONF
++# RNSBox: register DNS in openresolv's database (the same one dhcpcd's
++# wlan0 hook uses) instead of editing resolv.conf, so a dhcpcd event on
++# wlan0 can't regenerate eth0's servers away. /boot/resolv.conf keeps the
++# legacy direct write to resolv.conf.dhcp.
++USE_RESOLVCONF=false
++[ "$RESOLV_CONF" = /etc/resolv.conf ] && command -v resolvconf >/dev/null 2>&1 &&
++	USE_RESOLVCONF=true
+ [ -n "$broadcast" ] && BROADCAST="broadcast $broadcast"
+ [ -n "$subnet" ] && NETMASK="netmask $subnet"
+ # Handle stateful DHCPv6 like DHCPv4
+@@ -41,11 +48,15 @@ case "$ACTION" in
+ 		/sbin/ifconfig $interface 0.0.0.0
+ 
+ 		# drop info from this interface
+-		# resolv.conf may be a symlink to /tmp/, so take care
+-		TMPFILE=$(mktemp)
+-		grep -vE "# $interface\$" $RESOLV_CONF > $TMPFILE
+-		cat $TMPFILE > $RESOLV_CONF
+-		rm -f $TMPFILE
++		if $USE_RESOLVCONF; then
++			resolvconf -d "$interface" -f
++		else
++			# resolv.conf may be a symlink to /tmp/, so take care
++			TMPFILE=$(mktemp)
++			grep -vE "# $interface\$" $RESOLV_CONF > $TMPFILE
++			cat $TMPFILE > $RESOLV_CONF
++			rm -f $TMPFILE
++		fi
+ 
+ 		if [ -x /usr/sbin/avahi-autoipd ]; then
+ 			/usr/sbin/avahi-autoipd -c $interface && /usr/sbin/avahi-autoipd -k $interface
+@@ -94,13 +105,6 @@ case "$ACTION" in
+ 			done
+ 		fi
+ 
+-		# drop info from this interface
+-		# resolv.conf may be a symlink to /tmp/, so take care
+-		TMPFILE=$(mktemp)
+-		grep -vE "# $interface\$" $RESOLV_CONF > $TMPFILE
+-		cat $TMPFILE > $RESOLV_CONF
+-		rm -f $TMPFILE
+-
+ 		# prefer rfc3397 domain search list (option 119) if available
+ 		if [ -n "$search" ]; then
+ 			search_list=$search
+@@ -108,13 +112,27 @@ case "$ACTION" in
+ 			search_list=$domain
+ 		fi
+ 
+-		[ -n "$search_list" ] &&
+-			echo "search $search_list # $interface" >> $RESOLV_CONF
+-
+-		for i in $dns ; do
+-			echo adding dns $i
+-			echo "nameserver $i # $interface" >> $RESOLV_CONF
+-		done
++		if $USE_RESOLVCONF; then
++			{
++				[ -n "$search_list" ] && echo "search $search_list"
++				for i in $dns ; do echo "nameserver $i"; done
++			} | resolvconf -a "$interface"
++		else
++			# drop info from this interface
++			# resolv.conf may be a symlink to /tmp/, so take care
++			TMPFILE=$(mktemp)
++			grep -vE "# $interface\$" $RESOLV_CONF > $TMPFILE
++			cat $TMPFILE > $RESOLV_CONF
++			rm -f $TMPFILE
++
++			[ -n "$search_list" ] &&
++				echo "search $search_list # $interface" >> $RESOLV_CONF
++
++			for i in $dns ; do
++				echo adding dns $i
++				echo "nameserver $i # $interface" >> $RESOLV_CONF
++			done
++		fi
+ 		;;
+ esac
+ 
 -- 
 2.47.3
 

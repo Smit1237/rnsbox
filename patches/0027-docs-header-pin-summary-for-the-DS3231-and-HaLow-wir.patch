@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: smit1237 <smit1237@gmail.com>
+Date: Thu, 24 Sep 2026 18:39:40 +0300
+Subject: [PATCH 27/30] docs: header pin summary for the DS3231 and HaLow
+ wiring
+
+One table of the header pads RNSBox uses (GPIOA15/A27 I2C5 for the
+DS3231, GPIOA28/A29 UART1 for the HaLow modem, 3V3, GND) with a link to
+Sipeed's pinout diagram, the I2C1/I2C3 warning for the W board, and a note
+on Raspberry Pi RTC modules (socket order, often no pull-ups).
+---
+ README.RNSBox.md | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/README.RNSBox.md b/README.RNSBox.md
+index ff7ca80cc..ba9ea1a2e 100644
+--- a/README.RNSBox.md
++++ b/README.RNSBox.md
+@@ -58,6 +58,24 @@ DDR is available to Linux and the router data plane.
+   and a WiFi-HaLow RNode modem on UART1 (see
+   [Connecting a WiFi-HaLow (RNode) modem over SLIP](#connecting-a-wifi-halow-rnode-modem-over-slip)).
+ 
++### Header pins used by RNSBox
++
++All pads are 3.3 V logic. Physical positions are on Sipeed's
++[LicheeRV Nano pinout diagram](https://github.com/sipeed/sipeed_wiki/raw/main/docs/hardware/en/lichee/assets/RV_Nano/intro/RV_Nano_3.jpg)
++(the pad names below match its labels).
++
++| Pad        | Function          | Used for                        | Details |
++|------------|-------------------|---------------------------------|---------|
++| `GPIOA15`  | I²C5 SCL (bit-bang) | DS3231 RTC `SCL`              | [DS3231](#optional-ds3231-rtc) |
++| `GPIOA27`  | I²C5 SDA (bit-bang) | DS3231 RTC `SDA`              | [DS3231](#optional-ds3231-rtc) |
++| `GPIOA28`  | UART1 TX (`ttyS1`)  | HaLow modem `RX` (cross over) | [SLIP wiring](#wiring--pinout) |
++| `GPIOA29`  | UART1 RX (`ttyS1`)  | HaLow modem `TX` (cross over) | [SLIP wiring](#wiring--pinout) |
++| `3V3`      | power             | DS3231 `VCC` (never 5 V)        | |
++| `GND`      | ground            | DS3231 `GND`, modem `GND`       | |
++
++Don't use the pads Sipeed labels **I2C1** / **I2C3**: they are the SD1 pads,
++which on the Nano-e **W** carry the SDIO bus to the WiFi chip.
++
+ ## Default credentials
+ 
+ | Service | User  | Password |
+@@ -272,6 +290,12 @@ and shows up as `/dev/rtc0`.
+ - **Coin-cell charging.** The ZS-042 trickle-charges its cell through a
+   resistor and diode, which is unsafe with a non-rechargeable CR2032. Remove
+   that resistor or diode, or use an LIR2032.
++- **Raspberry Pi RTC modules** (the small boards with a 5-pin socket made to
++  sit on Pi pins 1–9) work too: their socket reads `+ D C NC −` = 3V3, SDA,
++  SCL, not connected, GND. They often have **no pull-ups**, because the Pi
++  provides its own. With everything unpowered, measure SDA→`+` and SCL→`+`:
++  a few kΩ means pull-ups are fitted; open circuit means add 4.7 kΩ from each
++  line to 3V3. Check it answers with `i2cdetect -y 5` (address `68`).
+ - **Why not I2C1 / I2C3?** Sipeed's pinout labels the SD1 pads as I2C1 and
+   I2C3. On the Nano-e **W** those pads carry the SDIO bus to the AIC8800
+   WiFi. `GPIOA15` / `GPIOA27` are free on both boards, so one image serves
+-- 
+2.47.3
+

@@ -1,0 +1,2371 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: smit1237 <smit1237@gmail.com>
+Date: Thu, 24 Sep 2026 23:13:19 +0300
+Subject: [PATCH 28/30] lan: one bridged LAN (br-lan) for USB-C and the WiFi
+ hotspot
+
+The USB-C NCM link and the W board's hotspot now share one LAN,
+br-lan = 10.42.0.1/24, instead of a separate 192.168.42.0/24 hotspot
+subnet.
+
+- kernel: CONFIG_BRIDGE=y (plain L2 bridge; no bridge netfilter).
+- S30gadget_nic creates br-lan at every boot (STP off, forward_delay 0,
+  multicast snooping off, per-unit MAC), enslaves usb0 and puts the LAN
+  address on the bridge; falls back to addressing usb0 directly if the
+  bridge can't be made. The LAN iface in use is recorded in
+  /run/lan-iface and read by every consumer.
+- hostapd joins the AP iface to br-lan (bridge=br-lan); ap_ip/ap_dhcp_*
+  are gone. dnsmasq serves one pool, 10.42.0.10-.250.
+- Firewall (generated, early, fallback, emergency), IPv6 confinement and
+  Reticulum's AutoInterface (devices = br-lan, usb0; bitrate pinned at
+  10 Mbit/s) follow the LAN iface; the portal shows one LAN.
+- Docs updated.
+---
+ APPLYING.md                                   |  22 +-
+ README.RNSBox.md                              | 105 ++++++---
+ build-rnsbox.sh                               |  12 +-
+ .../linux/sg2002_licheervnano_sd_defconfig    |  24 +-
+ .../sd_tools/sd_gen_burn_image_rootless.sh    |   7 +-
+ .../cvitek/SG200X/overlay/etc/dhcpcd.conf     |  22 +-
+ .../SG200X/overlay/etc/dhcpcd.exit-hook       |  72 ++++++
+ .../cvitek/SG200X/overlay/etc/dnsmasq.conf    |  13 +-
+ .../SG200X/overlay/etc/init.d/S08usbdev       |   8 +-
+ .../cvitek/SG200X/overlay/etc/init.d/S09ipv6  |  42 ++--
+ .../cvitek/SG200X/overlay/etc/init.d/S29fw    |   7 +-
+ .../SG200X/overlay/etc/init.d/S30gadget_nic   | 211 +++++++++++++-----
+ .../cvitek/SG200X/overlay/etc/init.d/S35wifi  | 131 ++++++++---
+ .../SG200X/overlay/etc/init.d/S36wifiwatch    |  14 +-
+ .../SG200X/overlay/etc/init.d/S46wanwatch     |  47 ++--
+ .../SG200X/overlay/etc/init.d/S60routing      | 115 +++++-----
+ .../cvitek/SG200X/overlay/etc/init.d/S82rnsd  |  76 ++++---
+ .../cvitek/SG200X/overlay/etc/nftables.conf   |  13 +-
+ .../SG200X/overlay/etc/reticulum/config       |  45 ++--
+ .../SG200X/overlay/etc/rnsbox/openports.conf  |   4 +-
+ .../SG200X/overlay/etc/rnsbox/wifi.conf       |  11 +-
+ .../overlay/etc/sysctl.d/20-rnsbox-net.conf   |  21 ++
+ .../package/rnsbox-portal/src/cgi/main.cpp    |  17 +-
+ .../package/rnsbox-portal/src/cgi/nftgen.cpp  |  13 +-
+ .../package/rnsbox-portal/src/cgi/nftgen.h    |  10 +-
+ .../src/cgi/pages/dashboard.html              |   9 +
+ .../rnsbox-portal/src/cgi/pages/network.html  |   4 +-
+ .../rnsbox-portal/src/cgi/pages/wifi.html     |  10 +-
+ .../rnsbox-portal/src/cgi/routes_dash.cpp     |  66 +++++-
+ .../rnsbox-portal/src/cgi/routes_net.cpp      |  24 +-
+ .../rnsbox-portal/src/cgi/routes_wifi.cpp     |  24 +-
+ .../package/rnsbox-portal/src/cgi/sysinfo.cpp |  48 +++-
+ .../package/rnsbox-portal/src/cgi/sysinfo.h   |  30 ++-
+ .../package/rnsbox-portal/src/cgi/wifi.cpp    |  35 ++-
+ .../package/rnsbox-portal/src/cgi/wifi.h      |   4 +-
+ 35 files changed, 960 insertions(+), 356 deletions(-)
+ create mode 100644 buildroot/board/cvitek/SG200X/overlay/etc/dhcpcd.exit-hook
+ create mode 100644 buildroot/board/cvitek/SG200X/overlay/etc/sysctl.d/20-rnsbox-net.conf
+
+diff --git a/APPLYING.md b/APPLYING.md
+index 5b85779dc..9e9b5b190 100644
+--- a/APPLYING.md
++++ b/APPLYING.md
+@@ -136,12 +136,13 @@ As with `build_all`, flash the image from the `build-rnsbox.sh` run that
+ follows instead.
+ 
+ `build-rnsbox.sh` catches the common cases: it warns when the built kernel
+-lacks IPv6 (Reticulum's AutoInterface on `usb0` needs it), lacks the DS3231
+-RTC driver, or predates RNSBox's `rtc-ds1307` fix; it rebuilds the AIC8800
+-driver when that is older than the kernel config; it ships the kernel's
+-installed modules and removes older copies from the overlay and target; and
+-it stops when the kernel's installed modules are older than the kernel
+-config.
++lacks IPv6 (Reticulum's AutoInterface on the LAN needs it), lacks bridge
++support (the LAN bridge `br-lan`: without it the LAN is `usb0` alone and the
++WiFi hotspot stays off), lacks the DS3231 RTC driver, or predates RNSBox's
++`rtc-ds1307` fix; it rebuilds the AIC8800 driver when that is older than the
++kernel config; it ships the kernel's installed modules and removes older
++copies from the overlay and target; and it stops when the kernel's installed
++modules are older than the kernel config.
+ 
+ Buildroot does not notice a changed package recipe either. `build-rnsbox.sh`
+ handles the packages listed above; for any other package you change, run
+@@ -161,10 +162,11 @@ e.g. 8 GB). The rootfs grows to fill the card on first boot.
+ ## 7. First boot
+ 
+ Plug the board into a host over USB-C. The host gets an address in
+-`10.42.0.10`–`.20` by DHCP; browse to `http://10.42.0.1/`. Use the IP
+-address: the portal answers only to an IP address (or `localhost` through an
+-SSH tunnel). The built-in names `setup.lan`, `setup.rnsbox`, `router.rnsbox`
+-and `rnsbox.local` redirect to the IP; any other name gets 403.
++`10.42.0.10`–`.250` by DHCP (the pool the WiFi hotspot's clients share; one
++LAN); browse to `http://10.42.0.1/`. Use the IP address: the portal answers
++only to an IP address (or `localhost` through an SSH tunnel). The built-in
++names `setup.lan`, `setup.rnsbox`, `router.rnsbox` and `rnsbox.local`
++redirect to the IP; any other name gets 403.
+ 
+ | Service | User  | Password |
+ |---------|-------|----------|
+diff --git a/README.RNSBox.md b/README.RNSBox.md
+index ba9ea1a2e..288f86598 100644
+--- a/README.RNSBox.md
++++ b/README.RNSBox.md
+@@ -15,14 +15,17 @@ kernel, Buildroot and the CVITEK/Sipeed BSP themselves come from upstream.
+ 
+ - **`rnsd`** (Reticulum 1.5.2) runs as the long-lived service: a transport node
+   with a `TCPServerInterface` on `0.0.0.0:4242` (open on the WAN by default,
+-  so Reticulum peers can connect in), an `AutoInterface` on the USB-C LAN,
+-  and two public RNS-testnet uplinks preconfigured.
++  so Reticulum peers can connect in), an `AutoInterface` on the LAN (the
++  USB-C link and the WiFi hotspot), and two public RNS-testnet uplinks
++  preconfigured.
+ - **Works offline.** `rnsd` starts at every boot with or without internet, NTP
+   or an RTC, so HaLow-, LAN- or WiFi-only meshes work. The time comes from NTP
+   when a server is reachable, from your browser, or at boot from an optional
+   DS3231 RTC. See [Clock and offline operation](#clock-and-offline-operation).
+ - **USB-C gadget = LAN.** The board presents a CDC-NCM network interface
+-  (`usb0 = 10.42.0.1/24`, dnsmasq DHCP + DNS). The DVD build additionally
++  (`usb0`), bridged with the WiFi hotspot (*W* board) into one LAN
++  (`br-lan = 10.42.0.1/24`, dnsmasq DHCP + DNS, pool `10.42.0.10`–`.250`).
++  See [Networking notes](#networking-notes). The DVD build additionally
+   exposes a read-only mass-storage "disc" pre-loaded with Reticulum client apps
+   for a zero-download quick start.
+ - **eth0 = WAN** (DHCP or static), or the WiFi client on the *W* board
+@@ -30,8 +33,8 @@ kernel, Buildroot and the CVITEK/Sipeed BSP themselves come from upstream.
+   management.
+ - **`rnsbox-portal`** — a C++ CGI admin UI (served by `uhttpd`) for network,
+   Reticulum, WiFi, clock and system settings. Open it by IP address:
+-  `http://10.42.0.1/` over USB-C, or the box's hotspot or WAN address. It is
+-  the single source of truth for the generated `nftables` ruleset (boot and
++  `http://10.42.0.1/` over USB-C or the hotspot, or the box's WAN address. It
++  is the single source of truth for the generated `nftables` ruleset (boot and
+   live-apply both call the same generator). As a DNS-rebinding guard it only
+   answers on an IP address (or `localhost`, for an SSH tunnel); the built-in
+   names such as `setup.lan` redirect to the IP, and any other name gets 403.
+@@ -111,9 +114,12 @@ a hotspot), and **STA + AP** (both at once). The hotspot runs on 2.4 GHz,
+ and since the radio can't be on two bands at once, STA + AP pins the WiFi
+ client to 2.4 GHz too: an upstream that only offers 5 GHz won't connect in
+ that mode, so use STA-only for a 5 GHz uplink. The WiFi client can be the WAN
+-(*Network → WAN uplink → wlan0*; always DHCP). The hotspot (`RNSBox-AP`,
+-`192.168.42.1/24`) is a second LAN: its clients get DHCP, DNS, the portal and
+-NAT'd internet, like the USB-C LAN.
++(*Network → WAN uplink → wlan0*; always DHCP), though not over another
++RNSBox's hotspot (see [Networking notes](#networking-notes)). The hotspot
++(`RNSBox-AP`) is part of the LAN: hostapd bridges it with the USB-C link into
++`br-lan`, so its clients share `10.42.0.0/24` and the one DHCP pool with the
++USB host, reach the portal at `10.42.0.1` and get NAT'd internet. Traffic
++between the USB host and hotspot clients is switched, not firewalled.
+ 
+ Because the AIC8800 is a **single radio**, the STA and AP time-share it, and the
+ hotspot is treated as the priority so local clients stay served:
+@@ -131,31 +137,55 @@ A small background watchdog (`S36wifiwatch`) enforces this and is active only in
+ 
+ ## Networking notes
+ 
+-- **IPv6 is link-local only, and only on the USB-C LAN (`usb0`).** It exists
++- **One LAN bridge.** `S30gadget_nic` creates the Linux bridge `br-lan` at
++  boot (kernel `CONFIG_BRIDGE=y`) with `usb0` as a port and `10.42.0.1/24` on
++  the bridge; while the hotspot runs, hostapd adds the AP interface (`wlan0`
++  in AP mode, `wlan1` in STA + AP) as a second port. STP is off with no
++  forwarding delay (the USB host's first DHCP request isn't lost), and
++  multicast snooping is off, so AutoInterface's multicast reaches every port.
++  The bridge keeps the box's per-unit USB MAC. The ports carry no address;
++  traffic between them is switched at L2 and not filtered, and nftables sees
++  every LAN client as `br-lan`. `br-lan` exists even with no USB host and no
++  radio (Nano-e). If the bridge can't be made, `usb0` is addressed directly
++  as before and the hotspot stays off (the WiFi tab says why). The LAN
++  interface in use is recorded in `/run/lan-iface` (`br-lan`, or `usb0`).
++- **IPv6 is link-local only, and only on the LAN (`br-lan`).** It exists
+   solely for Reticulum's `AutoInterface`, which discovers peers over IPv6
+   link-local multicast (`ff12::`, UDP 29716/29717, data on 42671). Every other
+-  interface — `eth0`, the WiFi client and hotspot, `sl0` — has IPv6 disabled
+-  (`S09ipv6`); the box does no IPv6 routing, NAT, RA or DHCPv6, has no IPv6
+-  internet, and dnsmasq filters AAAA records for LAN clients.
+-- For AutoInterface discovery, the host's USB network adapter must have IPv6
+-  enabled (the default on Windows, macOS and Linux). Otherwise point a
+-  `TCPClientInterface` at `10.42.0.1:4242`. Hotspot clients always use TCP
+-  (`192.168.42.1:4242`); AutoInterface does not run on the hotspot.
+-- RNS adopts an AutoInterface interface only when `rnsd` starts, and `usb0`
+-  gets its link-local address only once a USB host brings the link up. If the
+-  host attaches after `rnsd` started (box powered separately, or a slow first
+-  driver install), `S46wanwatch` restarts `rnsd` once when the address appears.
+-- **Firewall fail-safe.** The ruleset is regenerated at boot and
+-  pre-validated (`nft -c`) before it is swapped in. If generation fails on a
+-  first boot, the shipped fallback `/etc/nftables.conf` is LAN-only: the
+-  USB-C LAN keeps SSH, the web UI and NAT'd internet, while no WAN SSH, port
++  interface — `eth0`, the WiFi client, `sl0`, and the bridge's own ports — has
++  IPv6 disabled (`S09ipv6`); the box does no IPv6 routing, NAT, RA or DHCPv6,
++  has no IPv6 internet, and dnsmasq filters AAAA records for LAN clients.
++- For AutoInterface discovery, a client's network adapter (the host's USB
++  adapter, or a hotspot client's WiFi) must have IPv6 enabled (the default on
++  Windows, macOS, Linux and Android). Otherwise point a `TCPClientInterface`
++  at `10.42.0.1:4242` from the client (over USB-C or the hotspot alike). This
++  doesn't apply to another RNSBox: see the next note.
++- **Every RNSBox has the same LAN, `10.42.0.0/24`** (hotspot included), so
++  one RNSBox can't use another's hotspot as its WiFi uplink: the lease's
++  router and DNS, `10.42.0.1`, would be its own LAN address, leaving it with
++  no DNS and no way to reach the other box. The WiFi client therefore refuses
++  DHCP from `10.42.0.0/24` (another RNSBox's hotspot, or a Linux "shared"
++  connection, which uses `10.42.0.1/24` too). It stays associated but gets
++  no address, and the WiFi tab says why. The box also answers ARP only for an
++  address on the interface that was asked, so it can't pass itself off as
++  that network's `10.42.0.1`. Give it another uplink (Ethernet, or another
++  WiFi network). To link two RNSBoxes over Reticulum, point a
++  `TCPClientInterface` at the other box's WAN address, not at `10.42.0.1`.
++- RNS adopts an AutoInterface interface only when `rnsd` starts, and `br-lan`
++  gets its link-local address only once one of its ports has a link (a USB
++  host brings the NCM link up, or the hotspot starts). If that happens after
++  `rnsd` started (box powered separately, or a slow first driver install),
++  `S46wanwatch` restarts `rnsd` once when the address appears.
++- **Firewall fail-safe.** The ruleset is regenerated at boot and pre-validated
++  (`nft -c`) before it is swapped in. If generation fails on a first boot, the
++  shipped fallback `/etc/nftables.conf` is LAN-only: the LAN (USB-C link and
++  hotspot) keeps SSH, the web UI and NAT'd internet, while no WAN SSH, port
+   forwards or open ports are allowed. If even that can't load, a built-in
+   IPv4-only emergency ruleset is used; if nf_tables is unusable, forwarding
+   stays off. Details go to `/var/log/nftgen.err`. The same emergency ruleset
+-  (LAN only: the USB-C link, plus the hotspot at shutdown if it is on) is
+-  loaded before the WAN gets an address at boot (`S29fw`) and when the
+-  firewall is stopped at shutdown, so WAN SSH is never briefly open while the
+-  box boots.
++  (LAN only: `br-lan`, and `usb0` in case the bridge isn't there) is loaded
++  before the WAN gets an address at boot (`S29fw`) and when the firewall is
++  stopped at shutdown, so WAN SSH is never briefly open while the box boots.
+ - **eth0 is configured only when it is the WAN.** With `wlan0` as the WAN
+   (W board), `eth0` gets no DHCP client, address or route, so plugging a cable
+   in can't take over the default route. While `eth0` is the DHCP WAN,
+@@ -163,14 +193,15 @@ A small background watchdog (`S36wifiwatch`) enforces this and is active only in
+   picks up a new address within seconds.
+ - **Per-unit identity.** The eth0 MAC, the USB serial number, the host-side
+   USB network MAC (which names a Linux host's `enx…` interface) and the box's
+-  own USB network MAC (and so its `usb0` IPv6 link-local, which Reticulum's
+-  AutoInterface uses to tell boxes on one host apart) are derived per unit
+-  from the microSD card's CID. RNSBox doesn't load the driver that exposes the
+-  chip UID, so the identity belongs to the card: it stays the same across
+-  reboots and reflashes of the same card, and moving the card to another board
+-  moves it with the card. A card that reports a blank CID gets a random ID
+-  instead, which a reflash resets. Units upgraded from an image that shared
+-  one MAC get a new DHCP lease once and appear once as a new USB device.
++  own USB network MAC, which the LAN bridge carries too (and so its `br-lan`
++  IPv6 link-local, which Reticulum's AutoInterface uses to tell boxes on one
++  host apart) are derived per unit from the microSD card's CID. RNSBox doesn't
++  load the driver that exposes the chip UID, so the identity belongs to the
++  card: it stays the same across reboots and reflashes of the same card, and
++  moving the card to another board moves it with the card. A card that reports
++  a blank CID gets a random ID instead, which a reflash resets. Units upgraded
++  from an image that shared one MAC get a new DHCP lease once and appear once
++  as a new USB device.
+ 
+ ## Clock and offline operation
+ 
+@@ -416,7 +447,7 @@ link always goes to port 8081), and WAN tcp `8081` can't be port-forwarded
+ (the portal reserves it): add `tcp 8081` (or `tcp 80`) to Open Ports instead.
+ 
+ The SLIP link is a point-to-point host route to the modem only; it doesn't touch
+-the `eth0` WAN or `usb0` LAN. Requires `CONFIG_SLIP` (kernel) and `ldattach`
++the `eth0` WAN or the `br-lan` LAN. Requires `CONFIG_SLIP` (kernel) and `ldattach`
+ (util-linux) — both shipped.
+ 
+ ## Reticulum services
+diff --git a/build-rnsbox.sh b/build-rnsbox.sh
+index b7cde8185..b7a4ad5fb 100755
+--- a/build-rnsbox.sh
++++ b/build-rnsbox.sh
+@@ -77,7 +77,7 @@ chmod 0755 buildroot/board/cvitek/SG200X/overlay/etc/init.d/S* 2>/dev/null
+ 
+ # This driver never rebuilds the kernel. Warn if the built kernel predates
+ # the board defconfig's CONFIG_IPV6=y (needed by Reticulum's AutoInterface on
+-# usb0): the image would still boot fine — every IPv6 piece in the rootfs
++# the LAN): the image would still boot fine — every IPv6 piece in the rootfs
+ # degrades to IPv4-only — but AutoInterface can't find peers. Rebuild the
+ # kernel (build_all, or ./build-rnsbox-kclean.sh). The matching module
+ # refresh is enforced below (after defconfig): aic8800 is rebuilt if it
+@@ -92,6 +92,16 @@ if grep -q '^CONFIG_IPV6=y' "$KDEFCONFIG" && [ -f "$KBUILTCFG" ] \
+ 	echo "         this image keeps the old kernel. Rebuild kernel + osdrv"
+ 	echo "         (build_all, or ./build-rnsbox-kclean.sh) for AutoInterface."
+ fi
++# Same for the LAN bridge (CONFIG_BRIDGE=y, br-lan = usb0 + the hotspot, one
++# subnet): an older kernel boots fine — S30gadget_nic falls back to usb0
++# alone — but S35wifi then refuses to start the hotspot.
++if grep -q '^CONFIG_BRIDGE=y' "$KDEFCONFIG" && [ -f "$KBUILTCFG" ] \
++   && ! grep -q '^CONFIG_BRIDGE=y' "$KBUILTCFG"; then
++	echo "WARNING: the built kernel has no bridge support but the defconfig"
++	echo "         enables it — this image keeps the old kernel: LAN = usb0"
++	echo "         alone and no WiFi hotspot. Rebuild kernel + osdrv"
++	echo "         (build_all, or ./build-rnsbox-kclean.sh)."
++fi
+ # Same for the optional DS3231 RTC (built-in rtc-ds1307 + i2c-gpio, DTS rtc@68
+ # on i2c5; the DTB comes from the kernel build too): an older kernel boots
+ # fine but behaves as if no RTC were fitted.
+diff --git a/build/boards/sg200x/sg2002_licheervnano_sd/linux/sg2002_licheervnano_sd_defconfig b/build/boards/sg200x/sg2002_licheervnano_sd/linux/sg2002_licheervnano_sd_defconfig
+index 3670a3d1e..d0039bfb2 100644
+--- a/build/boards/sg200x/sg2002_licheervnano_sd/linux/sg2002_licheervnano_sd_defconfig
++++ b/build/boards/sg200x/sg2002_licheervnano_sd/linux/sg2002_licheervnano_sd_defconfig
+@@ -42,11 +42,13 @@ CONFIG_PACKET=y
+ CONFIG_UNIX=y
+ CONFIG_INET=y
+ # CONFIG_INET_DIAG is not set
+-# RNSBox: IPv6 is built in ONLY for Reticulum's AutoInterface on usb0 (it
++# RNSBox: IPv6 is built in ONLY for Reticulum's AutoInterface on the LAN (it
+ # runs purely over fe80:: link-local + ff12:: multicast; without IPv6 it shows
+ # "Up" but can never find a peer). It also lets NF_TABLES_IPV6/INET resolve.
+-# Confined to the USB LAN at runtime: /etc/init.d/S09ipv6 disables it on every
+-# other iface (eth0/wlan*/sl0/...) and nftgen adds a drop-policy ip6 table.
++# Confined to the LAN iface at runtime (br-lan; usb0 if the bridge can't be
++# made): /etc/init.d/S09ipv6 disables it on every other iface (eth0/wlan*/
++# sl0/the bridge ports...), S30gadget_nic opts the LAN iface back in, and
++# nftgen adds a drop-policy ip6 table.
+ # Minimal: no SIT/tunnels/GRE/multiple-tables (see the IPv6 block below).
+ # CONFIG_IPV6 appears three times in this file (last assignment wins in
+ # kconfig) — keep all three =y.
+@@ -999,7 +1001,11 @@ CONFIG_IP6_NF_TARGET_NPT=y
+ # end of IPv6: Netfilter Configuration
+ 
+ CONFIG_NF_DEFRAG_IPV6=y
+-CONFIG_NF_CONNTRACK_BRIDGE=y
++# RNSBox: no conntrack for bridged frames. The LAN bridge (CONFIG_BRIDGE
++# below) is a plain L2 switch: USB host <-> hotspot client traffic is never
++# filtered, only what reaches the IP layer on br-lan. (net/bridge/netfilter
++# is only compiled now that BRIDGE=y; this line used to be inert.)
++# CONFIG_NF_CONNTRACK_BRIDGE is not set
+ # CONFIG_BPFILTER is not set
+ # CONFIG_IP_DCCP is not set
+ # CONFIG_IP_SCTP is not set
+@@ -1007,7 +1013,15 @@ CONFIG_NF_CONNTRACK_BRIDGE=y
+ # CONFIG_TIPC is not set
+ # CONFIG_ATM is not set
+ # CONFIG_L2TP is not set
+-# CONFIG_BRIDGE is not set
++# RNSBox: one LAN subnet (10.42.0.0/24) for the USB-C NCM link and the WiFi
++# hotspot. S30gadget_nic creates br-lan at boot with usb0 as a port; hostapd
++# adds the AP iface (bridge=br-lan). Built in, so no module has to load
++# before S30gadget_nic. No br_netfilter / ebtables / nft bridge family: the
++# firewall (nftgen) matches iifname "br-lan" at the IP layer and traffic
++# between ports is switched at L2 unfiltered (intended). STP stays off and
++# multicast snooping is switched off at runtime (see S30gadget_nic).
++CONFIG_BRIDGE=y
++# CONFIG_BRIDGE_NETFILTER is not set
+ CONFIG_HAVE_NET_DSA=y
+ # CONFIG_NET_DSA is not set
+ # CONFIG_VLAN_8021Q is not set
+diff --git a/build/tools/common/sd_tools/sd_gen_burn_image_rootless.sh b/build/tools/common/sd_tools/sd_gen_burn_image_rootless.sh
+index 1f85d2b00..026f4c76c 100755
+--- a/build/tools/common/sd_tools/sd_gen_burn_image_rootless.sh
++++ b/build/tools/common/sd_tools/sd_gen_burn_image_rootless.sh
+@@ -56,9 +56,10 @@ echo 0x0105 > ${output_dir}/input/usb.idProduct
+ echo 0x0105 > ${output_dir}/input/usb.bcdDevice
+ echo "RNSBox" > ${output_dir}/input/usb.manufacturer
+ echo "RNSBox Reticulum router (LicheeRV Nano-e)" > ${output_dir}/input/usb.product
+-# No fixed device-side NCM MAC: S30gadget_nic derives the box's own usb0 MAC
+-# per unit from /device_key. It is also the source of usb0's fe80:: address,
+-# which is how Reticulum's AutoInterface tells boxes apart, so it must differ
++# No fixed device-side NCM MAC: S30gadget_nic derives the box's own LAN MAC
++# (usb0's, and the LAN bridge br-lan's) per unit from /device_key. It is also
++# the source of br-lan's fe80:: address (usb0's without the bridge), which is
++# how Reticulum's AutoInterface tells boxes apart, so it must differ
+ # per unit (one MAC for every box made two boxes on one host a single peer).
+ # /boot/usb.ncm.mac is an optional override and is not shipped; the input dir
+ # survives between builds, so remove an old copy explicitly.
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/dhcpcd.conf b/buildroot/board/cvitek/SG200X/overlay/etc/dhcpcd.conf
+index 7e13f82e9..e2d2f8f31 100644
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/dhcpcd.conf
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/dhcpcd.conf
+@@ -5,8 +5,9 @@
+ # while wlan0 is the STA (mode sta / sta+ap). Nothing runs a dhcpcd manager:
+ # in mode=ap wlan0 is the hotspot, and a manager would DHCP on it (see the
+ # overlay's S41dhcpcd stub). It never touches eth0 — S30eth owns eth0
+-# (udhcpc or static) and only when eth0 is the WAN — nor usb0/wlan1 (LAN,
+-# dnsmasq territory) nor sl0 (point-to-point modem link). IPv4 only, and never
++# (udhcpc or static) and only when eth0 is the WAN — nor the LAN bridge
++# br-lan and its ports usb0/wlan1 (dnsmasq territory; in mode=ap wlan0 is a
++# port too) nor sl0 (point-to-point modem link). IPv4 only, and never
+ # an IPv4LL/APIPA fallback — we'd rather have no IP than a 169.254.x.x address
+ # that the kernel will helpfully install a default route through.
+ 
+@@ -25,9 +26,9 @@ option classless_static_routes
+ require dhcp_server_identifier
+ slaac private
+ 
+-# IPv6 exists in the kernel only for usb0 (Reticulum AutoInterface, link-local);
+-# S09ipv6 disables it on every other iface. dhcpcd must never try DHCPv6 or
+-# router solicitation on the WAN.
++# IPv6 exists in the kernel only for the LAN iface br-lan (Reticulum
++# AutoInterface, link-local); S09ipv6 disables it on every other iface.
++# dhcpcd must never try DHCPv6 or router solicitation on the WAN.
+ noipv6
+ noipv6rs
+ 
+@@ -36,10 +37,19 @@ noipv6rs
+ # predecessor board.
+ noipv4ll
+ 
++# Never take a lease from a DHCP server in 10.42.0.0/24, this box's own LAN
++# subnet (br-lan 10.42.0.1/24). Every RNSBox's hotspot is that same LAN and
++# serves DHCP from 10.42.0.1 (so does a Linux "shared" connection): its
++# lease's router and DNS would be this box itself, leaving no DNS and no way
++# to reach the other box. wlan0 stays without an address instead, and
++# /etc/dhcpcd.exit-hook records why for the portal's WiFi tab
++# (/run/wifi-sta-conflict).
++blacklist 10.42.0.0/24
++
+ # The only iface dhcpcd may manage. eth0 used to be listed too, so the
+ # manager daemon ran a second DHCP client on eth0 next to S30eth's udhcpc —
+ # a cable plugged in while WAN=wlan0 then added an eth0 default route that
+ # hijacked the WAN. No manager runs any more (S41dhcpcd is a stub), so both
+ # lists are belt-and-braces; deny wins over allow.
+ allowinterfaces wlan0
+-denyinterfaces lo eth0 usb0 wlan1 sl0
++denyinterfaces lo eth0 br-lan usb0 wlan1 sl0
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/dhcpcd.exit-hook b/buildroot/board/cvitek/SG200X/overlay/etc/dhcpcd.exit-hook
+new file mode 100644
+index 000000000..9c99f859c
+--- /dev/null
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/dhcpcd.exit-hook
+@@ -0,0 +1,72 @@
++# /etc/dhcpcd.exit-hook — RNSBox. dhcpcd-run-hooks sources this after its own
++# hooks, for every event on the one iface dhcpcd manages: wlan0, the WiFi
++# client (see /etc/dhcpcd.conf). Sourced, not run: no `exit` here, and every
++# name is rnsbox_-prefixed so nothing of run-hooks' is clobbered.
++#
++# Flags a WiFi uplink that overlaps this box's own LAN, 10.42.0.0/24
++# (br-lan 10.42.0.1/24, the same on every RNSBox, hotspot included). That is
++# normally another RNSBox's hotspot, or a Linux "shared" connection (also
++# 10.42.0.1/24). dhcpcd.conf blacklists DHCP from 10.42.0.0/24, so wlan0 just
++# stays without an address there; this says why. The reason goes to
++# /run/wifi-sta-conflict (the portal's WiFi tab shows it) and, once per
++# association, to /var/log/wifi.log.
++#   CARRIER (associated): ARP-probe the uplink for 10.42.0.1 in DAD form
++#     (sender 0.0.0.0: needs no address and never announces ours), in the
++#     background so the DHCP start isn't held up. An answer while wlan0 still
++#     has no lease -> flagged.
++#   lease: an address or router inside 10.42.0.0/24 (a relayed DHCP server
++#     outside the blacklist) -> flagged; any other lease clears the flag.
++#   link loss / dhcpcd stop -> cleared; the next association checks again.
++
++rnsbox_conflict=/run/wifi-sta-conflict
++rnsbox_lan_ip=10.42.0.1
++rnsbox_msg_dhcp="This network uses 10.42.0.0/24, the subnet of this box's own LAN (another RNSBox's hotspot, or a Linux 'shared' connection), so it can't be the uplink: its DHCP is refused, because its router and DNS (10.42.0.1) would be this box itself. Use another network or Ethernet (eth0 WAN). To link two RNSBoxes over Reticulum, point a TCPClientInterface at the other box's WAN address."
++rnsbox_msg_lease="The lease from this network is in 10.42.0.0/24, the subnet of this box's own LAN, so its router or DNS can't be reached through it and the uplink won't work properly. Use another network or Ethernet (eth0 WAN)."
++
++# rnsbox_in_lan <addr>... — true if any argument is in 10.42.0.0/24.
++rnsbox_in_lan() {
++	for rnsbox_a in "$@"; do
++		case "$rnsbox_a" in 10.42.0.*) return 0 ;; esac
++	done
++	return 1
++}
++
++# rnsbox_flag <log detail> <reason for the WiFi tab>
++rnsbox_flag() {
++	[ -f "$rnsbox_conflict" ] \
++	  || printf '%s: %s: uplink overlaps the LAN 10.42.0.0/24: %s\n' \
++	       "$(date '+%F %T')" "$interface" "$1" >> /var/log/wifi.log
++	echo "$2" > "$rnsbox_conflict"
++}
++
++# rnsbox_probe — runs in the background after CARRIER. arping -D exits 1 when
++# something answered (0 = nobody, 2 = error). Only flag while still
++# associated and without a lease: a lease meanwhile came from a server
++# outside 10.42.0.0/24, and the lease check below judges that.
++rnsbox_probe() {
++	arping -q -D -I "$interface" -c 2 -w 3 "$rnsbox_lan_ip" >/dev/null 2>&1
++	[ $? -eq 1 ] || return 0
++	[ "$(cat "/sys/class/net/$interface/carrier" 2>/dev/null)" = 1 ] || return 0
++	[ -z "$(ip -4 -o addr show dev "$interface" 2>/dev/null)" ] || return 0
++	rnsbox_flag "$rnsbox_lan_ip answers on ssid '${ifssid:-?}'; its DHCP is refused" "$rnsbox_msg_dhcp"
++}
++
++if [ "$interface" = wlan0 ]; then
++	case "$reason" in
++	CARRIER)
++		rm -f "$rnsbox_conflict"
++		( rnsbox_probe ) </dev/null >/dev/null 2>&1 &
++		;;
++	BOUND|RENEW|REBIND|REBOOT|STATIC|INFORM)
++		# shellcheck disable=SC2086 # $new_routers: one word per router
++		if rnsbox_in_lan "$new_ip_address" $new_routers; then
++			rnsbox_flag "lease $new_ip_address router ${new_routers:-none}" "$rnsbox_msg_lease"
++		else
++			rm -f "$rnsbox_conflict"
++		fi
++		;;
++	PREINIT|NOCARRIER|NOCARRIER_ROAMING|STOP|STOPPED|DEPARTED|RELEASE)
++		rm -f "$rnsbox_conflict"
++		;;
++	esac
++fi
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/dnsmasq.conf b/buildroot/board/cvitek/SG200X/overlay/etc/dnsmasq.conf
+index 522c6c794..9810d162b 100644
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/dnsmasq.conf
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/dnsmasq.conf
+@@ -8,19 +8,22 @@
+ 
+ # Shared (interface-agnostic) settings.
+ # filter-AAAA: the box has no IPv6 uplink (IPv6 exists only as link-local on
+-# usb0, for Reticulum's AutoInterface), so never hand LAN clients AAAA records
+-# they can't reach. No enable-ra / DHCPv6 ranges either — dnsmasq does no IPv6
+-# address assignment.
++# the LAN iface br-lan, for Reticulum's AutoInterface), so never hand LAN
++# clients AAAA records they can't reach. No enable-ra / DHCPv6 ranges either
++# — dnsmasq does no IPv6 address assignment.
+ filter-AAAA
+ cache-size=1000
+ no-hosts
+ # bind-dynamic = bind per-interface as they come up, not wildcard-at-start.
+-# Lets the autogen section below reference usb0 even if it appears late.
++# Lets the autogen section below reference the LAN iface even if it appears
++# late. That is br-lan (usb0 without a bridge — /run/lan-iface): the USB-C
++# host and the hotspot clients (hostapd bridges the AP into it) share its
++# one subnet and DHCP pool; the bridge ports themselves carry no IP.
+ bind-dynamic
+ # DNS upstream follows /etc/resolv.conf (both via openresolv: eth0 by
+ # udhcpc/S30eth, wlan0 by dhcpcd).
+ 
+-# Friendly hostnames for the portal regardless of which LAN the client is on.
++# Friendly hostnames for the portal, from the USB-C link or the hotspot alike.
+ # They only redirect to the IP (http://10.42.0.1/): the portal serves content
+ # on an IP literal only (DNS-rebinding guard). Keep in sync with main.cpp
+ # host_is_alias ALIASES: a name missing there gets a 403 from the portal.
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S08usbdev b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S08usbdev
+index 5eb2e4262..9efc2458d 100755
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S08usbdev
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S08usbdev
+@@ -148,10 +148,10 @@ then
+ 			# Default: a locally-administered unicast MAC derived from
+ 			# /device_key (S02devicekey), so it is stable per unit and two
+ 			# boxes on one host don't collide. /boot/usb.ncm.host_mac
+-			# overrides it. (The device-side MAC is set on usb0 by
+-			# S30gadget_nic, also per unit; /boot/usb.ncm.mac, if present,
+-			# overrides it.) Must be set before the UDC
+-			# bind below.
++			# overrides it. (The device-side MAC is set by S30gadget_nic,
++			# also per unit, on usb0 and on the LAN bridge br-lan that usb0
++			# is a port of; /boot/usb.ncm.mac, if present, overrides it.)
++			# Must be set before the UDC bind below.
+ 			key=$(cat /device_key 2>/dev/null)
+ 			if [ -e /boot/usb.ncm.host_mac ]
+ 			then
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S09ipv6 b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S09ipv6
+index 4182112e1..8d0e50650 100755
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S09ipv6
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S09ipv6
+@@ -1,32 +1,42 @@
+ #!/bin/sh
+-# S09ipv6 — confine IPv6 to the USB LAN (usb0) before any other iface is up.
++# S09ipv6 — confine IPv6 to the LAN iface before any other iface is up.
+ #
+ # IPv6 is compiled into the kernel for ONE consumer: Reticulum's AutoInterface
+-# on usb0 (/etc/reticulum/config). It needs a fe80:: link-local address on
+-# usb0 and joins an ff12:: link-scope multicast group (UDP 29716 multicast
+-# discovery, 29717 unicast discovery, 42671 data). Nothing else on the box
+-# uses IPv6, so every other iface — eth0, wlan0, wlan1, sl0, a USB dongle —
+-# stays IPv4-only and never gets a link-local/SLAAC address a WAN peer could
+-# reach. (nftgen's ip6 table is the second layer: drop unless LAN.)
++# on the LAN (/etc/reticulum/config). It needs a fe80:: link-local address on
++# the LAN iface and joins an ff12:: link-scope multicast group (UDP 29716
++# multicast discovery, 29717 unicast discovery, 42671 data). The LAN iface is
++# the bridge br-lan (usb0 + the hotspot as ports), or usb0 alone if the bridge
++# can't be made — S30gadget_nic records which in /run/lan-iface. Nothing else
++# on the box uses IPv6, so every other iface — eth0, wlan0, wlan1, sl0, a USB
++# dongle, and usb0 while it is a bridge port — stays IPv4-only and never gets
++# a link-local/SLAAC address a WAN peer could reach. (nftgen's ip6 table is
++# the second layer: drop unless LAN.)
+ #
+ # Order matters. This runs after S08usbdev (usb0 may or may not exist yet) and
+-# before S10uuid (the first `ifconfig eth0 up`), S30eth, S31slip (creates sl0)
+-# and S35wifi (creates wlan0/wlan1):
++# before S10uuid (the first `ifconfig eth0 up`), S30eth, S30gadget_nic
++# (creates br-lan), S31slip (creates sl0) and S35wifi (creates wlan0/wlan1):
+ #   1. conf/default/disable_ipv6=1 — every iface registered from now on starts
+ #      with IPv6 off (also one that only gets IPv6 later, when its MTU is
+ #      raised to >= 1280, e.g. sl0).
+-#   2. every iface that already exists, except lo and usb0, is switched off
+-#      now (in practice eth0, registered by its driver at kernel boot).
+-#   3. usb0 is opted back in by S30gadget_nic just before it raises usb0 (it
+-#      may be created after this runs and so inherit default=1).
++#   2. every iface that already exists, except lo (and the LAN iface when
++#      this is re-run after S30gadget_nic), is switched off now — in practice
++#      eth0, registered by its driver at kernel boot, and usb0.
++#   3. S30gadget_nic opts the LAN iface back in just before raising it (br-lan
++#      is created after this runs and so inherits default=1; usb0 is opted in
++#      only in the no-bridge fallback).
+ # conf/all/disable_ipv6 is deliberately NOT written: on 5.10 that pushes the
+-# value to every existing iface, lo and usb0 included.
++# value to every existing iface, lo and the LAN iface included.
+ # The IPv4 counterpart is S29fw: it loads a fail-closed nftables ruleset (lo +
+-# usb0 only) before S30eth/S35wifi address the WAN, until S60routing's real one.
++# br-lan/usb0 only) before S30eth/S35wifi address the WAN, until S60routing's
++# real one.
+ #
+ # A kernel without IPv6 has no /proc/sys/net/ipv6 — then this is a no-op.
+ 
+-LAN_V6="lo usb0"   # the only ifaces allowed to keep IPv6
++# The only ifaces allowed to keep IPv6: lo, and the LAN iface once
++# S30gadget_nic has recorded it (a restart must not switch it off).
++LAN_V6=lo
++{ read -r _lan < /run/lan-iface; } 2>/dev/null
++case "$_lan" in br-lan|usb0) LAN_V6="lo $_lan" ;; esac
+ 
+ start() {
+ 	if [ ! -d /proc/sys/net/ipv6/conf ]; then
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S29fw b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S29fw
+index 2a6d62b02..137d255ad 100755
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S29fw
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S29fw
+@@ -5,11 +5,12 @@
+ # wlan0 STA), and stock S50sshd listens on 0.0.0.0:22, before S60routing loads
+ # the real ruleset. Without this, WAN SSH is reachable for a few seconds on
+ # every boot even with `tcp 22` removed from Open ports. (S09ipv6 is the IPv6
+-# equivalent.) Loads S60routing's emergency ruleset with usb0 as the only LAN;
+-# S60routing start replaces it.
++# equivalent.) Loads S60routing's emergency ruleset, whose LAN is br-lan AND
++# usb0 (the LAN iface isn't made until S30gadget_nic, and a bridge that
++# can't be made there leaves usb0 as the LAN); S60routing start replaces it.
+ #
+ # Order: after S10uuid (its `ifconfig eth0 up` sets no IPv4 address), before
+-# S30eth, S31slip and S35wifi.
++# S30eth, S30gadget_nic, S31slip and S35wifi.
+ case "${1:-start}" in
+ 	start|restart) /etc/init.d/S60routing early ;;
+ 	stop)          ;;    # S60routing stop leaves the box closed
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S30gadget_nic b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S30gadget_nic
+index 3eecd67cb..308932d25 100755
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S30gadget_nic
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S30gadget_nic
+@@ -1,22 +1,56 @@
+ #!/bin/sh
+-# RNSBox: bring up the CDC-NCM gadget interface as 10.42.0.1/24.
++# RNSBox: bring up the LAN — the bridge br-lan as 10.42.0.1/24, with the
++# CDC-NCM gadget interface usb0 as a port.
+ #
+ # Stock Sipeed S30gadget_nic computed a random subnet from device_key and ran
+ # udhcpd on it. We hardcode 10.42.0.1/24 so users
+ # always know where to point their browser, and let dnsmasq (from
+ # /etc/dnsmasq.conf, started by Buildroot's S80dnsmasq init script) own the
+-# DHCP+DNS scope. The device-side usb0 MAC is set here, derived per unit from
+-# /device_key (optional override: /boot/usb.ncm.mac, not shipped); the
+-# host-side MAC — which names the host's `enxXXXX` iface — is set by S08usbdev
+-# (configfs ncm host_addr, derived per unit from /device_key;
+-# /boot/usb.ncm.host_mac overrides).
++# DHCP+DNS scope (one pool, S60routing).
+ #
+-# usb0 is also the ONLY non-loopback iface with IPv6 (S09ipv6 turns it off by
+-# default everywhere): Reticulum's AutoInterface needs usb0's fe80:: address.
++# One LAN, one subnet: the USB-C link and the WiFi hotspot are ports of the
++# Linux bridge br-lan (kernel CONFIG_BRIDGE=y). usb0 is enslaved here;
++# S35wifi's hostapd adds the AP iface (bridge=br-lan) while a hotspot runs.
++# br-lan is made even when no port exists yet (the Nano-e has no radio, the
++# gadget may have failed), so the LAN iface and its address never depend on
++# which ports are there. Bridge settings:
++#   - STP off, forward_delay 0: a port forwards as soon as it has carrier —
++#     no 15 s listening/learning phase swallowing the USB host's first DHCP
++#     DISCOVERs.
++#   - multicast_snooping 0: every multicast frame is flooded to every port.
++#     Reticulum's AutoInterface finds peers over ff12:: multicast; with
++#     snooping on, a LAN that has an MLD querier (a client can be one) would
++#     get it only on ports that sent MLD reports.
++#   - MAC: the per-unit device-side MAC usb0 also gets (below), set on the
++#     bridge explicitly so it never changes as ports come and go (a bridge
++#     otherwise takes its lowest port MAC). The box's LAN MAC and its EUI-64
++#     fe80:: address — how RNS AutoInterface tells boxes apart — stay stable.
++# Traffic between ports (USB host <-> hotspot client) is switched at L2 and
++# not filtered; nftables only sees what reaches the IP layer on br-lan.
++#
++# The LAN iface actually in use is recorded in /run/lan-iface (br-lan, or usb0
++# in the fallback below). S60routing, S35wifi, S82rnsd, S46wanwatch, S09ipv6
++# and the portal read it instead of assuming a name.
++#
++# Fallback: if br-lan can't be made (a kernel without CONFIG_BRIDGE) or usb0
++# can't join it, usb0 is addressed directly, exactly as before the bridge:
++# the USB host is never cut off. Only the hotspot is (S35wifi won't start an
++# AP without br-lan).
++#
++# The device-side MAC is derived per unit from /device_key (optional
++# override: /boot/usb.ncm.mac, not shipped); the host-side MAC — which names
++# the host's `enxXXXX` iface — is set by S08usbdev (configfs ncm host_addr,
++# derived per unit from /device_key; /boot/usb.ncm.host_mac overrides).
++#
++# The LAN iface is also the ONLY non-loopback iface with IPv6 (S09ipv6 turns
++# it off by default everywhere): Reticulum's AutoInterface needs its fe80::
++# address. With the bridge that is br-lan; usb0, a port, gets none.
+ 
+ . /etc/profile
+ 
+-USB0_IPV4=10.42.0.1/24
++LAN_IPV4=10.42.0.1/24
++BR=br-lan
++LAN_FILE=/run/lan-iface
+ 
+ hex2mac() {
+ 	MAC=""
+@@ -26,61 +60,136 @@ hex2mac() {
+ 	done | tr '[:upper:]' '[:lower:]'
+ }
+ 
+-start() {
+-	# S08usbdev must run first (composes the gadget and writes to UDC).
+-	if [ ! -e /boot/usb.dev ] || [ ! -e /boot/usb.ncm ]; then
+-		echo "S30gadget_nic: usb.dev or usb.ncm flag missing; skipping" >&2
+-		return 0
+-	fi
+-
+-	# Wait briefly for usb0 to appear (configfs gadget creates it
+-	# asynchronously after the UDC write in S08usbdev).
+-	for _ in 1 2 3 4 5 6 7 8 9 10; do
+-		[ -d /sys/class/net/usb0 ] && break
+-		sleep 0.5
+-	done
+-
+-	if [ ! -d /sys/class/net/usb0 ]; then
+-		echo "S30gadget_nic: usb0 not present after 5s; gadget likely failed" >&2
+-		return 1
+-	fi
+-
+-	# Device-side MAC: /boot/usb.ncm.mac overrides; else per unit from
+-	# /device_key (distinct salt from S08usbdev's host_addr). Must differ per
+-	# unit: usb0's EUI-64 fe80:: is how RNS AutoInterface tells boxes apart.
++# lan_mac — print the device-side MAC: /boot/usb.ncm.mac overrides; else per
++# unit from /device_key (distinct salt from S08usbdev's host_addr). Must
++# differ per unit: the LAN iface's EUI-64 fe80:: is how RNS AutoInterface
++# tells boxes apart.
++lan_mac() {
+ 	key=$(cat /device_key 2>/dev/null)
+ 	if [ -e /boot/usb.ncm.mac ]; then
+-		new_mac=$(cat /boot/usb.ncm.mac)
++		cat /boot/usb.ncm.mac
+ 	elif [ -n "$key" ]; then
+ 		h=$(printf 'ncm-dev:%s' "$key" | sha256sum | cut -c1-12)
+ 		b0=$(( (0x$(echo "$h" | cut -c1-2) & 0xfc) | 0x02 ))
+-		new_mac=$(printf '%02x%s' "$b0" "$(echo "$h" | cut -c3-12)" | sed 's/../&:/g; s/:$//')
++		printf '%02x%s' "$b0" "$(echo "$h" | cut -c3-12)" | sed 's/../&:/g; s/:$//'
++	else
++		hex2mac 48da356e$(sha512sum /device_key_legacy 2>/dev/null | head -c 4)
++	fi
++}
++
++# ipv6_lan <iface> — opt the LAN iface back in to IPv6 (S09ipv6 set
++# default/disable_ipv6=1, which it inherits when created after S09) — before
++# `up`, so the kernel forms the fe80:: link-local once the link has carrier.
++# Link-local ONLY: accept_ra/autoconf=0 so a USB host or hotspot client
++# sharing its own IPv6 can't push a global address or a default route into
++# the box; forwarding=0 (nothing is routed over IPv6).
++ipv6_lan() {
++	d=/proc/sys/net/ipv6/conf/$1
++	[ -d "$d" ] || return 0
++	echo 0 > "$d/accept_ra"
++	echo 0 > "$d/autoconf"
++	echo 0 > "$d/forwarding"
++	echo 0 > "$d/disable_ipv6"
++}
++
++# make_bridge <mac> — create br-lan, or reuse it (restart), and apply the
++# settings in the header. False if the kernel can't make a bridge.
++make_bridge() {
++	b=/sys/class/net/$BR/bridge
++	[ -d "$b" ] || ip link add "$BR" type bridge 2>/dev/null
++	[ -d "$b" ] || return 1
++	echo 0 > "$b/stp_state" 2>/dev/null
++	echo 0 > "$b/forward_delay" 2>/dev/null
++	# (absent without CONFIG_BRIDGE_IGMP_SNOOPING: then nothing snoops anyway)
++	[ -e "$b/multicast_snooping" ] && echo 0 > "$b/multicast_snooping" 2>/dev/null
++	for k in stp_state forward_delay multicast_snooping; do
++		v=
++		{ read -r v < "$b/$k"; } 2>/dev/null
++		[ -z "$v" ] || [ "$v" = 0 ] \
++		  || echo "S30gadget_nic: $BR $k is $v, not 0" >&2
++	done
++	[ -n "$1" ] && ip link set "$BR" address "$1" 2>/dev/null
++	ipv6_lan "$BR"
++	return 0
++}
++
++start() {
++	# S08usbdev must run first (composes the gadget and writes to UDC).
++	usb=
++	if [ ! -e /boot/usb.dev ] || [ ! -e /boot/usb.ncm ]; then
++		echo "S30gadget_nic: usb.dev or usb.ncm flag missing; LAN without a USB port" >&2
++		want_usb=
+ 	else
+-		new_mac=$(hex2mac 48da356e$(sha512sum /device_key_legacy 2>/dev/null | head -c 4))
++		want_usb=1
++		# Wait briefly for usb0 to appear (configfs gadget creates it
++		# asynchronously after the UDC write in S08usbdev).
++		for _ in 1 2 3 4 5 6 7 8 9 10; do
++			[ -d /sys/class/net/usb0 ] && break
++			sleep 0.5
++		done
++		if [ -d /sys/class/net/usb0 ]; then
++			usb=usb0
++		else
++			echo "S30gadget_nic: usb0 not present after 5s; gadget likely failed" >&2
++		fi
+ 	fi
+-	[ -n "$new_mac" ] && ip link set usb0 address "$new_mac" 2>/dev/null
+ 
+-	# Opt usb0 back in to IPv6 (S09ipv6 set default/disable_ipv6=1, which usb0
+-	# inherits if it was created after S09) — before `up`, so the kernel forms
+-	# the fe80:: link-local once the host brings the link up. Link-local ONLY:
+-	# accept_ra/autoconf=0 so a host sharing its own IPv6 over the cable can't
+-	# push a global address or a default route into the box.
+-	if [ -d /proc/sys/net/ipv6/conf/usb0 ]; then
+-		echo 0 > /proc/sys/net/ipv6/conf/usb0/accept_ra
+-		echo 0 > /proc/sys/net/ipv6/conf/usb0/autoconf
+-		echo 0 > /proc/sys/net/ipv6/conf/usb0/disable_ipv6
++	mac=$(lan_mac)
++	[ -n "$usb" ] && [ -n "$mac" ] && ip link set usb0 address "$mac" 2>/dev/null
++
++	lan=
++	if make_bridge "$mac"; then
++		lan=$BR
++		if [ -n "$usb" ]; then
++			# A port: no IPv6 and no address of its own (a fallback-mode
++			# start may have left one); br-lan carries both.
++			[ -d /proc/sys/net/ipv6/conf/usb0 ] \
++			  && echo 1 > /proc/sys/net/ipv6/conf/usb0/disable_ipv6
++			ip addr flush dev usb0 2>/dev/null
++			if ip link set usb0 master "$BR" 2>/dev/null; then
++				ip link set usb0 up
++			else
++				# The USB host must keep its LAN: drop the bridge and
++				# address usb0 alone (fallback below).
++				echo "S30gadget_nic: usb0 could not join $BR; falling back to usb0 alone" >&2
++				ip link del "$BR" 2>/dev/null \
++				  || { ip addr flush dev "$BR"; ip link set "$BR" down; }
++				lan=
++			fi
++		fi
+ 	fi
+ 
+-	ip link set usb0 up
+-	ip addr add "$USB0_IPV4" dev usb0
+-	echo "S30gadget_nic: usb0 up, $USB0_IPV4"
++	if [ "$lan" = "$BR" ]; then
++		ip link set "$BR" up
++		ip -4 addr flush dev "$BR"
++		ip addr add "$LAN_IPV4" dev "$BR"
++		echo "$BR" > "$LAN_FILE"
++		echo "S30gadget_nic: $BR up, $LAN_IPV4${usb:+, port usb0}"
++	else
++		# Fallback: usb0 alone, as before the bridge.
++		echo usb0 > "$LAN_FILE"
++		if [ -n "$usb" ]; then
++			ipv6_lan usb0
++			ip link set usb0 up
++			ip addr add "$LAN_IPV4" dev usb0
++			echo "S30gadget_nic: no $BR bridge; usb0 up, $LAN_IPV4"
++		else
++			echo "S30gadget_nic: no $BR bridge and no usb0; no LAN" >&2
++		fi
++	fi
++	# status 1 if the gadget should have made usb0 but didn't
++	[ -z "$want_usb" ] || [ -n "$usb" ]
+ }
+ 
++# Addresses off, links down. br-lan and its ports stay as they are (a hotspot
++# port stays enslaved), so start brings the same LAN back; /run/lan-iface
++# still names it.
+ stop() {
+-	if [ -d /sys/class/net/usb0 ]; then
+-		ip addr flush dev usb0
+-		ip link set usb0 down
+-	fi
++	for i in "$BR" usb0; do
++		[ -d "/sys/class/net/$i" ] || continue
++		ip addr flush dev "$i"
++		ip link set "$i" down
++	done
+ }
+ 
+ case "$1" in
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S35wifi b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S35wifi
+index c19c258ea..16cb80ac7 100755
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S35wifi
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S35wifi
+@@ -1,9 +1,25 @@
+ #!/bin/sh
+ # S35wifi — AIC8800 WiFi bring-up for the LicheeRV Nano-e W variant.
+ #
+-# Runs after S30eth / S30gadget_nic (eth0 + usb0 up) and BEFORE S60routing
+-# (S60 folds the AP iface into NAT/DHCP when it sees /run/wifi-ap-iface).
+-# Order: load modules -> dispatch on mode (off / sta / ap / sta+ap).
++# Runs after S30eth / S30gadget_nic (eth0 + the LAN bridge br-lan up) and
++# BEFORE S60routing. Order: load modules -> dispatch on mode (off / sta / ap /
++# sta+ap).
++#
++# The hotspot is part of the LAN, not a subnet of its own: hostapd runs with
++# bridge=br-lan, so the AP iface (wlan0 in ap mode, wlan1 in sta+ap) joins
++# S30gadget_nic's bridge next to usb0 and has no IP; its clients get
++# 10.42.0.x from the one LAN DHCP pool (dnsmasq on br-lan) and nftables sees
++# them as br-lan. When the AP stops, its iface leaves the bridge (hostapd
++# does it on exit; stop() makes sure — a wlan0 left as a bridge port could
++# never become a STA again, cfg80211 refuses). Without br-lan (/run/lan-iface
++# = usb0: kernel without CONFIG_BRIDGE) the AP is refused, as for a weak PSK.
++# /run/wifi-ap-iface names the AP iface while one is up (the portal's WiFi
++# status reads it).
++#
++# The same 10.42.0.0/24 LAN is on every RNSBox, so another RNSBox's hotspot
++# can't be this box's uplink: dhcpcd refuses DHCP from 10.42.0.0/24
++# (/etc/dhcpcd.conf) and /etc/dhcpcd.exit-hook writes the reason to
++# /run/wifi-sta-conflict for the WiFi tab.
+ #
+ # On the non-W board there's no AIC8800 and no wlanN appears; we detect
+ # that and exit 0 so the same image boots on both SKUs.
+@@ -17,10 +33,16 @@ HOSTAPD_CONF=/var/run/hostapd.conf
+ STA_IF=wlan0
+ AP_IF_CONCURRENT=wlan1
+ LOG=/var/log/wifi.log
+-# Present while the AP is refused for a weak ap_psk (holds the reason). Lets
+-# the refusal be logged once per start/restart instead of on every
+-# S36wifiwatch revive attempt (every few seconds in sta+ap; /var/log is tiny).
++# Present while the AP is refused — weak ap_psk, or no LAN bridge (holds the
++# reason). Lets the refusal be logged once per start/restart instead of on
++# every S36wifiwatch revive attempt (every few seconds in sta+ap; /var/log is
++# tiny).
+ AP_REFUSED=/run/wifi-ap-refused
++# The LAN bridge hostapd adds the AP iface to (S30gadget_nic makes it).
++LAN_BR=br-lan
++# Present while the STA's network overlaps the LAN subnet (holds the reason;
++# written and cleared by /etc/dhcpcd.exit-hook).
++STA_CONFLICT=/run/wifi-sta-conflict
+ 
+ # 2.4 GHz channel centre frequencies (ch1..13, MHz). Used to pin the STA to
+ # 2.4 GHz in concurrent sta+ap mode so it is ALWAYS co-band with the AP. The
+@@ -54,10 +76,33 @@ ap_psk_ok() {
+ 
+ # ap_refuse <reason> — record why the AP is not started; log only the first time.
+ ap_refuse() {
+-	[ -f "$AP_REFUSED" ] || log "AP NOT started: $* — set a hotspot password (8-63 chars) in the portal WiFi tab"
++	[ -f "$AP_REFUSED" ] || log "AP NOT started: $*"
+ 	echo "$*" > "$AP_REFUSED"
+ }
+-AP_PSK_REASON="ap_psk is empty, not 8-63 printable ASCII chars, or the old published default 'changeme123'"
++AP_PSK_REASON="ap_psk is empty, not 8-63 printable ASCII chars, or the old published default 'changeme123' — set a hotspot password (8-63 chars) in the portal WiFi tab"
++AP_BR_REASON="no LAN bridge $LAN_BR (/run/lan-iface is not $LAN_BR: kernel without CONFIG_BRIDGE?) — the hotspot is bridged into the LAN and cannot run without it"
++
++# lan_bridged — true if the LAN iface is the bridge (/run/lan-iface, written
++# by S30gadget_nic) and it exists. Checked before hostapd starts: with
++# bridge= naming a missing bridge, hostapd would create one of its own.
++lan_bridged() {
++	_l=
++	{ read -r _l < /run/lan-iface; } 2>/dev/null
++	[ "$_l" = "$LAN_BR" ] && [ -d "/sys/class/net/$LAN_BR/bridge" ]
++}
++
++# in_bridge <iface> — true while <iface> is a port of $LAN_BR.
++in_bridge() {
++	[ -e "/sys/class/net/$LAN_BR/brif/$1" ]
++}
++
++# ap_unbridge <iface> — take a (former) AP iface out of $LAN_BR. hostapd does
++# this itself on a clean exit; this covers a crash / SIGKILL, and a wlan0
++# that must become a STA (cfg80211 won't turn a bridge port into a station).
++ap_unbridge() {
++	in_bridge "$1" || return 0
++	ip link set dev "$1" nomaster 2>>"$LOG" && log "$1 left $LAN_BR"
++}
+ 
+ load_modules() {
+ 	if ! grep -q '^cfg80211 ' /proc/modules 2>/dev/null; then
+@@ -142,6 +187,8 @@ gen_wpa_conf() {
+ }
+ 
+ # gen_hostapd_conf <iface> <ssid> <psk> <chan> <hidden> <htmode> [force_off]
++#   The AP always joins the LAN bridge (bridge=$LAN_BR; hostapd adds the iface
++#   after switching it to AP mode, and removes it again on exit).
+ #   chan      = 1..13  or  "auto" (=> hostapd ACS, channel=0; needs the driver
+ #               to implement nl80211 survey — if it doesn't, start_ap falls
+ #               back to a fixed channel)
+@@ -154,6 +201,7 @@ gen_hostapd_conf() {
+ 	iface="$1"; ssid="$2"; psk="$3"; chan="$4"; hidden="$5"; htmode="$6"; force_off="$7"
+ 	{
+ 		echo "interface=$iface"
++		echo "bridge=$LAN_BR"
+ 		echo "driver=nl80211"
+ 		echo "ssid=$ssid"
+ 		echo "hw_mode=g"
+@@ -240,6 +288,8 @@ start_sta() {
+ 	fi
+ 	[ -n "$country" ] && iw reg set "$country" 2>/dev/null
+ 	gen_wpa_conf "$ssid" "$psk" "$hidden" "$country" "$band"
++	# Normally a no-op: stop() unbridged an AP-mode wlan0 already.
++	ap_unbridge "$STA_IF"
+ 	ip link set "$STA_IF" up 2>/dev/null
+ 	# 9>&- closes the /run/wifi.lock fd (held by the caller) for the daemon, so
+ 	# a long-lived wpa_supplicant can't pin the lock after S35wifi exits and
+@@ -253,6 +303,12 @@ start_sta() {
+ 	log "STA started on $STA_IF ssid=$ssid${band:+ (2.4 GHz pinned — concurrent)}"
+ }
+ 
++# ap_bridge_state <iface> — for the start log line. hostapd exits at init if
++# it can't add the iface to the bridge, so "not in" should never show.
++ap_bridge_state() {
++	if in_bridge "$1"; then echo "bridged into $LAN_BR"; else echo "NOT in $LAN_BR - hotspot clients get no LAN"; fi
++}
++
+ # Bring up hostapd; if it exits within ~1s (ACS survey unsupported, bad
+ # channel, etc.) retry once on a safe fixed channel. Returns 0 if a hostapd
+ # is running afterwards.
+@@ -265,16 +321,20 @@ _hostapd_up() {
+ start_ap() {
+ 	iface="$1"
+ 	ssid=$(cfg ap_ssid); psk=$(cfg ap_psk); chan=$(cfg ap_channel)
+-	hidden=$(cfg ap_hidden); ap_ip=$(cfg ap_ip); htmode=$(cfg ap_htmode)
++	hidden=$(cfg ap_hidden); htmode=$(cfg ap_htmode)
+ 	[ -z "$ssid" ] && { log "AP requested but ap_ssid empty; skipping"; return 0; }
+ 	if ! ap_psk_ok "$psk"; then
+ 		ap_refuse "$AP_PSK_REASON"
+-		rm -f /run/wifi-ap-iface      # no AP: don't let S60routing/portal think one is up
++		rm -f /run/wifi-ap-iface      # no AP: don't let the portal think one is up
++		return 0
++	fi
++	if ! lan_bridged; then
++		ap_refuse "$AP_BR_REASON"
++		rm -f /run/wifi-ap-iface
+ 		return 0
+ 	fi
+ 	rm -f "$AP_REFUSED"
+ 	[ -z "$chan" ] && chan=6
+-	[ -z "$ap_ip" ] && ap_ip=192.168.42.1
+ 	[ -z "$htmode" ] && htmode=ht20
+ 
+ 	# Concurrent STA+AP: the AIC8800 is a single radio, so the AP must share
+@@ -306,14 +366,16 @@ start_ap() {
+ 	fi
+ 
+ 	gen_hostapd_conf "$iface" "$ssid" "$psk" "$chan" "$hidden" "$htmode" "$ap_sec_off"
++	# No IP on the AP iface: it is a bridge port. The flush clears anything
++	# the iface held in its previous role (e.g. an old image's hotspot
++	# address).
+ 	ip addr flush dev "$iface" 2>/dev/null
+-	ip addr add "$ap_ip/24" dev "$iface" 2>/dev/null
+ 	ip link set "$iface" up 2>/dev/null
+ 
+ 	if _hostapd_up; then
+ 		echo "$iface" > /run/wifi-ap-iface
+ 		apply_txpower "$iface"
+-		log "AP started on $iface ssid=$ssid ch=$chan ht=$htmode ip=$ap_ip"
++		log "AP started on $iface ssid=$ssid ch=$chan ht=$htmode $(ap_bridge_state "$iface")"
+ 	else
+ 		# Fallback: ACS or HT40 likely unsupported / mismatched. Drop to a
+ 		# safe HT20 config so the hotspot still comes up. In concurrent mode
+@@ -326,7 +388,7 @@ start_ap() {
+ 		if _hostapd_up; then
+ 			echo "$iface" > /run/wifi-ap-iface
+ 			apply_txpower "$iface"
+-			log "AP started on $iface ssid=$ssid ch=$fb_chan ht=ht20 ip=$ap_ip (fallback)"
++			log "AP started on $iface ssid=$ssid ch=$fb_chan ht=ht20 $(ap_bridge_state "$iface") (fallback)"
+ 		else
+ 			log "AP failed to start even on ch$fb_chan HT20 — see hostapd output above"
+ 		fi
+@@ -360,9 +422,10 @@ start() {
+ 			# ap_channel — the hotspot is the priority — and S36wifiwatch
+ 			# re-syncs the AP to the STA's channel if/when it later joins.
+ 			start_sta concurrent
+-			# A weak ap_psk refuses only the AP (start_ap logs why); the STA
+-			# above keeps working. No point waiting 20 s for it in that case.
+-			if ap_psk_ok "$(cfg ap_psk)"; then
++			# A weak ap_psk (or no LAN bridge) refuses only the AP (start_ap
++			# logs why); the STA above keeps working. No point waiting 20 s
++			# for it in that case.
++			if ap_psk_ok "$(cfg ap_psk)" && lan_bridged; then
+ 				if wait_sta_connected 20; then
+ 					log "STA associated — starting co-channel AP"
+ 				else
+@@ -380,23 +443,18 @@ stop() {
+ 	[ -f /var/run/wpa_supplicant-wlan0.pid ] && { kill "$(cat /var/run/wpa_supplicant-wlan0.pid)" 2>/dev/null; rm -f /var/run/wpa_supplicant-wlan0.pid; }
+ 	killall hostapd wpa_supplicant 2>/dev/null
+ 	dhcpcd -x "$STA_IF" 2>/dev/null
+-	# Drop the STA's DNS from openresolv (no-op if dhcpcd's STOP hook already did).
++	# Drop the STA's DNS from openresolv, and the uplink-overlap note (no-ops
++	# if dhcpcd's STOP hooks already did).
+ 	resolvconf -d "$STA_IF.dhcp" -f 2>/dev/null
++	rm -f "$STA_CONFLICT"
++	# The AP iface leaves the LAN bridge. hostapd removes it on a clean exit,
++	# but it may still be exiting or have died without doing so: a wlan0
++	# (AP-only mode) left as a port would bridge whatever it joins next into
++	# the LAN — and as a port it can't become a STA at all. wlan1 leaves by
++	# being deleted.
++	ap_unbridge "$STA_IF"
+ 	iw dev "$AP_IF_CONCURRENT" del 2>/dev/null
+-	# The AP iface (wlan0 in AP-only mode) stays LAN in the LIVE ruleset
+-	# (S60routing's @lan_ifaces) until S60routing next runs, and wlan0 keeps
+-	# the hotspot's $ap_ip/24. Left alone, a wlan0 that now becomes a STA would
+-	# be LAN-trusted on the upstream WLAN (dnsmasq serving DHCP there too), and
+-	# in sta+ap its 192.168.42.0/24 route would shadow wlan1's, so replies to
+-	# hotspot clients would go out wlan0. Drop both now; the S60routing
+-	# restart that follows (portal apply) adds the new AP iface back.
+-	ap=$(cat /run/wifi-ap-iface 2>/dev/null | tr -d '[:space:]')
+-	case "$ap" in
+-		"$STA_IF"|"$AP_IF_CONCURRENT")
+-			for fam in ip ip6; do
+-				nft delete element "$fam" filter lan_ifaces "{ \"$ap\" }" 2>/dev/null
+-			done ;;
+-	esac
++	# Nothing of wlan0's old role (a lease dhcpcd -x didn't drop) carries over.
+ 	ip addr flush dev "$STA_IF" 2>/dev/null
+ 	rm -f /run/wifi-ap-iface
+ }
+@@ -436,12 +494,17 @@ case "${1:-start}" in
+ 		# instead of a redundant teardown/rebuild (one avoidable blip). The
+ 		# channel re-sync path still uses ap_restart (always restarts).
+ 		if ! pidof hostapd >/dev/null 2>&1; then
+-			# Refused PSK: bail before load_modules (which sleeps 1 s) — the
+-			# watchdog calls this every few seconds while hostapd is absent.
++			# Refused PSK / no bridge: bail before load_modules (which sleeps
++			# 1 s) — the watchdog calls this every few seconds while hostapd
++			# is absent.
+ 			if ! ap_psk_ok "$(cfg ap_psk)"; then
+ 				ap_refuse "$AP_PSK_REASON"
+ 				exit 0
+ 			fi
++			if ! lan_bridged; then
++				ap_refuse "$AP_BR_REASON"
++				exit 0
++			fi
+ 			load_modules
+ 			start_ap "$AP_IF_CONCURRENT"
+ 		fi
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S36wifiwatch b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S36wifiwatch
+index ceb1e7da4..89df8d517 100755
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S36wifiwatch
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S36wifiwatch
+@@ -23,8 +23,9 @@ CONF=/etc/rnsbox/wifi.conf
+ STA_IF=wlan0
+ AP_IF=wlan1
+ LOG=/var/log/wifi.log
+-# Written by S35wifi when it refuses to start the AP (weak/empty ap_psk). While
+-# it exists there is no hotspot to revive or protect — see loop().
++# Written by S35wifi when it refuses to start the AP (weak/empty ap_psk, or no
++# LAN bridge). While it exists there is no hotspot to revive or protect — see
++# loop().
+ AP_REFUSED=/run/wifi-ap-refused
+ GRACE=8          # seconds the STA may be down before we protect the AP
+ IDLE_RETRY=30    # seconds between STA reconnect attempts, but only while idle
+@@ -46,10 +47,11 @@ loop() {
+ 		[ "$(cfg mode)" = "sta+ap" ] || { down=0; protected=0; continue; }
+ 
+ 		# AP refused by S35wifi (its password is empty/too short/the old
+-		# published default): reviving it would only re-log the refusal every
+-		# STEP seconds, and freezing the STA scan would protect nothing. Leave
+-		# the STA to wpa_supplicant (undoing our own disconnect, if we issued
+-		# one) until an S35wifi restart with a valid password clears the marker.
++		# published default, or there is no LAN bridge br-lan to put it in):
++		# reviving it would only re-log the refusal every STEP seconds, and
++		# freezing the STA scan would protect nothing. Leave the STA to
++		# wpa_supplicant (undoing our own disconnect, if we issued one) until
++		# an S35wifi restart that can start the AP clears the marker.
+ 		if [ -f "$AP_REFUSED" ]; then
+ 			[ "$protected" = 1 ] && wpa reconnect
+ 			down=0; protected=0
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S46wanwatch b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S46wanwatch
+index 985bb36d4..4a2e9f250 100755
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S46wanwatch
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S46wanwatch
+@@ -30,8 +30,9 @@
+ #      trusted clock (TLS) and an uplink; when either only arrives after boot
+ #      (NTP once the WAN is up, a browser sync, or a WAN that comes up after
+ #      the RTC already made the clock trusted) the watchdog triggers it.
+-#   4. USB host attached (or its NCM driver bound) only after rnsd started:
+-#      usb0 had no IPv6 link-local yet, so the AutoInterface skipped it; the
++#   4. The LAN link came up only after rnsd started (no USB host / hotspot
++#      yet): the LAN iface (br-lan; usb0 without a bridge — /run/lan-iface)
++#      had no IPv6 link-local yet, so the AutoInterface skipped it; the
+ #      watchdog restarts rnsd once when the address appears.
+ #   5. nomadnet / lxmd enabled by the operator (both opt-in: shipped
+ #      enabled=no, and RAM is scarce): they attach to rnsd's shared
+@@ -56,7 +57,7 @@ PIDFILE=/var/run/wanwatch.pid
+ LOG=/var/log/wanwatch.log
+ RNSD_PIDFILE=/var/run/rnsd.pid
+ BOOTCHECK_MARK=/run/rnsbox-update-bootcheck   # created by S84cron bootcheck
+-LL_MARK=/run/rnsd-usb0-no-ll                  # created by S82rnsd start
++LL_MARK=/run/rnsd-lan-no-ll                   # created by S82rnsd start
+ STOPPED_MARK=/run/rnsd.stopped                # explicit `S82rnsd stop`
+ ARMED_MARK=/run/rnsd.armed                    # S82rnsd start/restart ran
+ DEPS_MARK=/run/wanwatch-deps-pending          # nomadnet/lxmd wait for rnsd
+@@ -108,13 +109,27 @@ rnsd_running() {
+ 	return 1
+ }
+ 
+-# usb0_ll — true once usb0 has a usable IPv6 link-local address (scope 0x20,
+-# DAD done: neither tentative 0x40 nor dadfailed 0x08). Same test as S82rnsd;
+-# builtins only.
+-usb0_ll() {
++# lan_iface — set LAN to the LAN iface S30gadget_nic recorded in
++# /run/lan-iface: br-lan, or usb0 when the bridge couldn't be made. Without
++# a valid record: br-lan if that bridge exists, else usb0 (as S60routing).
++# Same as S82rnsd; builtins only.
++lan_iface() {
++	LAN=
++	{ read -r LAN </run/lan-iface; } 2>/dev/null
++	case "$LAN" in
++		br-lan|usb0) ;;
++		*) LAN=usb0; [ -d /sys/class/net/br-lan/bridge ] && LAN=br-lan ;;
++	esac
++}
++
++# lan_ll — true once the LAN iface has a usable IPv6 link-local address
++# (scope 0x20, DAD done: neither tentative 0x40 nor dadfailed 0x08). Same
++# test as S82rnsd; builtins only.
++lan_ll() {
+ 	[ -r /proc/net/if_inet6 ] || return 1
++	lan_iface
+ 	while read -r _addr _idx _plen scope flags dev; do
+-		[ "$dev" = usb0 ] && [ "$scope" = 20 ] || continue
++		[ "$dev" = "$LAN" ] && [ "$scope" = 20 ] || continue
+ 		case "$flags" in [0-9a-f][0-9a-f]) ;; *) continue ;; esac
+ 		[ $((0x$flags & 0x48)) -eq 0 ] && return 0
+ 	done </proc/net/if_inet6
+@@ -287,14 +302,14 @@ loop() {
+ 			[ -n "$ROUTES" ] && /etc/init.d/S84cron bootcheck >> "$LOG" 2>&1
+ 		fi
+ 
+-		# Step 4: rnsd started before usb0 had its IPv6 link-local (no USB
+-		# host had brought the link up yet), so its AutoInterface never
+-		# adopted usb0 — RNS only picks ifaces at startup. S82rnsd left
+-		# $LL_MARK; restart rnsd once, as soon as the address is there.
+-		# (S82rnsd kick-restart re-evaluates and clears the marker, and
+-		# does nothing after an explicit stop.)
+-		if [ -f "$LL_MARK" ] && usb0_ll && rnsd_running; then
+-			log "usb0 got its IPv6 link-local after rnsd started -> restarting rnsd (AutoInterface)"
++		# Step 4: rnsd started before the LAN iface had its IPv6 link-local
++		# (no USB host had brought the link up and no hotspot was running
++		# yet), so its AutoInterface never adopted it — RNS only picks
++		# ifaces at startup. S82rnsd left $LL_MARK; restart rnsd once, as
++		# soon as the address is there. (S82rnsd kick-restart re-evaluates
++		# and clears the marker, and does nothing after an explicit stop.)
++		if [ -f "$LL_MARK" ] && lan_ll && rnsd_running; then
++			log "$LAN got its IPv6 link-local after rnsd started -> restarting rnsd (AutoInterface)"
+ 			rm -f "$LL_MARK"
+ 			/etc/init.d/S82rnsd kick-restart >> "$LOG" 2>&1
+ 		fi
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S60routing b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S60routing
+index d6dfa1c9e..413ac5e30 100755
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S60routing
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S60routing
+@@ -1,15 +1,20 @@
+ #!/bin/sh
+ # S60routing — kernel routing knobs + regenerate nftables.conf and the
+-# per-LAN dnsmasq scope, then apply.
++# LAN's dnsmasq scope, then apply.
+ #
+-# Runs after S30gadget_nic (usb0), S30eth (eth0 lease) and S35wifi (so an
+-# AP iface, if any, already exists and can be folded into the LAN side).
++# Runs after S30gadget_nic (the LAN iface: br-lan, or usb0 without a bridge;
++# recorded in /run/lan-iface), S30eth (eth0 lease) and S35wifi (wlan0 may be
++# the WAN). The hotspot needs nothing here: hostapd bridges the AP iface into
++# br-lan (S35wifi), so its clients share the one LAN iface, subnet and DHCP
++# pool with the USB host.
+ # Re-runnable as `restart` whenever the portal edits the rnsbox configs.
+ #
+ # nftables ruleset comes from `/usr/sbin/rnsbox-portal nftgen` (the C++
+ # portal's generator — single source of truth shared with the web UI):
+ # `table ip filter` + `table ip nat`, plus a LAN-only `table ip6 filter` when
+-# the kernel has IPv6 (only usb0 has IPv6 at all — see S09ipv6). Pre-validate
++# the kernel has IPv6 (only the LAN iface has IPv6 at all — see S09ipv6). The
++# LAN set is just the LAN iface: traffic between bridge ports (USB host <->
++# hotspot client) is switched at L2 and never reaches nftables. Pre-validate
+ # with `nft -c -f` (validate-before-swap discipline) before atomically
+ # swapping the live config so a bad generated rule can't lock us out.
+ #
+@@ -31,7 +36,7 @@
+ # failure land in $NFT_ERR.
+ #
+ # Before this runs, S29fw (`S60routing early`) has already loaded the emergency
+-# ruleset with usb0 as the only LAN: the WAN gets its address in S30eth /
++# ruleset (LAN = br-lan + usb0): the WAN gets its address in S30eth /
+ # S35wifi and stock S50sshd listens on 0.0.0.0:22 well before S60, so without
+ # it IPv4 would be unfiltered for that window on every boot. `stop` loads the
+ # same emergency ruleset instead of flushing, so shutdown (rcK stops S60 before
+@@ -44,20 +49,17 @@ DNSMASQ_FILE=/etc/dnsmasq.conf
+ NFTGEN="/usr/sbin/rnsbox-portal nftgen"
+ WAN_CANDIDATES="eth0 wlan0"
+ 
+-USB0_LAN_IP=10.42.0.1
+-USB0_LAN_DHCP_START=10.42.0.10
+-USB0_LAN_DHCP_END=10.42.0.20
++# One LAN, one pool: the USB host and every hotspot client (bridged into
++# br-lan by hostapd) draw from it. Old wifi.conf ap_ip/ap_dhcp_* keys (the
++# former separate 192.168.42.0/24 hotspot subnet) are ignored.
++LAN_IP=10.42.0.1
++LAN_DHCP_START=10.42.0.10
++LAN_DHCP_END=10.42.0.250
+ AUTOGEN_DNSMASQ="# --- AUTOGEN MARKER --- per-LAN scopes appended at boot below ---"
+-
+-# RNSBox W variant: S35wifi writes the AP iface name to /run/wifi-ap-iface
+-# when a hotspot is up. Fold it into the LAN side so it gets NAT + a DHCP
+-# scope automatically. WiFi subnet read from /etc/rnsbox/wifi.conf.
+-WIFI_CONF=/etc/rnsbox/wifi.conf
+-wifi_cfg() {
+-	grep -E "^[[:space:]]*$1[[:space:]]*=" "$WIFI_CONF" 2>/dev/null | tail -1 \
+-	  | sed -E "s/^[^=]*=[[:space:]]*//" | sed -E 's/[[:space:]]*#.*$//' \
+-	  | sed -E 's/[[:space:]]*$//'
+-}
++# Always LAN in the early/emergency rulesets, whatever /run/lan-iface says: the
++# bridge and its USB port, so a bridge that failed (usb0 addressed alone) or
++# isn't made yet (S29fw runs before S30gadget_nic) can't lock out the USB host.
++FALLBACK_LAN="br-lan usb0"
+ 
+ read_wan() {
+ 	# wan.conf is now key=value (interface=eth0). Prefer the interface= key;
+@@ -69,13 +71,16 @@ read_wan() {
+ 	case "$WAN" in eth0|wlan0) ;; *) WAN=eth0 ;; esac
+ }
+ 
++# read_lan — LAN_IFACES = the LAN iface S30gadget_nic recorded in
++# /run/lan-iface: br-lan, or usb0 when the bridge couldn't be made. Without
++# a valid record (S30gadget_nic hasn't run): br-lan if it exists, else usb0.
+ read_lan() {
+-	LAN_IFACES="usb0"
+-	AP_IF=""
+-	if [ -r /run/wifi-ap-iface ]; then
+-		AP_IF=$(cat /run/wifi-ap-iface 2>/dev/null | tr -d '[:space:]')
+-		[ -n "$AP_IF" ] && [ -e "/sys/class/net/$AP_IF" ] && LAN_IFACES="usb0,$AP_IF"
+-	fi
++	LAN_IFACES=
++	{ read -r LAN_IFACES < /run/lan-iface; } 2>/dev/null
++	case "$LAN_IFACES" in
++		br-lan|usb0) ;;
++		*) LAN_IFACES=usb0; [ -d /sys/class/net/br-lan/bridge ] && LAN_IFACES=br-lan ;;
++	esac
+ }
+ 
+ # note <msg> — to the console/caller and, timestamped, to $NFT_ERR.
+@@ -127,9 +132,13 @@ regen_nftables() {
+ 
+ # Last-resort ruleset (step 3 in the header). IPv4-only on purpose so it
+ # loads on any nf_tables kernel; same LAN-only shape as the static fallback
+-# but built from the live WAN/LAN names.
++# but built from the live WAN name. LAN = $LAN_IFACES plus $FALLBACK_LAN.
+ emergency_ruleset() {
+-	lan_set=$(echo "$LAN_IFACES" | sed -e 's/[^,][^,]*/"&"/g' -e 's/,/, /g')
++	lan_set=
++	for i in $(echo "$LAN_IFACES" | tr ',' ' ') $FALLBACK_LAN; do
++		case ", $lan_set, " in *", \"$i\", "*) continue ;; esac
++		lan_set="${lan_set:+$lan_set, }\"$i\""
++	done
+ 	cat <<EOF
+ flush ruleset
+ table ip filter {
+@@ -156,12 +165,13 @@ EOF
+ }
+ 
+ # $NFT_FILE is safe to (re)load only if it was generated for the current
+-# WAN/LAN: a stale one could still list e.g. wlan0 (an old AP-only hotspot)
+-# as LAN after wlan0 became the uplink, and accept everything from it. The
+-# shipped static fallback (not nftgen output) is closed toward every non-LAN
+-# iface whatever the topology, so it always fits. An empty or truncated file
+-# (no filter table) never counts as that fallback: nft -f of it would "load"
+-# nothing and leave the box unfiltered with ip_forward=1.
++# WAN/LAN: a stale one could still list e.g. wlan0 (an AP-only hotspot of an
++# image before the LAN bridge) as LAN after wlan0 became the uplink, and
++# accept everything from it. The shipped static fallback (not nftgen output)
++# is closed toward every non-LAN iface whatever the topology, so it always
++# fits. An empty or truncated file (no filter table) never counts as that
++# fallback: nft -f of it would "load" nothing and leave the box unfiltered
++# with ip_forward=1.
+ nft_file_fits() {
+ 	grep -q '^table ip filter' "$NFT_FILE" || return 1
+ 	grep -q '^# Generated by rnsbox nftgen' "$NFT_FILE" || return 0
+@@ -189,7 +199,8 @@ apply_nftables() {
+ # Re-attach $1's root qdisc so it picks up default_qdisc (fq). The default is
+ # chosen when an iface is first raised, and eth0/usb0/wlan0/sl0 are all up
+ # before we set it — so they'd keep pfifo_fast (mq + pfifo_fast children on
+-# wlan0).
++# wlan0). (br-lan itself is noqueue, like every bridge: its egress queues on
++# the port the frame leaves by.)
+ # Deleting the root makes the kernel attach the default again (mq with fq
+ # children on a multi-queue device, plain fq otherwise); a default root has
+ # handle 0: which tc can't delete, so swap in a handled pfifo_fast first
+@@ -212,26 +223,14 @@ regen_dnsmasq() {
+ 		echo "# WAN=$WAN (no DHCP served on the uplink — $WAN is a client there)"
+ 		echo "no-dhcp-interface=$WAN"
+ 		echo
+-		echo "# Sole DHCP server on usb0 and the AP: ACK a renewal for a lease we no longer have (lost table, clock step) instead of NAKing it"
++		echo "# Sole DHCP server on the LAN: ACK a renewal for a lease we no longer have (lost table, clock step) instead of NAKing it"
+ 		echo "dhcp-authoritative"
+ 		echo
+-		echo "# usb0 LAN"
+-		echo "interface=usb0"
+-		echo "dhcp-range=set:usb0,$USB0_LAN_DHCP_START,$USB0_LAN_DHCP_END,255.255.255.0,12h"
+-		echo "dhcp-option=tag:usb0,3,$USB0_LAN_IP"
+-		echo "dhcp-option=tag:usb0,6,$USB0_LAN_IP"
+-		# RNSBox W variant: AP hotspot scope (only when S35wifi has an AP up).
+-		if [ -n "$AP_IF" ] && [ -e "/sys/class/net/$AP_IF" ]; then
+-			AP_IP=$(wifi_cfg ap_ip); [ -z "$AP_IP" ] && AP_IP=192.168.42.1
+-			AP_DS=$(wifi_cfg ap_dhcp_start); [ -z "$AP_DS" ] && AP_DS=192.168.42.10
+-			AP_DE=$(wifi_cfg ap_dhcp_end); [ -z "$AP_DE" ] && AP_DE=192.168.42.100
+-			echo
+-			echo "# $AP_IF WiFi AP LAN"
+-			echo "interface=$AP_IF"
+-			echo "dhcp-range=set:$AP_IF,$AP_DS,$AP_DE,255.255.255.0,12h"
+-			echo "dhcp-option=tag:$AP_IF,3,$AP_IP"
+-			echo "dhcp-option=tag:$AP_IF,6,$AP_IP"
+-		fi
++		echo "# LAN ($LAN_IFACES): the USB-C host and the hotspot clients, one pool"
++		echo "interface=$LAN_IFACES"
++		echo "dhcp-range=set:lan,$LAN_DHCP_START,$LAN_DHCP_END,255.255.255.0,12h"
++		echo "dhcp-option=tag:lan,3,$LAN_IP"
++		echo "dhcp-option=tag:lan,6,$LAN_IP"
+ 	} >> "$DNSMASQ_FILE"
+ }
+ 
+@@ -248,6 +247,13 @@ start() {
+ 	echo 0 > /proc/sys/net/ipv4/conf/default/rp_filter
+ 	echo 0 > /proc/sys/net/ipv4/conf/all/accept_redirects
+ 	echo 0 > /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || true
++	# ARP only for an address on the iface asked, and from an address of the
++	# iface asking: every RNSBox's LAN is 10.42.0.1, so a box whose WiFi
++	# client is on another RNSBox's hotspot must not answer for it there.
++	# S02sysctl already set this (/etc/sysctl.d/20-rnsbox-net.conf) before
++	# any uplink came up; kept here with the other routing knobs.
++	echo 1 > /proc/sys/net/ipv4/conf/all/arp_ignore
++	echo 2 > /proc/sys/net/ipv4/conf/all/arp_announce
+ 	# route_localnet on the WAN iface: lets a port forward whose target is a
+ 	# loopback address (127.0.0.0/8 — e.g. a service that binds only to
+ 	# 127.0.0.1) actually be delivered. Without it, a packet DNAT'd to 127.x
+@@ -356,11 +362,12 @@ restart_dnsmasq() {
+ # Boot placeholder, loaded by S29fw before any uplink has an address (S30eth,
+ # S35wifi) — stock S50sshd listens on 0.0.0.0:22 well before start() runs.
+ # Nothing is routed yet (ip_forward=0), so this is just the emergency ruleset
+-# with usb0 as the only LAN: lo + usb0 + established in, every other iface
+-# dropped. start() swaps the real ruleset in atomically.
++# with $FALLBACK_LAN as the LAN (S30gadget_nic hasn't made br-lan yet): lo +
++# br-lan + usb0 + established in, every other iface dropped. start() swaps
++# the real ruleset in atomically.
+ early() {
+ 	read_wan
+-	LAN_IFACES=usb0
++	read_lan
+ 	echo 0 > /proc/sys/net/ipv4/ip_forward
+ 	emergency_ruleset | nft -f - >>"$NFT_ERR" 2>&1 \
+ 	  || note "could not load the early fail-closed ruleset (see $NFT_ERR)"
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S82rnsd b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S82rnsd
+index 5d39cb2ac..fcf801c9f 100755
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S82rnsd
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S82rnsd
+@@ -27,10 +27,10 @@
+ #
+ # Bind addr: rnsd listens on whatever interfaces are declared in the
+ # config (typically a TCPServerInterface on 0.0.0.0:4242 + an
+-# AutoInterface on usb0). The nftables INPUT chain (S60routing) accepts
+-# inbound :4242 on the WAN because the shipped /etc/rnsbox/openports.conf
+-# opens it (`tcp 4242`, for WAN peers); remove that entry (portal: Network
+-# -> Open ports) to keep them out.
++# AutoInterface on the LAN iface, br-lan). The nftables INPUT chain
++# (S60routing) accepts inbound :4242 on the WAN because the shipped
++# /etc/rnsbox/openports.conf opens it (`tcp 4242`, for WAN peers); remove
++# that entry (portal: Network -> Open ports) to keep them out.
+ #
+ # Logging: rnsd prints its log to stdout, and Python block-buffers a
+ # redirected stdout — a quiet rnsd never filled the buffer, so the old
+@@ -65,9 +65,9 @@ DAEMON=/usr/bin/rnsd
+ PIDFILE=/var/run/$NAME.pid
+ LOGPIPE=/var/run/$NAME.logpipe
+ CFG_DIR=/etc/reticulum
+-# Present while the running rnsd was started before usb0 had its IPv6
+-# link-local address (see usb0_ll); S46wanwatch tests it too.
+-LL_MARK=/run/rnsd-usb0-no-ll
++# Present while the running rnsd was started before the LAN iface had its
++# IPv6 link-local address (see lan_ll); S46wanwatch tests it too.
++LL_MARK=/run/rnsd-lan-no-ll
+ # Present after an explicit `S82rnsd stop` (rcK at shutdown, or the operator)
+ # until the next explicit start/restart. S46wanwatch and S84cron use
+ # `kick`/`kick-restart`, which check it under the lock and never clear it, so
+@@ -191,28 +191,49 @@ logger_pid() {
+ 	echo "$l"
+ }
+ 
+-# usb0_ll — true once usb0 has a usable IPv6 link-local address (scope 0x20,
+-# DAD done: neither tentative 0x40 nor dadfailed 0x08), read from
+-# /proc/net/if_inet6 with builtins only. Same test as S46wanwatch.
+-usb0_ll() {
++# lan_iface — set LAN to the LAN iface S30gadget_nic recorded in
++# /run/lan-iface: br-lan, or usb0 when the bridge couldn't be made. Without
++# a valid record: br-lan if that bridge exists, else usb0 (as S60routing).
++# Builtins only. Same as S46wanwatch.
++lan_iface() {
++	LAN=
++	{ read -r LAN </run/lan-iface; } 2>/dev/null
++	case "$LAN" in
++		br-lan|usb0) ;;
++		*) LAN=usb0; [ -d /sys/class/net/br-lan/bridge ] && LAN=br-lan ;;
++	esac
++}
++
++# lan_ll — true once the LAN iface has a usable IPv6 link-local address
++# (scope 0x20, DAD done: neither tentative 0x40 nor dadfailed 0x08), read
++# from /proc/net/if_inet6 with builtins only. Same test as S46wanwatch.
++lan_ll() {
+ 	[ -r /proc/net/if_inet6 ] || return 1
++	lan_iface
+ 	while read -r _addr _idx _plen scope flags dev; do
+-		[ "$dev" = usb0 ] && [ "$scope" = 20 ] || continue
++		[ "$dev" = "$LAN" ] && [ "$scope" = 20 ] || continue
+ 		case "$flags" in [0-9a-f][0-9a-f]) ;; *) continue ;; esac
+ 		[ $((0x$flags & 0x48)) -eq 0 ] && return 0
+ 	done </proc/net/if_inet6
+ 	return 1
+ }
+ 
+-# auto_wants_usb0 — true if $CFG_DIR/config has an AutoInterface that would
+-# adopt usb0: a [[...]] stanza with type = AutoInterface, enabled (or
++# auto_wants_lan — true if $CFG_DIR/config has an AutoInterface that would
++# adopt the LAN iface: a [[...]] stanza with type = AutoInterface, enabled (or
+ # interface_enabled) true (RNS starts an interface only then; either one
+-# suffices), and no devices list (all ifaces) or one that names usb0. Without
+-# this, a disabled or re-pointed AutoInterface would still leave $LL_MARK and
+-# S46wanwatch would bounce rnsd for nothing when a USB host attaches.
+-auto_wants_usb0() {
+-	awk '
+-	function chk() { if (t == "autointerface" && e && (d == "" || d ~ /(^|[[:space:],])usb0([[:space:],]|$)/)) hit = 1 }
++# suffices), and no devices list (all ifaces) or one that names the LAN iface
++# (the shipped config lists br-lan and usb0). Without this, a disabled or
++# re-pointed AutoInterface would still leave $LL_MARK and S46wanwatch would
++# bounce rnsd for nothing when the LAN link comes up.
++auto_wants_lan() {
++	lan_iface
++	awk -v lan="$LAN" '
++	function chk() {
++		if (t == "autointerface" && e) {
++			if (d == "") hit = 1
++			else { n = split(d, dv, /[[:space:],]+/); for (i = 1; i <= n; i++) if (dv[i] == lan) hit = 1 }
++		}
++	}
+ 	/^[[:space:]]*\[/ { chk(); t = ""; e = 0; d = ""; next }
+ 	{ l = tolower($0); sub(/#.*/, "", l); gsub(/"/, "", l) }
+ 	l ~ /^[[:space:]]*type[[:space:]]*=/ { sub(/^[^=]*=[[:space:]]*/, "", l); gsub(/[[:space:]]/, "", l); t = l; next }
+@@ -282,12 +303,15 @@ start() {
+ 	fi
+ 
+ 	# RNS's AutoInterface adopts an iface only if it already has its IPv6
+-	# link-local when rnsd starts, and usb0 only gets one once a USB host has
+-	# brought the link up. If that hasn't happened yet (host slow to bind the
+-	# NCM driver, or the box powered separately) and an enabled AutoInterface
+-	# covers usb0, leave a marker: S46wanwatch restarts rnsd once when the
+-	# address appears.
+-	if [ -r /proc/net/if_inet6 ] && ! usb0_ll && auto_wants_usb0; then
++	# link-local when rnsd starts (AutoInterface.__init__ scans the ifaces
++	# once), and the LAN iface only gets one once the link has carrier: for
++	# br-lan, its first port coming up — a USB host bringing up the NCM link,
++	# or the hotspot starting; for a lone usb0, the USB host. If that hasn't
++	# happened yet (host slow to bind the NCM driver, the box powered
++	# separately with no hotspot) and an enabled AutoInterface covers the LAN
++	# iface, leave a marker: S46wanwatch restarts rnsd once when the address
++	# appears.
++	if [ -r /proc/net/if_inet6 ] && ! lan_ll && auto_wants_lan; then
+ 		: > "$LL_MARK"
+ 	else
+ 		rm -f "$LL_MARK"
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/nftables.conf b/buildroot/board/cvitek/SG200X/overlay/etc/nftables.conf
+index d7a10da0d..a0e7be74f 100644
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/nftables.conf
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/nftables.conf
+@@ -7,10 +7,11 @@
+ # if it was generated for the same WAN/LAN (else the emergency ruleset).
+ #
+ # It fails CLOSED toward the WAN and needs no WAN iface name:
+-#   - LAN ifaces (usb0; wlan1 = the concurrent-mode hotspot vif, only ever an
+-#     AP) keep full access, so SSH / the web UI stay reachable over USB-C to
+-#     repair things. An AP-only hotspot runs on wlan0, which a static file
+-#     can't tell apart from a wlan0 WAN, so it counts as non-LAN here;
++#   - the LAN keeps full access, so SSH / the web UI stay reachable over USB-C
++#     to repair things: br-lan (the LAN bridge — USB-C link and hotspot, one
++#     subnet; the hotspot's AP iface is a bridge port, so its clients arrive
++#     on br-lan too) and usb0 (the LAN iface when S30gadget_nic couldn't make
++#     the bridge; as a bridge port it carries no IP traffic of its own);
+ #   - every other iface (eth0, wlan0, sl0, ...) reaches nothing on the box:
+ #     no port forwards, no open ports and — unlike the generated ruleset — no
+ #     WAN SSH;
+@@ -27,7 +28,7 @@
+ flush ruleset
+ 
+ table ip filter {
+-	set lan_ifaces { type ifname; elements = { "usb0", "wlan1" } }
++	set lan_ifaces { type ifname; elements = { "br-lan", "usb0" } }
+ 
+ 	chain input {
+ 		type filter hook input priority filter; policy drop;
+@@ -59,7 +60,7 @@ table ip nat {
+ }
+ 
+ table ip6 filter {
+-	set lan_ifaces { type ifname; elements = { "usb0", "wlan1" } }
++	set lan_ifaces { type ifname; elements = { "br-lan", "usb0" } }
+ 
+ 	chain input {
+ 		type filter hook input priority filter; policy drop;
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/reticulum/config b/buildroot/board/cvitek/SG200X/overlay/etc/reticulum/config
+index 0ff56298d..9c82a4f52 100644
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/reticulum/config
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/reticulum/config
+@@ -7,8 +7,9 @@
+ #   - listens on TCP 0.0.0.0:4242 so external Reticulum peers can
+ #     connect inbound (WAN reach: `tcp 4242` in
+ #     /etc/rnsbox/openports.conf, shipped open; the portal UI edits it)
+-#   - runs an AutoInterface on usb0 so devices on the USB-tethered
+-#     LAN auto-discover this node without manual config
++#   - runs an AutoInterface on the LAN (br-lan: the USB-C link and the
++#     WiFi hotspot) so devices on it auto-discover this node without
++#     manual config
+ #
+ # Edit live via the portal (Reticulum tab) or directly with SSH +
+ # `/etc/init.d/S82rnsd restart` to apply.
+@@ -27,20 +28,36 @@
+ 
+ [interfaces]
+ 
+-  # LAN-side auto-discovery on the USB-C gadget network. Reticulum
+-  # multicasts node announcements over usb0 so any client device
+-  # tethered via USB-C finds this node with no config.
+-  # Runs purely over IPv6 link-local: usb0's fe80:: address, the ff12::
+-  # link-scope group, UDP 29716/29717 (discovery) + 42671 (data). usb0 is
+-  # the only iface with IPv6 on this box (S09ipv6 / S30gadget_nic), and
+-  # its link-local appears only once a USB host has brought the link up.
+-  # rnsd adopts usb0 only if it already has one when rnsd starts; if the
+-  # host attaches later, S46wanwatch restarts rnsd once when the address
+-  # appears (or restart rnsd yourself from the portal Reticulum tab).
+-  [[USB LAN AutoInterface]]
++  # LAN-side auto-discovery. Reticulum multicasts node announcements
++  # over the LAN, so any client tethered via USB-C or joined to the
++  # hotspot (both ports of the bridge br-lan, one segment) finds this
++  # node with no config.
++  # Runs purely over IPv6 link-local: the LAN iface's fe80:: address, the
++  # ff12:: link-scope group, UDP 29716/29717 (discovery) + 42671 (data).
++  # The LAN iface is br-lan, or usb0 alone if the bridge couldn't be made
++  # (/run/lan-iface). It is the only iface with IPv6 on this box (S09ipv6
++  # / S30gadget_nic; usb0 has none while it is a bridge port), and its
++  # link-local appears only once the link has carrier: a USB host has
++  # brought usb0 up, or the hotspot is running.
++  # `devices` lists both names: AutoInterface (RNS/Interfaces/
++  # AutoInterface.py, __init__) walks the system ifaces once at startup,
++  # skips any not in `devices`, and adopts one only if it has an fe80::
++  # address, so whichever of the two is the LAN iface is used and the
++  # other is skipped. The pin also keeps it off any iface that might gain
++  # IPv6 later (with no `devices` it would try them all).
++  # rnsd adopts the LAN iface only if it already has its link-local when
++  # rnsd starts; if the link comes up later, S46wanwatch restarts rnsd
++  # once when the address appears (or restart rnsd yourself from the
++  # portal Reticulum tab).
++  [[LAN AutoInterface]]
+     type = AutoInterface
+     enabled = True
+-    devices = usb0
++    devices = br-lan, usb0
++    # Explicit 10 Mbit/s: RNS sizes announce caps and link timeouts from this.
++    # It equals AutoInterface's own BITRATE_GUESS today; pinned here so a
++    # future RNS default can't change it. Conservative next to the real LAN
++    # (USB-C NCM / 2.4 GHz hotspot) - the C906 running Python is the limit.
++    bitrate = 10000000
+ 
+   # Inbound TCP listener for external Reticulum peers. Bound on all
+   # interfaces; nftables limits which interfaces actually reach it.
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/openports.conf b/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/openports.conf
+index f0daedfa2..96c4c68a0 100644
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/openports.conf
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/openports.conf
+@@ -6,8 +6,8 @@
+ # SSH (22), the web UI (80) and rnsd's TCPServerInterface (4242, so external
+ # Reticulum peers can connect in) ship as default entries, so the box is
+ # reachable on the WAN out of the box. Remove them here (or in the portal:
+-# Network -> Open ports) to close WAN access — the LAN side (usb0) always
+-# stays open.
++# Network -> Open ports) to close WAN access — the LAN side (br-lan: the
++# USB-C link and the WiFi hotspot) always stays open.
+ # Managed by the rnsbox-portal UI (Network -> Open ports).
+ tcp 22  # SSH
+ tcp 80  # web admin UI
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/wifi.conf b/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/wifi.conf
+index a2b76073b..66479ed65 100644
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/wifi.conf
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/wifi.conf
+@@ -16,6 +16,14 @@
+ #             while the hotspot is on. A 5 GHz-ONLY upstream will not connect
+ #             in sta+ap; use mode=sta (no hotspot) for a 5 GHz uplink.
+ #
++# The hotspot has no subnet of its own: hostapd bridges the AP iface (wlan0
++# in ap mode, wlan1 in sta+ap) into the LAN bridge br-lan, so its clients are
++# on the same 10.42.0.0/24 as the USB-C host and get their address from the
++# one LAN DHCP pool (dnsmasq, 10.42.0.10-250); the portal is 10.42.0.1 from
++# either. The AP iface itself has no IP. (ap_ip / ap_dhcp_start /
++# ap_dhcp_end, the old separate 192.168.42.0/24 hotspot subnet, are gone and
++# ignored if still present.)
++#
+ # Managed by the rnsbox-portal WiFi tab. Apply hand-edits with:
+ #   /etc/init.d/S35wifi restart
+ 
+@@ -50,9 +58,6 @@ ap_channel=6
+ # concurrent.
+ ap_htmode=ht20
+ # ap_hidden=0
+-ap_ip=192.168.42.1
+-ap_dhcp_start=192.168.42.10
+-ap_dhcp_end=192.168.42.100
+ 
+ # --- TX power (radio-wide; applies to STA and AP) ---
+ # tx_power:
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/sysctl.d/20-rnsbox-net.conf b/buildroot/board/cvitek/SG200X/overlay/etc/sysctl.d/20-rnsbox-net.conf
+new file mode 100644
+index 000000000..21350ab97
+--- /dev/null
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/sysctl.d/20-rnsbox-net.conf
+@@ -0,0 +1,21 @@
++# RNSBox: ARP only for an address on the interface that was asked. Every
++# RNSBox's LAN address is the same, 10.42.0.1 (br-lan; its hotspot is bridged
++# into it). With the kernel default arp_ignore=0 a box answers ARP for any of
++# its addresses on any interface, so a box whose WiFi client got onto another
++# RNSBox's hotspot would answer "who-has 10.42.0.1" there with its wlan0 MAC,
++# and that box's USB host and hotspot clients could take it for their
++# gateway, portal and DNS server.
++#   arp_ignore=1    reply only if the target address is configured on the
++#                   interface the request came in on (10.42.0.1 is on
++#                   br-lan, so the LAN is still answered; eth0, wlan0 and sl0
++#                   answer only for their own addresses)
++#   arp_announce=2  send ARP requests from an address of the outgoing
++#                   interface, never e.g. 10.42.0.1 on the uplink
++# The kernel uses the larger of all.* and the interface's own value, so all.*
++# covers every interface; default.* gives interfaces created later (usb0,
++# br-lan, wlan0/wlan1) the same values. Applied by /etc/init.d/S02sysctl,
++# before any uplink comes up (S30eth, S35wifi); S60routing sets all.* again.
++net.ipv4.conf.all.arp_ignore = 1
++net.ipv4.conf.all.arp_announce = 2
++net.ipv4.conf.default.arp_ignore = 1
++net.ipv4.conf.default.arp_announce = 2
+diff --git a/buildroot/package/rnsbox-portal/src/cgi/main.cpp b/buildroot/package/rnsbox-portal/src/cgi/main.cpp
+index b4cc3f601..e3f47e04f 100644
+--- a/buildroot/package/rnsbox-portal/src/cgi/main.cpp
++++ b/buildroot/package/rnsbox-portal/src/cgi/main.cpp
+@@ -16,7 +16,6 @@
+ #include "routes.h"
+ #include "nftgen.h"
+ #include "store.h"
+-#include "wifi.h"
+ #include <cctype>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -188,19 +187,17 @@ static bool tcp_forwarded(int wan_port) {
+     return false;
+ }
+ 
+-// Request from a LAN segment or the box itself? Our prerouting DNAT matches only
++// Request from the LAN or the box itself? Our prerouting DNAT matches only
+ // iifname "<WAN>" (nftgen) and keeps the source address, so for these clients a
+ // redirect to another port of the same Host reaches us, never a forward's target.
+-// usb0 is 10.42.0.1/24 (S30gadget_nic); the hotspot is ap_ip/24 (S35wifi) while
+-// it is up (/run/wifi-ap-iface). uhttpd listens on IPv4 only (S81router).
++// The LAN is one subnet: 10.42.0.1/24 on /run/lan-iface (S30gadget_nic) —
++// br-lan, which bridges the USB-C host and the WiFi hotspot's clients (one
++// dnsmasq pool), or usb0 alone if the bridge couldn't be made. uhttpd listens
++// on IPv4 only (S81router).
+ static bool from_lan(const http::Request& req) {
+     const std::string& ra = req.remote_addr;
+     if (!store::valid_ipv4(ra)) return false;
+-    auto net24 = [](const std::string& ip) { return ip.substr(0, ip.rfind('.') + 1); };
+-    if (ra.rfind("127.", 0) == 0 || net24(ra) == "10.42.0.") return true;
+-    if (util::trim(util::read_file("/run/wifi-ap-iface", 64)).empty()) return false;
+-    std::string ap = wifi::read_conf()["ap_ip"];
+-    return store::valid_ipv4(ap) && net24(ap) == net24(ra);
++    return ra.rfind("127.", 0) == 0 || ra.rfind("10.42.0.", 0) == 0;
+ }
+ 
+ // ---- auth routes ----
+@@ -238,7 +235,7 @@ static void r_logout(const http::Request& req, http::Response& res) {
+ }
+ 
+ int main(int argc, char** argv) {
+-    // CLI mode: `rnsbox-portal nftgen --wan eth0 --lan usb0,wlan1` (boot path).
++    // CLI mode: `rnsbox-portal nftgen --wan eth0 --lan br-lan` (boot path).
+     if (argc >= 2 && strcmp(argv[1], "nftgen") == 0)
+         return nftgen::cli_main(argc, argv);
+ 
+diff --git a/buildroot/package/rnsbox-portal/src/cgi/nftgen.cpp b/buildroot/package/rnsbox-portal/src/cgi/nftgen.cpp
+index bf67a3db4..9a2e74764 100644
+--- a/buildroot/package/rnsbox-portal/src/cgi/nftgen.cpp
++++ b/buildroot/package/rnsbox-portal/src/cgi/nftgen.cpp
+@@ -2,6 +2,7 @@
+ // tables are byte-identical to it, the ip6 filter table was added after.
+ #include "nftgen.h"
+ #include "store.h"
++#include "sysinfo.h"
+ #include <cstdio>
+ #include <cstring>
+ #include <map>
+@@ -92,10 +93,11 @@ std::string generate(const std::string& wan, const std::vector<std::string>& lan
+     add("}");
+ 
+     if (with_ipv6) {
+-        // IPv6 is only there for Reticulum's AutoInterface on usb0 (fe80::
+-        // link-local + ff12:: multicast; UDP 29716/29717/42671) and S09ipv6
+-        // disables it on every non-LAN iface. This table is the second layer:
+-        // nothing but lo + the LAN reaches the box over IPv6, nothing is routed.
++        // IPv6 is only there for Reticulum's AutoInterface on the LAN iface
++        // (br-lan; fe80:: link-local + ff12:: multicast; UDP 29716/29717/42671)
++        // and S09ipv6 disables it on every other iface, bridge ports included.
++        // This table is the second layer: nothing but lo + the LAN reaches the
++        // box over IPv6, nothing is routed.
+         add("");
+         add("table ip6 filter {");
+         add("\tset lan_ifaces { type ifname; elements = { " + lan_set + " } }\n");
+@@ -124,7 +126,7 @@ std::string generate(const std::string& wan, const std::vector<std::string>& lan
+ }
+ 
+ int cli_main(int argc, char** argv) {
+-    std::string wan, lan = "usb0";
++    std::string wan, lan;
+     // ip6 table only on a kernel that has IPv6 (the rootfs can outlive the
+     // kernel it shipped with) — nft would reject `table ip6` otherwise and
+     // S60routing's nft -c would throw away the whole ruleset.
+@@ -135,6 +137,7 @@ int cli_main(int argc, char** argv) {
+         else if (!strcmp(argv[i], "--no-ipv6")) v6 = false;
+     }
+     if (wan.empty()) { fprintf(stderr, "usage: rnsbox-portal nftgen --wan <iface> [--lan a,b] [--no-ipv6]\n"); return 2; }
++    if (lan.empty()) lan = sysinfo::lan_iface();
+     std::vector<std::string> lans;
+     size_t i = 0;
+     while (i < lan.size()) {
+diff --git a/buildroot/package/rnsbox-portal/src/cgi/nftgen.h b/buildroot/package/rnsbox-portal/src/cgi/nftgen.h
+index 82bf77889..ec04a517b 100644
+--- a/buildroot/package/rnsbox-portal/src/cgi/nftgen.h
++++ b/buildroot/package/rnsbox-portal/src/cgi/nftgen.h
+@@ -1,11 +1,15 @@
+ // nftgen.h — nftables ruleset generator (native port of nftgen.py).
+ // Single source of truth for /etc/nftables.conf, used two ways:
+ //   - the portal's apply path (config change), and
+-//   - the boot path: `rnsbox-portal nftgen --wan eth0 --lan usb0[,wlan1]`
++//   - the boot path: `rnsbox-portal nftgen --wan eth0 --lan br-lan`
+ //     invoked by /etc/init.d/S60routing.
++// The LAN is the one iface S30gadget_nic records in /run/lan-iface: the
++// bridge br-lan (USB-C link + hotspot as ports, one subnet), or usb0 when the
++// bridge couldn't be made. Traffic between bridge ports is switched at L2 and
++// never reaches these tables.
+ // Emits `table ip filter` + `table ip nat` (the router) and, when with_ipv6,
+ // a drop-policy `table ip6 filter` that only admits the LAN ifaces (IPv6 is
+-// there solely for Reticulum's AutoInterface link-local traffic on usb0).
++// there solely for Reticulum's AutoInterface link-local traffic on the LAN).
+ #ifndef RNSBOX_NFTGEN_H
+ #define RNSBOX_NFTGEN_H
+ 
+@@ -18,6 +22,8 @@ std::string generate(const std::string& wan_iface, const std::vector<std::string
+                      bool with_ipv6 = true);
+ 
+ // CLI: parse --wan/--lan[/--no-ipv6] from argv, print the ruleset to stdout.
++// Without --lan: the LAN iface from /run/lan-iface (sysinfo::lan_iface() —
++// same rule as S60routing read_lan()).
+ // The ip6 table is emitted only if the kernel has IPv6 (/proc/sys/net/ipv6)
+ // and --no-ipv6 wasn't given. Returns exit code.
+ int cli_main(int argc, char** argv);
+diff --git a/buildroot/package/rnsbox-portal/src/cgi/pages/dashboard.html b/buildroot/package/rnsbox-portal/src/cgi/pages/dashboard.html
+index 0e53f86af..590081c06 100644
+--- a/buildroot/package/rnsbox-portal/src/cgi/pages/dashboard.html
++++ b/buildroot/package/rnsbox-portal/src/cgi/pages/dashboard.html
+@@ -94,6 +94,15 @@ __HALOW_SCRIPT__
+       setText('d-lan-addr', (lif.addrs&&lif.addrs.length)?lif.addrs.join(', '):'(none)');
+       setText('d-lan-rxtx', (lif.rx||'0')+' / '+(lif.tx||'0'));
+     }
++    // Bridge ports (usb0 + the hotspot iface while an AP is up) — same markup
++    // as the server-rendered row.
++    if($('d-lan-ports')){
++      var ps=d.lan_ports||[];
++      setHTML('d-lan-ports', ps.length ? ps.map(function(p){
++        return esc(p.name)+' '+(p.state==='up'?'<span class="badge ok">UP</span>':'<span class="badge warn">'+esc(p.state||'DOWN')+'</span>')+
++          (p.role?' <span class="muted">'+esc(p.role)+'</span>':'');
++      }).join(' · ') : '(none)');
++    }
+     setHTML('d-rnsd-status', rn.running
+       ? '<span class="badge ok">RUNNING</span> (pid '+esc(rn.pid)+')'+(rn.rss_mb?' · '+esc(rn.rss_mb)+' MB RSS':'')
+       : '<span class="badge err">STOPPED</span>');
+diff --git a/buildroot/package/rnsbox-portal/src/cgi/pages/network.html b/buildroot/package/rnsbox-portal/src/cgi/pages/network.html
+index 9720b28f1..6cc294ea1 100644
+--- a/buildroot/package/rnsbox-portal/src/cgi/pages/network.html
++++ b/buildroot/package/rnsbox-portal/src/cgi/pages/network.html
+@@ -72,7 +72,7 @@
+ 
+ <section class="card">
+   <h3>Open ports (services on this router exposed on WAN)</h3>
+-  <p class="muted">Allows inbound connections on the WAN to services bound on this device. <strong>SSH (22)</strong>, the <strong>web UI (80)</strong> (which also carries the HaLow modem page on 8081) and <strong>rnsd's TCPServerInterface (4242)</strong>, for external Reticulum peers, are open by default &mdash; remove them to close WAN access (the LAN side &mdash; <code>usb0</code>, plus the WiFi hotspot while it is on &mdash; always stays open).</p>
++  <p class="muted">Allows inbound connections on the WAN to services bound on this device. <strong>SSH (22)</strong>, the <strong>web UI (80)</strong> (which also carries the HaLow modem page on 8081) and <strong>rnsd's TCPServerInterface (4242)</strong>, for external Reticulum peers, are open by default &mdash; remove them to close WAN access (the LAN side &mdash; <strong>__LAN__</strong>: the USB-C link, plus the WiFi hotspot while it is on &mdash; always stays open).</p>
+   <table class="data">
+     <thead>
+       <tr><th>Proto</th><th>Port</th><th>Comment</th><th></th></tr>
+@@ -95,6 +95,8 @@
+ 
+ <section class="card">
+   <h3>LAN clients (DHCP leases)</h3>
++  <p class="muted">The USB-C host and WiFi hotspot clients share one LAN subnet
++  (10.42.0.0/24) and one DHCP pool; the box is 10.42.0.1 on both.</p>
+   <table class="data">
+     <thead>
+       <tr><th>IP</th><th>MAC</th><th>Name</th><th>Lease (s)</th></tr>
+diff --git a/buildroot/package/rnsbox-portal/src/cgi/pages/wifi.html b/buildroot/package/rnsbox-portal/src/cgi/pages/wifi.html
+index a81eb9402..c45f5d4a0 100644
+--- a/buildroot/package/rnsbox-portal/src/cgi/pages/wifi.html
++++ b/buildroot/package/rnsbox-portal/src/cgi/pages/wifi.html
+@@ -28,6 +28,9 @@
+ <section class="card">
+   <h3>Join a network (client)</h3>
+   __CONCURRENT_NOTE__
++  <p class="muted">Another RNSBox's hotspot can't be this box's uplink: every
++  RNSBox's LAN is 10.42.0.0/24, so the box refuses DHCP from such a network
++  (its router and DNS would be the box itself).</p>
+   <button type="button" class="btn" onclick="doScan()">Scan</button>
+   <span id="scanmsg" class="muted"></span>
+   <table class="data" id="scantbl" style="margin-top:8px; display:none">
+@@ -45,8 +48,11 @@
+ <section class="card">
+   <h3>Hotspot (access point)</h3>
+   <p class="muted">Runs concurrently with the client connection (AIC8800
+-  single radio, time-shared). AP clients are NAT'd to the WAN and get DHCP
+-  from the AP subnet in <code>/etc/rnsbox/wifi.conf</code>.</p>
++  single radio, time-shared). The hotspot is bridged with the USB-C link into
++  one LAN (<code>br-lan</code>): WiFi clients join the same 10.42.0.0/24
++  subnet and DHCP pool as the USB host, reach this portal at 10.42.0.1, are
++  NAT'd to the WAN, and talk to the USB host directly (switched, not
++  firewalled).</p>
+   __AP_PSK_NOTE__
+   <form method="post" action="__BASE__/wifi/ap">
+     <label><input type="checkbox" name="ap_enable" __AP_ENABLE_CHECKED__> Enable hotspot</label>
+diff --git a/buildroot/package/rnsbox-portal/src/cgi/routes_dash.cpp b/buildroot/package/rnsbox-portal/src/cgi/routes_dash.cpp
+index a63ab3ccb..120da5edc 100644
+--- a/buildroot/package/rnsbox-portal/src/cgi/routes_dash.cpp
++++ b/buildroot/package/rnsbox-portal/src/cgi/routes_dash.cpp
+@@ -77,6 +77,48 @@ static std::string iface_json(const sysinfo::Iface* i) {
+            "\",\"addrs\":" + str_array_json(i->addrs) + "}";
+ }
+ 
++// --- LAN (/run/lan-iface: br-lan, or usb0 when the bridge couldn't be made) ---
++// The LAN card shows the LAN iface (it holds 10.42.0.1/24) plus, for the
++// bridge, one entry per port: usb0 always, the hotspot iface while an AP is up.
++struct LanPort { std::string name, role; const sysinfo::Iface* i; };
++
++static std::vector<LanPort> lan_ports(const sysinfo::Network& net, const std::string& lan_if) {
++    std::vector<LanPort> out;
++    for (const auto& p : sysinfo::bridge_ports(lan_if))
++        out.push_back({p, sysinfo::lan_port_role(p), find_iface(net, p)});
++    return out;
++}
++
++static std::string state_badge(const sysinfo::Iface* i) {
++    if (i && i->state == "up") return "<span class=\"badge ok\">UP</span>";
++    return "<span class=\"badge warn\">" + E((i && !i->state.empty()) ? i->state : std::string("DOWN")) + "</span>";
++}
++
++// "usb0 [UP] USB-C · wlan1 [UP] WiFi hotspot" — same markup as the patch() JS.
++static std::string ports_html(const std::vector<LanPort>& ports) {
++    if (ports.empty()) return "(none)";
++    std::string o;
++    for (size_t k = 0; k < ports.size(); ++k) {
++        if (k) o += " &middot; ";
++        o += E(ports[k].name) + " " + state_badge(ports[k].i);
++        if (!ports[k].role.empty()) o += " <span class=\"muted\">" + E(ports[k].role) + "</span>";
++    }
++    return o;
++}
++
++static std::string ports_json(const std::vector<LanPort>& ports) {
++    std::string o = "[";
++    for (size_t k = 0; k < ports.size(); ++k) {
++        if (k) o += ",";
++        const sysinfo::Iface* i = ports[k].i;
++        o += "{\"name\":\"" + JE(ports[k].name) +
++             "\",\"role\":\"" + JE(ports[k].role) +
++             "\",\"state\":\"" + JE(i ? i->state : std::string()) + "\"}";
++    }
++    o += "]";
++    return o;
++}
++
+ // --- HaLow card + live-status script (verbatim port of the old template) ---
+ static std::string halow_card_html(const std::string& base) {
+     // href must go through the portal (SCRIPT_NAME base), not the server root —
+@@ -157,7 +199,8 @@ void dashboard_page(const Request& req, Response& res) {
+     bool slip_on = slip_enabled(store::read_slip());
+ 
+     const sysinfo::Iface* wif = find_iface(net, wan.interface);
+-    const sysinfo::Iface* lif = find_iface(net, "usb0");
++    std::string lan_if = sysinfo::lan_iface();
++    const sysinfo::Iface* lif = find_iface(net, lan_if);
+ 
+     std::string h = render::page_file("dashboard");
+     h = R(std::move(h), "__BASE__", base);
+@@ -194,18 +237,25 @@ void dashboard_page(const Request& req, Response& res) {
+         h = R(std::move(h), "__WAN_RXTX__", rx + " / " + tx);
+     }
+ 
+-    // LAN card — only when usb0 is actually up (a USB host is tethered)
++    // LAN card. br-lan exists (and holds 10.42.0.1/24) from boot on, whether
++    // or not a USB host or hotspot client is attached, so the card is always
++    // there; its State follows the bridge (UP once any port has a link). Ports
++    // row only for a bridge — the usb0 fallback is the whole LAN by itself.
+     std::string lan;
+-    if (lif && lif->state == "up") {
++    if (lif) {
+         std::string addr = lif->addrs.empty() ? std::string("(none)") : join_esc(lif->addrs);
+         std::string rx = lif->rx.empty() ? std::string("0") : E(lif->rx);
+         std::string tx = lif->tx.empty() ? std::string("0") : E(lif->tx);
++        std::string ports;
++        if (lif->bridge)
++            ports = "      <tr><th>Ports</th><td id=\"d-lan-ports\">" + ports_html(lan_ports(net, lan_if)) + "</td></tr>\n";
+         lan =
+             "<section class=\"card\">\n"
+-            "    <h3>LAN (usb0)</h3>\n"
++            "    <h3>LAN (" + E(lan_if) + ")</h3>\n"
+             "    <table class=\"kv\">\n"
+-            "      <tr><th>State</th><td id=\"d-lan-state\"><span class=\"badge ok\">UP</span></td></tr>\n"
+-            "      <tr><th>Address</th><td id=\"d-lan-addr\">" + addr + "</td></tr>\n"
++            "      <tr><th>State</th><td id=\"d-lan-state\">" + state_badge(lif) + "</td></tr>\n"
++            "      <tr><th>Address</th><td id=\"d-lan-addr\">" + addr + "</td></tr>\n" +
++            ports +
+             "      <tr><th>MAC</th><td>" + E(lif->mac) + "</td></tr>\n"
+             "      <tr><th>RX / TX</th><td id=\"d-lan-rxtx\">" + rx + " / " + tx + "</td></tr>\n"
+             "    </table>\n"
+@@ -248,7 +298,8 @@ void dashboard_data(const Request& req, Response& res) {
+     sysinfo::Network net  = sysinfo::network_summary();
+     store::WanConfig  wan  = store::read_wan();
+     const sysinfo::Iface* wif = find_iface(net, wan.interface);
+-    const sysinfo::Iface* lif = find_iface(net, "usb0");
++    std::string lan_if = sysinfo::lan_iface();
++    const sysinfo::Iface* lif = find_iface(net, lan_if);
+ 
+     std::string J = "{\"sys\":{";
+     J += "\"uptime\":\"" + JE(sys.uptime) + "\",";
+@@ -269,6 +320,7 @@ void dashboard_data(const Request& req, Response& res) {
+     J += "},";
+     J += "\"wan_if\":" + iface_json(wif) + ",";
+     J += "\"lan_if\":" + iface_json(lif) + ",";
++    J += "\"lan_ports\":" + ports_json(lan_ports(net, lan_if)) + ",";
+     J += "\"gateway\":\"" + JE(net.default_gateway) + "\",";
+     J += "\"dns\":" + str_array_json(net.dns) + ",";
+     J += "\"clock_source\":\"" + JE(sysinfo::clock_source()) + "\",";
+diff --git a/buildroot/package/rnsbox-portal/src/cgi/routes_net.cpp b/buildroot/package/rnsbox-portal/src/cgi/routes_net.cpp
+index a8ef99472..f138c442f 100644
+--- a/buildroot/package/rnsbox-portal/src/cgi/routes_net.cpp
++++ b/buildroot/package/rnsbox-portal/src/cgi/routes_net.cpp
+@@ -30,10 +30,13 @@ void network_page(const Request& req, Response& res) {
+     std::string h = render::page_file("network");
+     h = R(std::move(h), "__BASE__", base);
+     h = R(std::move(h), "__WAN__", E(w.interface));
+-    // Real LAN set (usb0 + the hotspot iface while it's up) — the same list
+-    // nftables treats as the full-access management side.
+-    std::string lan;
+-    for (const auto& l : sysinfo::lan_ifaces()) { if (!lan.empty()) lan += ", "; lan += E(l); }
++    // The LAN iface nftables treats as the full-access management side
++    // (/run/lan-iface: br-lan, or usb0 if the bridge couldn't be made) and,
++    // for a bridge, its ports — usb0 always, the hotspot iface while it's up.
++    std::string lan_if = sysinfo::lan_iface();
++    std::string lan = E(lan_if), ports;
++    for (const auto& p : sysinfo::bridge_ports(lan_if)) { if (!ports.empty()) ports += ", "; ports += E(p); }
++    if (!ports.empty()) lan += " (" + ports + ")";
+     h = R(std::move(h), "__LAN__", lan);
+     h = R(std::move(h), "__GATEWAY__", net.default_gateway.empty() ? "(none)" : E(net.default_gateway));
+     h = R(std::move(h), "__SEL_ETH0__",  w.interface == "eth0"  ? "selected" : "");
+@@ -85,7 +88,8 @@ void network_page(const Request& req, Response& res) {
+     }
+     h = R(std::move(h), "__OPENPORTS_ROWS__", rows);
+ 
+-    // All interfaces
++    // All interfaces. Bridge topology noted under the name: the LAN bridge
++    // carries the address; its ports (usb0, the hotspot iface) carry none.
+     rows.clear();
+     for (const auto& i : net.ifaces) {
+         std::string addrs;
+@@ -93,7 +97,15 @@ void network_page(const Request& req, Response& res) {
+         std::string st = (i.state == "up")
+             ? std::string("<span class=\"badge ok\">UP</span>")
+             : "<span class=\"badge warn\">" + E(i.state.empty() ? "?" : i.state) + "</span>";
+-        rows += "<tr><td><strong>" + E(i.name) + "</strong></td><td>" + st + "</td>"
++        std::string note;
++        if (i.bridge) {
++            note = (i.name == lan_if) ? "LAN bridge" : "bridge";
++        } else if (!i.master.empty()) {
++            std::string role = (i.master == lan_if) ? sysinfo::lan_port_role(i.name) : std::string();
++            note = "port of " + E(i.master) + (role.empty() ? std::string() : " &middot; " + E(role));
++        }
++        if (!note.empty()) note = "<br><span class=\"muted\">" + note + "</span>";
++        rows += "<tr><td><strong>" + E(i.name) + "</strong>" + note + "</td><td>" + st + "</td>"
+                 "<td>" + addrs + "</td><td><code>" + E(i.mac) + "</code></td>"
+                 "<td>" + E(i.mtu) + "</td><td>" + E(i.rx) + " / " + E(i.tx) + "</td></tr>";
+     }
+diff --git a/buildroot/package/rnsbox-portal/src/cgi/routes_wifi.cpp b/buildroot/package/rnsbox-portal/src/cgi/routes_wifi.cpp
+index 085532141..6e38e3325 100644
+--- a/buildroot/package/rnsbox-portal/src/cgi/routes_wifi.cpp
++++ b/buildroot/package/rnsbox-portal/src/cgi/routes_wifi.cpp
+@@ -69,6 +69,13 @@ void wifi_page(const Request& req, Response& res) {
+                    "        hotspot off).</div>";
+         }
+     }
++    // The joined network overlaps this box's LAN subnet 10.42.0.0/24 (another
++    // RNSBox's hotspot): /etc/dhcpcd.exit-hook recorded why it's no uplink.
++    if (cfg["mode"] == "sta" || cfg["mode"] == "sta+ap") {
++        std::string why = util::trim(util::read_file("/run/wifi-sta-conflict", 1024));
++        if (!why.empty())
++            sta += "\n        <div class=\"flash warn\" style=\"margin-top:4px\">" + E(why) + "</div>";
++    }
+     h = R(std::move(h), "__STA_CELL__", sta);
+ 
+     // Hotspot (AP) cell
+@@ -77,7 +84,14 @@ void wifi_page(const Request& req, Response& res) {
+         ap = "<span class=\"badge ok\">UP</span> on " + E(st.ap.iface) + ",\n        " +
+              std::to_string(st.ap.clients) + " client(s)";
+         if (!st.ap.width.empty()) ap += ", " + E(st.ap.width) + " MHz";
+-        ap += ", " + E(st.ap.ip);
++        // Normally a port of the LAN bridge, sharing its subnet + DHCP pool. Not
++        // bridged (no bridge in the kernel): nothing serves its clients.
++        if (!st.ap.bridge.empty())
++            ap += ", bridged into " + E(st.ap.bridge) + (st.ap.ip.empty() ? std::string() : " (" + E(st.ap.ip) + ")");
++        else if (!st.ap.ip.empty())
++            ap += ", " + E(st.ap.ip);
++        else
++            ap += ", <span class=\"badge warn\">not in the LAN bridge</span>";
+     } else {
+         ap = "<span class=\"badge warn\">off</span>";
+     }
+@@ -121,6 +135,14 @@ void wifi_page(const Request& req, Response& res) {
+         psk_note = "<div class=\"flash warn\">The hotspot is switched on but is <strong>not running</strong>:\n"
+                    "  its password is empty, too short, or the old published default\n"
+                    "  <code>changeme123</code>. Set a new one below and apply.</div>";
++    // Any other refusal S35wifi recorded (today: no LAN bridge br-lan to put
++    // the AP in — a kernel without CONFIG_BRIDGE) — show its reason.
++    else if ((m == "ap" || m == "sta+ap") && !st.ap.active) {
++        std::string why = util::trim(util::read_file("/run/wifi-ap-refused", 512));
++        if (!why.empty())
++            psk_note = "<div class=\"flash warn\">The hotspot is switched on but is <strong>not running</strong>:\n"
++                       "  " + E(why) + "</div>";
++    }
+     h = R(std::move(h), "__AP_PSK_NOTE__", psk_note);
+ 
+     std::string lock = concurrent ? " <span class=\"muted\">(locked — follows client link)</span>" : "";
+diff --git a/buildroot/package/rnsbox-portal/src/cgi/sysinfo.cpp b/buildroot/package/rnsbox-portal/src/cgi/sysinfo.cpp
+index cd82f3c12..1568afe14 100644
+--- a/buildroot/package/rnsbox-portal/src/cgi/sysinfo.cpp
++++ b/buildroot/package/rnsbox-portal/src/cgi/sysinfo.cpp
+@@ -124,6 +124,18 @@ std::string real_path(const std::string& p) {
+ 
+ namespace sysinfo {
+ 
++bool ifname_ok(const std::string& n) {
++    if (n.empty() || n.size() > 15 || n == "." || n == "..") return false;
++    for (char c : n) if (!(isalnum((unsigned char)c) || c == '-' || c == '_' || c == '.')) return false;
++    return true;
++}
++
++std::string bridge_of(const std::string& iface) {
++    if (!ifname_ok(iface)) return "";
++    std::string m = real_path("/sys/class/net/" + iface + "/brport/bridge");
++    return m.empty() ? std::string() : m.substr(m.rfind('/') + 1);
++}
++
+ std::string hostname() {
+     std::string h = slurp_trim("/proc/sys/kernel/hostname");
+     return h.empty() ? std::string("(unknown)") : h;
+@@ -209,6 +221,8 @@ Network network_summary() {
+         i.rx = human_bytes(slurp_trim(base + "/statistics/rx_bytes"));
+         i.tx = human_bytes(slurp_trim(base + "/statistics/tx_bytes"));
+         if (auto* v = find_addrs(dev)) i.addrs = *v;
++        i.bridge = is_dir(base + "/bridge");      // br-lan
++        i.master = bridge_of(dev);                // usb0 / wlan1 -> br-lan
+         net.ifaces.push_back(std::move(i));
+     }
+     // default gateway
+@@ -278,17 +292,35 @@ Rnsd rnsd_status(bool with_raw) {
+     return r;
+ }
+ 
+-std::vector<std::string> lan_ifaces() {
+-    std::vector<std::string> out = {"usb0"};
+-    // Same test as S60routing read_lan(): name from the file, iface must exist.
+-    // Name charset-checked too (it becomes part of a /sys path and the page).
+-    std::string ap = util::trim(util::read_file("/run/wifi-ap-iface", 64));
+-    bool sane = !ap.empty() && ap.size() <= 15 && ap != "usb0";
+-    for (char c : ap) if (!(isalnum((unsigned char)c) || c == '-' || c == '_' || c == '.')) sane = false;
+-    if (sane && ap != "." && ap != ".." && is_dir("/sys/class/net/" + ap)) out.push_back(ap);
++std::string lan_iface() {
++    // Same rule as S60routing read_lan() (and S82rnsd / S46wanwatch): only
++    // the two names S30gadget_nic ever records are taken from the file; with
++    // no valid record, br-lan if that bridge exists, else the gadget NIC.
++    std::string l = util::trim(util::read_file("/run/lan-iface", 64));
++    if (l == "br-lan" || l == "usb0") return l;
++    return is_dir("/sys/class/net/br-lan/bridge") ? std::string("br-lan") : std::string("usb0");
++}
++
++std::vector<std::string> bridge_ports(const std::string& br) {
++    std::vector<std::string> out;
++    if (!ifname_ok(br)) return out;
++    if (DIR* d = opendir(("/sys/class/net/" + br + "/brif").c_str())) {
++        while (struct dirent* e = readdir(d)) {
++            std::string n = e->d_name;
++            if (n != "." && n != ".." && ifname_ok(n)) out.push_back(n);
++        }
++        closedir(d);
++    }
++    std::sort(out.begin(), out.end());
+     return out;
+ }
+ 
++std::string lan_port_role(const std::string& port) {
++    if (port == "usb0") return "USB-C";
++    if (port.compare(0, 4, "wlan") == 0) return "WiFi hotspot";
++    return "";
++}
++
+ std::vector<Lease> dnsmasq_leases() {
+     std::vector<Lease> out;
+     for (const char* path : {"/var/lib/misc/dnsmasq.leases", "/tmp/dnsmasq.leases"}) {
+diff --git a/buildroot/package/rnsbox-portal/src/cgi/sysinfo.h b/buildroot/package/rnsbox-portal/src/cgi/sysinfo.h
+index f209b12c8..1cc7a6eb7 100644
+--- a/buildroot/package/rnsbox-portal/src/cgi/sysinfo.h
++++ b/buildroot/package/rnsbox-portal/src/cgi/sysinfo.h
+@@ -28,6 +28,8 @@ Summary summary();
+ struct Iface {
+     std::string name, state, mac, mtu, rx, tx;
+     std::vector<std::string> addrs;   // "addr/prefix"
++    bool bridge = false;              // a Linux bridge (br-lan)
++    std::string master;               // bridge this iface is a port of ("" = none)
+ };
+ struct Network {
+     std::vector<Iface> ifaces;        // sorted, lo excluded
+@@ -44,10 +46,30 @@ struct Rnsd {
+ };
+ Rnsd rnsd_status(bool with_raw = false);
+ 
+-// LAN-side interfaces exactly as S60routing puts them in nftables' @lan_ifaces:
+-// usb0 always, plus the hotspot iface S35wifi records in /run/wifi-ap-iface
+-// while an AP is up (and the iface exists).
+-std::vector<std::string> lan_ifaces();
++// A plausible interface name (IFNAMSIZ, kernel-legal charset). Names read from
++// /run files become part of a /sys path and the page — check them first.
++bool ifname_ok(const std::string& name);
++
++// The bridge `iface` is a port of (its /sys/class/net/<iface>/brport/bridge
++// link), e.g. "br-lan" for usb0; "" when it isn't bridged.
++std::string bridge_of(const std::string& iface);
++
++// The LAN interface in use, as S30gadget_nic records it in /run/lan-iface —
++// what S60routing puts in nftables' @lan_ifaces and dnsmasq serves: "br-lan"
++// (the bridge of the USB-C gadget NIC usb0 + the hotspot iface while an AP is
++// up; one subnet, 10.42.0.1/24) or "usb0" when the bridge couldn't be made.
++// Without a valid record (missing file, any other name): "br-lan" if that
++// bridge exists, else "usb0" — the same rule as S60routing read_lan(), so
++// the portal, nftgen and the init scripts always agree on the LAN.
++std::string lan_iface();
++
++// Member ports of bridge `br` (/sys/class/net/<br>/brif), sorted (usb0 before
++// wlan1). Empty for a non-bridge iface — the usb0 fallback has no ports.
++std::vector<std::string> bridge_ports(const std::string& br);
++
++// What a LAN bridge port is, for labels: "USB-C" (usb0), "WiFi hotspot" (a
++// wlan* port: only an AP vif can be bridged), else "".
++std::string lan_port_role(const std::string& port);
+ 
+ // length: dnsmasq is built with HAVE_BROKEN_RTC, so the leases file's first
+ // field is the lease length in seconds, not an expiry epoch.
+diff --git a/buildroot/package/rnsbox-portal/src/cgi/wifi.cpp b/buildroot/package/rnsbox-portal/src/cgi/wifi.cpp
+index 99d69141c..e9540aab3 100644
+--- a/buildroot/package/rnsbox-portal/src/cgi/wifi.cpp
++++ b/buildroot/package/rnsbox-portal/src/cgi/wifi.cpp
+@@ -2,6 +2,7 @@
+ #include "wifi.h"
+ #include "util.h"
+ #include "http.h"
++#include "sysinfo.h"
+ #include "web.h"
+ #include <cctype>
+ #include <cstdlib>
+@@ -14,10 +15,13 @@
+ 
+ namespace wifi {
+ 
++// No AP address/DHCP keys: the hotspot is a port of the LAN bridge (br-lan,
++// 10.42.0.1/24, one dnsmasq pool). Old ap_ip / ap_dhcp_start / ap_dhcp_end
++// lines are ignored on read and dropped by the next write_conf().
+ static const char* KEYS[] = {
+     "mode", "sta_ssid", "sta_psk", "sta_hidden", "sta_country",
+     "ap_ssid", "ap_psk", "ap_channel", "ap_htmode", "ap_hidden",
+-    "ap_ip", "ap_dhcp_start", "ap_dhcp_end", "tx_power",
++    "tx_power",
+ };
+ 
+ bool present() {
+@@ -34,7 +38,7 @@ std::map<std::string, std::string> read_conf() {
+     std::map<std::string, std::string> cfg;
+     for (const char* k : KEYS) cfg[k] = "";
+     cfg["mode"] = "off"; cfg["ap_ssid"] = "RNSBox-AP"; cfg["ap_channel"] = "6";
+-    cfg["ap_htmode"] = "ht20"; cfg["ap_ip"] = "192.168.42.1"; cfg["tx_power"] = "auto";
++    cfg["ap_htmode"] = "ht20"; cfg["tx_power"] = "auto";
+     std::string data = util::read_file(CONF);
+     size_t i = 0;
+     while (i < data.size()) {
+@@ -86,9 +90,9 @@ bool write_conf(const std::map<std::string, std::string>& updates) {
+     for (const char* k : {"sta_ssid", "sta_psk", "sta_hidden", "sta_country"})
+         o += std::string(k) + "=" + cfg[k] + "\n";
+     o += "\n# --- AP (hotspot) ---\n";
++    o += "# Bridged into the LAN (br-lan): clients share 10.42.0.0/24 and its DHCP pool.\n";
+     o += "# ap_psk: 8..63 chars — the hotspot will not start without one.\n";
+-    for (const char* k : {"ap_ssid", "ap_psk", "ap_channel", "ap_htmode", "ap_hidden",
+-                          "ap_ip", "ap_dhcp_start", "ap_dhcp_end"})
++    for (const char* k : {"ap_ssid", "ap_psk", "ap_channel", "ap_htmode", "ap_hidden"})
+         o += std::string(k) + "=" + cfg[k] + "\n";
+     o += "\n# --- TX power (radio-wide): auto = chip max, or 1..18 dBm ---\n";
+     o += "tx_power=" + cfg["tx_power"] + "\n";
+@@ -211,6 +215,18 @@ static std::string ip_of(const std::string& dev) {
+     return out.substr(p, e - p);
+ }
+ 
++// The running AP's iface: what S35wifi records in /run/wifi-ap-iface while
++// an AP is up (wlan1 in sta+ap, wlan0 in ap-only); failing that, a wlan* port
++// of the LAN bridge — only an AP vif can be bridged (a STA would need 4addr).
++static std::string ap_iface() {
++    std::string a = util::trim(util::read_file("/run/wifi-ap-iface", 64));
++    if (sysinfo::ifname_ok(a) && !util::read_file("/sys/class/net/" + a + "/ifindex", 32).empty())
++        return a;
++    for (const auto& p : sysinfo::bridge_ports(sysinfo::lan_iface()))
++        if (p.compare(0, 4, "wlan") == 0) return p;
++    return "";
++}
++
+ Status status() {
+     Status s;
+     auto cfg = read_conf();
+@@ -229,8 +245,8 @@ Status status() {
+         s.sta.width = after_token(sta_info, "width: ");
+         s.sta.txpower = after_token(sta_info, "txpower ");
+     }
+-    std::string ap_if = util::trim(util::read_file("/run/wifi-ap-iface", 64));
+-    if (!ap_if.empty() && util::read_file("/sys/class/net/" + ap_if + "/ifindex", 32).size() > 0) {
++    std::string ap_if = ap_iface();
++    if (!ap_if.empty()) {
+         std::string dump = util::run({"/usr/sbin/iw", "dev", ap_if, "station", "dump"}, "", 5).out;
+         std::string ap_info = util::run({"/usr/sbin/iw", "dev", ap_if, "info"}, "", 5).out;
+         int clients = 0; size_t sp = 0;
+@@ -238,7 +254,11 @@ Status status() {
+         s.ap.active = true;
+         s.ap.iface = ap_if;
+         s.ap.clients = clients;
++        // hostapd (bridge=br-lan) enslaves the AP iface, which then holds no
++        // address: its clients reach the box at the bridge's.
++        s.ap.bridge = sysinfo::bridge_of(ap_if);
+         s.ap.ip = ip_of(ap_if);
++        if (s.ap.ip.empty() && !s.ap.bridge.empty()) s.ap.ip = ip_of(s.ap.bridge);
+         s.ap.width = after_token(ap_info, "width: ");
+         s.ap.txpower = after_token(ap_info, "txpower ");
+     }
+@@ -264,7 +284,8 @@ std::string status_json() {
+     if (s.ap.active) {
+         o += ",\"ap\":{\"active\":true,\"iface\":\"" + http::json_escape(s.ap.iface) +
+              "\",\"clients\":" + std::to_string(s.ap.clients) +
+-             ",\"ip\":\"" + http::json_escape(s.ap.ip) +
++             ",\"bridge\":\"" + http::json_escape(s.ap.bridge) +
++             "\",\"ip\":\"" + http::json_escape(s.ap.ip) +
+              "\",\"width\":\"" + http::json_escape(s.ap.width) +
+              "\",\"txpower\":\"" + http::json_escape(s.ap.txpower) + "\"}";
+     } else {
+diff --git a/buildroot/package/rnsbox-portal/src/cgi/wifi.h b/buildroot/package/rnsbox-portal/src/cgi/wifi.h
+index 57fe5b968..0fa16db9d 100644
+--- a/buildroot/package/rnsbox-portal/src/cgi/wifi.h
++++ b/buildroot/package/rnsbox-portal/src/cgi/wifi.h
+@@ -33,7 +33,9 @@ bool ap_psk_ok(const std::string& psk);
+ // Live radio status (parsed from `iw`). Used both server-side (wifi_page render)
+ // and, serialized, by the /wifi/status AJAX endpoint.
+ struct StaStatus { bool connected = false; std::string ssid, signal, ip, width, txpower; };
+-struct ApStatus  { bool active = false; std::string iface; int clients = 0; std::string ip, width, txpower; };
++// bridge: the bridge the AP iface is a port of ("" = not bridged); ip: where
++// its clients reach the box — the bridge's address (the port itself has none).
++struct ApStatus  { bool active = false; std::string iface; int clients = 0; std::string bridge, ip, width, txpower; };
+ struct Status {
+     bool present = false;
+     std::string mode;
+-- 
+2.47.3
+

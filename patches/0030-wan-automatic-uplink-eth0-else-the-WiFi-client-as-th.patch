@@ -1,0 +1,1551 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: smit1237 <smit1237@gmail.com>
+Date: Fri, 25 Sep 2026 01:37:34 +0300
+Subject: [PATCH 30/30] wan: automatic uplink (eth0, else the WiFi client) as
+ the default
+
+wan.conf gains interface=auto, now shipped and the fallback for a missing
+or unknown value. eth0 and wlan0 are then both WAN ifaces (@wan_ifaces in
+the filter and nat tables, route_localnet, dnsmasq no-dhcp-interface), and
+the kernel's route metric picks the one in use: eth0's udhcpc route
+(metric 0) while it has a cable and a lease, the WiFi client's dhcpcd route
+(3000+) otherwise. A fresh box with neither is offline and needs no change
+once a cable or a WiFi network appears. The box never rewrites wan.conf, and
+a pinned eth0 or wlan0 keeps its previous behaviour.
+
+Auto only:
+- S30eth sets ignore_routes_with_linkdown on eth0, so an unplugged eth0's
+  lease route is skipped; `linkdown`/`linkup` drop and restore eth0's DNS
+  servers, and a static (exclusive) list is registered only with carrier.
+- S46wanwatch acts on eth0 carrier edges and tracks the default route in
+  use; when it moves (or eth0 was re-addressed) `S60routing uplink` runs
+  `rnsbox-portal ctflush`, a netlink flush of the conntrack entries that
+  nftgen's masquerade rule marks, so NATed flows reconnect over the new
+  uplink instead of hanging on the old address. LAN, HaLow (sl0) and
+  inbound entries are kept.
+
+Also: nftgen drops WAN packets to 127.0.0.0/8 before the open ports; the
+portal shows "auto -> <iface>" and the pinned iface's own gateway; the WiFi
+tab notes when the WAN is pinned to eth0; step-1 NTP and S45ntpsync count
+only default routes with carrier; regen_dnsmasq no longer prints busybox
+sed's cut-off lines.
+---
+ README.RNSBox.md                              |  46 ++++--
+ .../cvitek/SG200X/overlay/etc/init.d/S30eth   | 156 ++++++++++++++----
+ .../SG200X/overlay/etc/init.d/S45ntpsync      |   6 +-
+ .../SG200X/overlay/etc/init.d/S46wanwatch     |  97 ++++++++++-
+ .../SG200X/overlay/etc/init.d/S60routing      |  93 ++++++++---
+ .../cvitek/SG200X/overlay/etc/rnsbox/wan.conf |  22 ++-
+ .../rnsbox-portal/src/cgi/conntrack.cpp       |  78 +++++++++
+ .../package/rnsbox-portal/src/cgi/conntrack.h |  22 +++
+ .../package/rnsbox-portal/src/cgi/main.cpp    |   8 +-
+ .../package/rnsbox-portal/src/cgi/nftgen.cpp  |  82 +++++----
+ .../package/rnsbox-portal/src/cgi/nftgen.h    |   9 +-
+ .../src/cgi/pages/dashboard.html              |   3 +-
+ .../rnsbox-portal/src/cgi/pages/network.html  |  17 +-
+ .../rnsbox-portal/src/cgi/pages/settings.html |   6 +-
+ .../rnsbox-portal/src/cgi/routes_dash.cpp     |  13 +-
+ .../rnsbox-portal/src/cgi/routes_net.cpp      |  21 ++-
+ .../rnsbox-portal/src/cgi/routes_settings.cpp |   2 +-
+ .../rnsbox-portal/src/cgi/routes_wifi.cpp     |  20 ++-
+ .../package/rnsbox-portal/src/cgi/store.cpp   |   9 +-
+ .../package/rnsbox-portal/src/cgi/store.h     |   2 +-
+ .../package/rnsbox-portal/src/cgi/sysinfo.cpp |  61 ++++++-
+ .../package/rnsbox-portal/src/cgi/sysinfo.h   |  18 +-
+ 22 files changed, 639 insertions(+), 152 deletions(-)
+ create mode 100644 buildroot/package/rnsbox-portal/src/cgi/conntrack.cpp
+ create mode 100644 buildroot/package/rnsbox-portal/src/cgi/conntrack.h
+
+diff --git a/README.RNSBox.md b/README.RNSBox.md
+index 288f86598..402a4cd29 100644
+--- a/README.RNSBox.md
++++ b/README.RNSBox.md
+@@ -28,9 +28,11 @@ kernel, Buildroot and the CVITEK/Sipeed BSP themselves come from upstream.
+   See [Networking notes](#networking-notes). The DVD build additionally
+   exposes a read-only mass-storage "disc" pre-loaded with Reticulum client apps
+   for a zero-download quick start.
+-- **eth0 = WAN** (DHCP or static), or the WiFi client on the *W* board
+-  (DHCP), with NAT masquerade plus per-rule port forwarding and open-port
+-  management.
++- **Automatic WAN** (the default): eth0 (DHCP or static) while it has a
++  cable and an address, otherwise the WiFi client on the *W* board (DHCP),
++  switching by itself as the cable goes in or out. Either can also be pinned
++  as the only uplink. NAT masquerade plus per-rule port forwarding and
++  open-port management.
+ - **`rnsbox-portal`** — a C++ CGI admin UI (served by `uhttpd`) for network,
+   Reticulum, WiFi, clock and system settings. Open it by IP address:
+   `http://10.42.0.1/` over USB-C or the hotspot, or the box's WAN address. It
+@@ -113,9 +115,10 @@ tab. It has four modes: **off**, **STA** (join an upstream network), **AP** (run
+ a hotspot), and **STA + AP** (both at once). The hotspot runs on 2.4 GHz,
+ and since the radio can't be on two bands at once, STA + AP pins the WiFi
+ client to 2.4 GHz too: an upstream that only offers 5 GHz won't connect in
+-that mode, so use STA-only for a 5 GHz uplink. The WiFi client can be the WAN
+-(*Network → WAN uplink → wlan0*; always DHCP), though not over another
+-RNSBox's hotspot (see [Networking notes](#networking-notes)). The hotspot
++that mode, so use STA-only for a 5 GHz uplink. The WiFi client is the WAN
++whenever eth0 has no cable, with the default *Network → WAN uplink →
++Automatic* (or always, pinned to *wlan0*; always DHCP), though not over
++another RNSBox's hotspot (see [Networking notes](#networking-notes)). The hotspot
+ (`RNSBox-AP`) is part of the LAN: hostapd bridges it with the USB-C link into
+ `br-lan`, so its clients share `10.42.0.0/24` and the one DHCP pool with the
+ USB host, reach the portal at `10.42.0.1` and get NAT'd internet. Traffic
+@@ -186,11 +189,32 @@ A small background watchdog (`S36wifiwatch`) enforces this and is active only in
+   (LAN only: `br-lan`, and `usb0` in case the bridge isn't there) is loaded
+   before the WAN gets an address at boot (`S29fw`) and when the firewall is
+   stopped at shutdown, so WAN SSH is never briefly open while the box boots.
+-- **eth0 is configured only when it is the WAN.** With `wlan0` as the WAN
+-  (W board), `eth0` gets no DHCP client, address or route, so plugging a cable
+-  in can't take over the default route. While `eth0` is the DHCP WAN,
+-  re-plugging its cable renews the lease, so moving the box to another network
+-  picks up a new address within seconds.
++- **Automatic WAN.** `/etc/rnsbox/wan.conf` ships `interface=auto`: eth0 and
++  the WiFi client (`wlan0`) are both WAN interfaces for the firewall, NAT and
++  open ports, and the kernel's route metric picks the one in use. eth0's
++  default route (metric 0) wins while it has a cable and an address; the WiFi
++  client's (dhcpcd, metric 3000+) carries traffic otherwise. With the cable
++  out, the kernel skips eth0's leftover route (`ignore_routes_with_linkdown`
++  on eth0) and `S46wanwatch` drops eth0's DNS servers; re-plugging renews the
++  lease (a static eth0 gets its DNS back), so moving the box to another
++  network picks up a new address within seconds. When the uplink in use
++  changes, `S46wanwatch` has `S60routing uplink` flush the conntrack entries
++  of the NATed flows (a ct mark set by the masquerade rule), so those drop
++  and reconnect over the new uplink instead of hanging on the old address;
++  LAN, HaLow and inbound connections are left alone. Inbound connections (open ports, port forwards) come
++  through the uplink in use; the other one answers only its own local
++  network. A fresh box with no cable and no WiFi network set up is simply
++  offline: LAN, `rnsd` and a HaLow link work, and a cable or a WiFi network
++  added later is used with no setting to change. The box never rewrites this
++  setting itself.
++- **Pinned WAN.** *Network → WAN uplink → eth0 only* or *wlan0 only* keeps
++  the uplink on that interface, without the switching above (no skipping of
++  eth0's routes, DNS drop/restore or conntrack flush). A pinned DHCP eth0
++  still renews its lease when its cable is re-plugged. With `wlan0` pinned
++  (W board), `eth0` gets no DHCP client, address or route, so plugging a
++  cable in can't take over the default route. With `eth0` pinned, a joined
++  WiFi network carries none of the LAN's traffic (the WiFi tab says so when
++  you connect).
+ - **Per-unit identity.** The eth0 MAC, the USB serial number, the host-side
+   USB network MAC (which names a Linux host's `enx…` interface) and the box's
+   own USB network MAC, which the LAN bridge carries too (and so its `br-lan`
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S30eth b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S30eth
+index 98ee97d70..e9c3c28fe 100755
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S30eth
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S30eth
+@@ -1,7 +1,8 @@
+ #!/bin/sh
+-# S30eth — bring up the WAN on eth0 with either a DHCP lease or a static
+-# address, per /etc/rnsbox/wan.conf — but ONLY when eth0 is the WAN
+-# (interface=eth0, the default).
++# S30eth — bring up eth0 as an uplink with either a DHCP lease or a static
++# address, per /etc/rnsbox/wan.conf — whenever eth0 can be the WAN:
++# interface=auto (the default: eth0 and the wlan0 WiFi client are both
++# uplinks, the kernel prefers eth0 by route metric) or interface=eth0.
+ #
+ # DHCP path: busybox udhcpc (its default.script sets the lease addr/route and
+ #   registers the lease DNS with openresolv as "eth0"). Backgrounded;
+@@ -15,14 +16,23 @@
+ #   same one dhcpcd feeds for a wlan0 STA — so neither writer's regeneration
+ #   drops the other's servers (dnsmasq + the box's own resolver follow it).
+ #
++# interface=auto: eth0 is configured as for eth0, and dhcpcd's default route
++#   on a wlan0 STA (metric 3000+) stays behind eth0's (metric 0). Only in
++#   auto (pinned eth0 keeps its old behaviour): eth0's
++#   ignore_routes_with_linkdown (set in start) makes the kernel skip eth0's
++#   routes while its cable is out, so the WiFi client takes over at once
++#   instead of the stale lease blackholing traffic; S46wanwatch drops eth0's
++#   DNS servers then (`linkdown`) and restores them when the link is back
++#   (`renew`, `linkup`), and a static DNS list is registered only while eth0
++#   has carrier (it is exclusive: it would hide the WiFi client's servers).
+ # interface=wlan0 (W variant; S35wifi + dhcpcd address wlan0): eth0 is left
+ #   unconfigured — no DHCP client, no address, no route. Otherwise a cable in
+ #   eth0 would add udhcpc's metric-0 default route and hijack the WiFi WAN.
+ #   udhcpc here is eth0's only DHCP client (dhcpcd.conf no longer lists eth0).
+ #
+ # `restart` (the portal runs it, then S60routing, on every WAN save) always
+-# tears eth0 down first, so eth0 <-> wlan0 and dhcp <-> static switches end
+-# clean both ways.
++# tears eth0 down first, so auto/eth0 <-> wlan0 and dhcp <-> static switches
++# end clean both ways.
+ #
+ # /boot/eth.nodhcp still forces "leave eth0 alone" (legacy escape hatch).
+ 
+@@ -41,10 +51,30 @@ cfg() {
+ 
+ wan_iface() {
+ 	# Same rules as S60routing read_wan(): the interface= key, else a legacy
+-	# bare "eth0"/"wlan0" line, else eth0.
++	# bare "eth0"/"wlan0" line, else auto (also for an unknown value).
+ 	w=$(cfg interface | tr -d '[:space:]')
+ 	[ -z "$w" ] && w=$(grep -vE '^[[:space:]]*#|^[[:space:]]*$|=' "$WAN_CONF" 2>/dev/null | head -1 | tr -d '[:space:]')
+-	case "$w" in eth0|wlan0) echo "$w" ;; *) echo eth0 ;; esac
++	case "$w" in auto|eth0|wlan0) echo "$w" ;; *) echo auto ;; esac
++}
++
++# eth_managed — true when start() configures eth0 at all: no
++# /boot/eth.nodhcp and eth0 can be the WAN (interface=auto or eth0).
++eth_managed() {
++	[ ! -e /boot/eth.nodhcp ] && [ "$(wan_iface)" != wlan0 ]
++}
++
++# eth_auto — eth0 is managed and interface=auto: eth0 is one of two uplinks,
++# so its link state decides whether its routes and DNS servers count.
++eth_auto() {
++	[ ! -e /boot/eth.nodhcp ] && [ "$(wan_iface)" = auto ]
++}
++
++# eth0_carrier — true while eth0 has a link (the file reads EINVAL while
++# eth0 is admin-down).
++eth0_carrier() {
++	c=
++	{ read -r c </sys/class/net/eth0/carrier; } 2>/dev/null
++	[ "$c" = 1 ]
+ }
+ 
+ eth0_udhcpc_pids() {
+@@ -68,11 +98,10 @@ stop_dhcp() {
+ 	rm -f /run/udhcpc.eth0.pid
+ }
+ 
+-# dhcp_wan — true when start() would run udhcpc: no /boot/eth.nodhcp,
+-# interface=eth0, and not static with an address (an empty static address
+-# falls back to DHCP).
++# dhcp_wan — true when start() would run udhcpc: eth0 is managed and not
++# static with an address (an empty static address falls back to DHCP).
+ dhcp_wan() {
+-	[ ! -e /boot/eth.nodhcp ] && [ "$(wan_iface)" = eth0 ] || return 1
++	eth_managed || return 1
+ 	[ "$(cfg mode)" != static ] || [ -z "$(cfg address)" ]
+ }
+ 
+@@ -83,15 +112,44 @@ dhcp_wan() {
+ # busybox puts it in the DISCOVER as the requested-IP option, nothing more).
+ # The same network re-grants it; another network ignores the hint and offers
+ # its own address. Either way the WAN is back after a brief outage; a silent
+-# network leaves udhcpc retrying in the background, as at boot. No-op unless
+-# eth0 is the DHCP WAN. Nothing for S60routing to redo: the ruleset names
+-# ifaces, not addresses.
++# network leaves udhcpc retrying in the background, as at boot. No-op
++# unless eth0 is the DHCP WAN, except with interface=auto: a static eth0
++# kept its address and routes across the unplug, and only gets its DNS
++# servers (which `linkdown` dropped) registered again. Nothing for
++# S60routing to redo: the ruleset names ifaces, not addresses.
+ renew() {
+-	dhcp_wan || return 0
+-	REQUEST_IP=$(ip -4 -o addr show dev eth0 2>/dev/null | awk '{sub("/.*", "", $4); print $4; exit}')
+-	echo "eth0 renew: restarting udhcpc${REQUEST_IP:+, asking for $REQUEST_IP}"
+-	stop
+-	start
++	if dhcp_wan; then
++		REQUEST_IP=$(ip -4 -o addr show dev eth0 2>/dev/null | awk '{sub("/.*", "", $4); print $4; exit}')
++		echo "eth0 renew: restarting udhcpc${REQUEST_IP:+, asking for $REQUEST_IP}"
++		stop
++		start
++	else
++		linkup
++	fi
++}
++
++# linkup — interface=auto, static eth0 with carrier: register its DNS
++# servers (idempotent; no udhcpc restart). S46wanwatch runs it at its start
++# when eth0 already has a link: at boot start_static usually runs before the
++# link has come up, so it registered nothing, and no carrier-up edge follows.
++linkup() {
++	eth_auto && ! dhcp_wan || return 0
++	eth0_carrier || return 0
++	echo "eth0 link up: registering its static DNS servers"
++	register_static_dns
++}
++
++# linkdown — interface=auto only. S46wanwatch runs this when eth0 loses its
++# carrier (and once at its start if eth0 has none). The kernel already
++# ignores eth0's routes then (ignore_routes_with_linkdown), but its DNS
++# servers would stay in resolv.conf: a static list is registered exclusive
++# and would hide the WiFi client's servers entirely, a DHCP one would leave
++# dnsmasq trying a server that is now unreachable. Drop them; `renew`
++# restores them on re-plug.
++linkdown() {
++	eth_auto || return 0
++	echo "eth0 link down: dropping its DNS servers until the cable is back"
++	strip_resolv
+ }
+ 
+ strip_resolv() {
+@@ -139,19 +197,29 @@ start_static() {
+ 		# dhcpcd's wlan0 default (metric 3000+) alone if the STA is also up.
+ 		ip route replace default via "$gw" dev eth0 2>/dev/null
+ 	fi
+-	# Register the static DNS servers with openresolv as the eth0 entry, so
+-	# dnsmasq (upstream) + the box's own resolver use them and a dhcpcd event on
+-	# a wlan0 STA (resolvconf -a wlan0.dhcp) can't regenerate them away.
+-	# Exclusive: only the operator's servers are listed while this is set.
+-	# The touch lets openresolv back up an empty file, not a stale
+-	# /etc/resolv.conf.bak from an earlier boot.
+-	if [ -n "$dns" ]; then
+-		[ -e "$RESOLV" ] || : > "$RESOLV"
+-		for s in $dns; do echo "nameserver $s"; done | IF_EXCLUSIVE=yes resolvconf -a eth0
+-	fi
++	register_static_dns
+ 	echo "static $addr/$prefix gw=${gw:-none} dns=${dns:-none}"
+ }
+ 
++# Register the static DNS servers with openresolv as the eth0 entry, so
++# dnsmasq (upstream) + the box's own resolver use them and a dhcpcd event on
++# a wlan0 STA (resolvconf -a wlan0.dhcp) can't regenerate them away.
++# Exclusive: only the operator's servers are listed while this is set. With
++# interface=auto only while eth0 has carrier (linkup/renew register them once
++# the link is up, linkdown drops them), so an unplugged static eth0 can't
++# hide the WiFi client's servers. The touch lets openresolv back up an empty
++# file, not a stale /etc/resolv.conf.bak from an earlier boot.
++register_static_dns() {
++	dns=$(cfg dns)
++	[ -n "$dns" ] || return 0
++	if eth_auto && ! eth0_carrier; then
++		echo "static DNS deferred until eth0 has a link"
++		return 0
++	fi
++	[ -e "$RESOLV" ] || : > "$RESOLV"
++	for s in $dns; do echo "nameserver $s"; done | IF_EXCLUSIVE=yes resolvconf -a eth0
++}
++
+ start() {
+ 	printf "start ethernet: "
+ 	# openresolv restores /etc/resolv.conf.bak (on the SD rootfs) whenever its
+@@ -164,7 +232,16 @@ start() {
+ 		return
+ 	fi
+ 	iface=$(wan_iface)
+-	if [ "$iface" != "eth0" ]; then
++	# interface=auto: route lookups skip eth0's routes while it has no
++	# carrier, so an unplugged eth0's lease (or static gateway) can't
++	# outrank the WiFi client's default route. Per interface in the kernel
++	# (IN_DEV_CONF_GET: all.* isn't consulted). Only eth0: br-lan's
++	# connected route must stay when no LAN port is up, and a wlan0 route
++	# already has the highest metric. 0 (the kernel default) otherwise, so
++	# a pinned eth0 behaves as before and a switch away from auto undoes it.
++	v=0; [ "$iface" = auto ] && v=1
++	echo $v > /proc/sys/net/ipv4/conf/eth0/ignore_routes_with_linkdown 2>/dev/null
++	if [ "$iface" = wlan0 ]; then
+ 		# (stop's strip_resolv already regenerated resolv.conf from dhcpcd's
+ 		# wlan0 entry when the WAN moved off eth0.)
+ 		echo "skipped (WAN=$iface — eth0 left unconfigured)"
+@@ -186,13 +263,20 @@ stop() {
+ 	# default route included.
+ 	ip addr flush dev eth0 2>/dev/null
+ 	strip_resolv
++	# WAN=auto: flows opened while eth0 is re-addressed go out the WiFi
++	# client; S46wanwatch flushes their NAT entries once eth0 is the uplink
++	# again, even if that happens between two of its ticks.
++	eth_auto && : > /run/wan-eth0-readdressed
+ }
+ 
+ case "${1:-start}" in
+-	start)   start ;;
+-	stop)    stop ;;
+-	restart) stop; start ;;        # NB: real order (old S30eth had it backwards)
+-	renew)   renew ;;
+-	dhcpwan) dhcp_wan ;;           # exit 0 iff eth0 is the DHCP WAN (S46wanwatch)
+-	*)       echo "Usage: $0 {start|stop|restart|renew|dhcpwan}" >&2; exit 1 ;;
++	start)    start ;;
++	stop)     stop ;;
++	restart)  stop; start ;;        # NB: real order (old S30eth had it backwards)
++	renew)    renew ;;
++	linkup)   linkup ;;
++	linkdown) linkdown ;;
++	managed)  eth_managed ;;        # exit 0 iff eth0 is configured here (S46wanwatch)
++	auto)     eth_auto ;;           # exit 0 iff also interface=auto (S46wanwatch)
++	*)        echo "Usage: $0 {start|stop|restart|renew|linkup|linkdown|managed|auto}" >&2; exit 1 ;;
+ esac
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S45ntpsync b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S45ntpsync
+index 7e85358d6..61ad97188 100755
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S45ntpsync
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S45ntpsync
+@@ -121,12 +121,16 @@ rtc_trusted() {
+ }
+ 
+ # have_route - true while the main table has an IPv4 default route (S30eth:
+-# eth0 udhcpc lease or static gateway; dhcpcd: wlan0 WAN on the W board);
++# eth0 udhcpc lease or static gateway; dhcpcd: wlan0 WAN on the W board)
++# whose iface has carrier (an unplugged eth0 keeps its lease's route);
+ # ROUTE_IF = its interface. Builtins only.
+ have_route() {
+ 	ROUTE_IF=
+ 	while read -r ifc dst _gw _flags _rc _use _met mask _rest; do
+ 		[ "$dst" = 00000000 ] && [ "$mask" = 00000000 ] || continue
++		car=
++		{ read -r car <"/sys/class/net/$ifc/carrier"; } 2>/dev/null
++		[ "$car" = 1 ] || continue
+ 		ROUTE_IF=$ifc
+ 		return 0
+ 	done 2>/dev/null </proc/net/route
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S46wanwatch b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S46wanwatch
+index 4a2e9f250..c455bca63 100755
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S46wanwatch
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S46wanwatch
+@@ -47,7 +47,17 @@
+ #      doesn't watch carrier (dhcpcd used to, back when it ran on eth0), so
+ #      the old address + default route would stay until T1/T2; the watchdog
+ #      has S30eth restart udhcpc asking for its old address — a brief WAN
+-#      re-acquire; the same network re-grants the same address.
++#      re-acquire; the same network re-grants the same address (a static
++#      eth0 gets its DNS servers back). eth0 cable pulled: the kernel already
++#      skips its routes (so with interface=auto a WiFi client takes over);
++#      the watchdog has S30eth drop eth0's DNS servers, which would otherwise
++#      stay listed (a static list exclusively). The DNS part only with
++#      interface=auto; a pinned eth0 keeps its old behaviour.
++#   7. WAN=auto switched uplinks: the default route in use (lowest metric,
++#      iface with carrier) moved between eth0 and the WiFi client. Flows
++#      NATed to the old uplink's address would otherwise hang on the new one
++#      (conntrack keeps the old SNAT binding); `S60routing uplink` flushes
++#      conntrack so they are picked up again from the new address.
+ #
+ # Purely additive: boot-time S45/S82 still run first. The watchdog
+ # only does work when something becomes finishable that the boot
+@@ -61,6 +71,7 @@ LL_MARK=/run/rnsd-lan-no-ll                   # created by S82rnsd start
+ STOPPED_MARK=/run/rnsd.stopped                # explicit `S82rnsd stop`
+ ARMED_MARK=/run/rnsd.armed                    # S82rnsd start/restart ran
+ DEPS_MARK=/run/wanwatch-deps-pending          # nomadnet/lxmd wait for rnsd
++READDR_MARK=/run/wan-eth0-readdressed         # S30eth stop, WAN=auto
+ CLOCK_SRC=/run/clock-source                   # rtc|ntp|browser (S45ntpsync)
+ NTPD_PIDFILE=/var/run/ntpd.pid                # S49ntp / the ntpd daemon
+ NTPD_OUT=/run/wanwatch-ntpd.out               # last `S49ntp start` output
+@@ -146,15 +157,33 @@ eth0_link() {
+ }
+ 
+ # default_routes — ROUTES = the IPv4 default routes of the main table
+-# (" iface:gateway:metric" each), empty when there is none. Builtins only.
++# (" iface:gateway:metric" each) whose iface has carrier, empty when there is
++# none. An unplugged eth0 keeps its lease's route, which the kernel skips
++# (ignore_routes_with_linkdown, S30eth); it isn't an uplink. Builtins only.
+ default_routes() {
+ 	ROUTES=
+ 	while read -r ifc dst gw _flags _rc _use met mask _rest; do
+ 		[ "$dst" = 00000000 ] && [ "$mask" = 00000000 ] || continue
++		car=
++		{ read -r car <"/sys/class/net/$ifc/carrier"; } 2>/dev/null
++		[ "$car" = 1 ] || continue
+ 		ROUTES="$ROUTES $ifc:$gw:$met"
+ 	done 2>/dev/null </proc/net/route
+ }
+ 
++# uplink_now — UPLINK = the iface of the default route in use: the lowest
++# metric one among ROUTES (default_routes: ifaces with carrier), empty when
++# there is none. Builtins only.
++uplink_now() {
++	default_routes
++	UPLINK=; best=
++	for r in $ROUTES; do
++		ifc=${r%%:*}; met=${r##*:}
++		case "$met" in ''|*[!0-9]*) continue ;; esac
++		if [ -z "$best" ] || [ "$met" -lt "$best" ]; then best=$met; UPLINK=$ifc; fi
++	done
++}
++
+ # all_routes — ALLROUTES = a signature of the whole IPv4 main table
+ # (" iface:dest:gateway:metric:mask" each), empty when there is none; step 1
+ # reacts to any change, since a local time server needs no default route.
+@@ -194,6 +223,20 @@ svc_enabled() {
+ loop() {
+ 	log "started"
+ 	eth0_link; eth_carrier=$CARRIER; eth_ups=$UPS
++	# WAN=auto: bring eth0's DNS servers in line with its link now. No
++	# carrier (no cable, or the link not up yet): drop any S30eth registered
++	# (a static list is exclusive, and would hide a WiFi client's); a late
++	# link counts as carrier-up on a later tick (step 5), which registers
++	# them again. Carrier already up: a static eth0 registers them (at boot
++	# S30eth ran before the link came up, and no edge will follow).
++	if [ -x /etc/init.d/S30eth ] && /etc/init.d/S30eth auto; then
++		if [ "$CARRIER" = 1 ]; then
++			/etc/init.d/S30eth linkup >> "$LOG" 2>&1
++		else
++			/etc/init.d/S30eth linkdown >> "$LOG" 2>&1
++		fi
++	fi
++	uplink_now; last_uplink=$UPLINK
+ 	ntp_routes=; ntp_next=0; ntp_gap=$NTP_RETRY
+ 	while sleep 10; do
+ 		# Step 1: NTP one-shot while the clock source isn't ntp — on any
+@@ -209,10 +252,16 @@ loop() {
+ 		# again next tick rather than lose the edge. Builtins only until a
+ 		# run is due; only a change that started a one-shot is logged here
+ 		# (the one-shot logs to ntp-step.log, which it rolls over).
++		# The default route in use; with WAN=auto a cable pulled or plugged
++		# in changes it without changing the table (a dead eth0's routes
++		# stay, flagged linkdown), so it is part of step 1's signature.
++		uplink_now
++
+ 		src=
+ 		{ read -r src <"$CLOCK_SRC"; } 2>/dev/null
+ 		if [ "$src" != ntp ] && [ -x /etc/init.d/S45ntpsync ]; then
+ 			all_routes
++			[ -n "$ALLROUTES" ] && ALLROUTES="$ALLROUTES uplink=$UPLINK"
+ 			if [ -z "$ALLROUTES" ]; then
+ 				ntp_routes=
+ 			else
+@@ -316,18 +365,50 @@ loop() {
+ 
+ 		# Step 5: eth0 carrier came back since the last tick (0 -> 1, or a
+ 		# higher carrier_up_count for a replug between ticks), once per edge:
+-		# `S30eth renew` restarts udhcpc asking for its old address. Only
+-		# while eth0 is the DHCP WAN (`S30eth dhcpwan`: not for static, a
+-		# wlan0 WAN or /boot/eth.nodhcp); wan.conf is only parsed on a link
+-		# event, not every tick. A new lease on another network changes the
+-		# routing table, which step 1 picks up.
++		# `S30eth renew` restarts udhcpc asking for its old address (a
++		# static eth0: registers its DNS servers again). Carrier lost (1 ->
++		# 0): `S30eth linkdown` drops eth0's DNS servers. Only while S30eth
++		# configures eth0 (`S30eth managed`: interface=auto or eth0, no
++		# /boot/eth.nodhcp); wan.conf is only parsed on a link event, not
++		# every tick. A new lease on another network changes the routing
++		# table, which step 1 picks up.
+ 		eth0_link
+ 		if [ "$CARRIER" = 1 ] && { [ "$eth_carrier" != 1 ] || [ "$UPS" != "$eth_ups" ]; } \
+-		   && [ -x /etc/init.d/S30eth ] && /etc/init.d/S30eth dhcpwan; then
++		   && [ -x /etc/init.d/S30eth ] && /etc/init.d/S30eth managed; then
+ 			log "eth0 carrier up (up count ${eth_ups:-?} -> ${UPS:-?}) -> S30eth renew"
+ 			/etc/init.d/S30eth renew >> "$LOG" 2>&1
++		elif [ "$CARRIER" != 1 ] && [ "$eth_carrier" = 1 ] \
++		   && [ -x /etc/init.d/S30eth ] && /etc/init.d/S30eth auto; then
++			log "eth0 carrier lost -> S30eth linkdown"
++			/etc/init.d/S30eth linkdown >> "$LOG" 2>&1
+ 		fi
+ 		eth_carrier=$CARRIER; eth_ups=$UPS
++
++		# Step 6: the default route in use moved to another iface:
++		# `S60routing uplink` flushes the WAN-NATed conntrack entries when
++		# WAN=auto (a no-op for a pinned WAN), so flows NATed to the old
++		# uplink restart from the new one instead of hanging. Re-read here,
++		# after step 5: a renew has just dropped eth0's address and route,
++		# so the WiFi client carries the flows until the new lease arrives,
++		# and that later return to eth0 is the move that needs the flush.
++		# No uplink at all (both down) isn't a move: the next one compares
++		# against the last uplink that carried traffic. $READDR_MARK (S30eth
++		# stop re-addressed eth0 outside this loop, e.g. a portal WAN save,
++		# possibly between two ticks) counts as a move back to eth0.
++		uplink_now
++		if [ -n "$UPLINK" ] && { [ "$UPLINK" != "$last_uplink" ] \
++		   || { [ "$UPLINK" = eth0 ] && [ -f "$READDR_MARK" ]; }; }; then
++			if [ -n "$last_uplink" ] && [ -x /etc/init.d/S60routing ]; then
++				if [ "$UPLINK" = "$last_uplink" ]; then
++					log "uplink $UPLINK re-addressed"
++				else
++					log "uplink $last_uplink -> $UPLINK"
++				fi
++				/etc/init.d/S60routing uplink "$last_uplink" "$UPLINK" >> "$LOG" 2>&1
++			fi
++			last_uplink=$UPLINK
++		fi
++		[ "$UPLINK" = eth0 ] && rm -f "$READDR_MARK"
+ 	done
+ }
+ 
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S60routing b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S60routing
+index 413ac5e30..51fe99662 100755
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S60routing
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S60routing
+@@ -4,7 +4,20 @@
+ #
+ # Runs after S30gadget_nic (the LAN iface: br-lan, or usb0 without a bridge;
+ # recorded in /run/lan-iface), S30eth (eth0 lease) and S35wifi (wlan0 may be
+-# the WAN). The hotspot needs nothing here: hostapd bridges the AP iface into
++# the WAN).
++#
++# The WAN (wan.conf interface=) is one uplink, eth0 or wlan0, or `auto` (the
++# default): both are WAN ifaces at once, in the ruleset's @wan_ifaces, NAT and
++# route_localnet alike. Which one carries traffic is the kernel's routing
++# choice, not ours: eth0's default route (metric 0) beats a wlan0 STA's
++# (dhcpcd, metric 3000+) while eth0 has a cable and a lease, and is skipped
++# while it has no carrier (S30eth sets ignore_routes_with_linkdown). So a
++# cable plugged in, pulled out or a WiFi uplink joined needs no re-run here;
++# only the WAN-NATed conntrack entries are flushed when the uplink in use
++# moves (`uplink`, run by S46wanwatch), or those flows would hang on the old
++# uplink's address.
++# A wlan0 that is the hotspot (mode=ap) is a br-lan port: nftables sees its
++# traffic on br-lan, never on wlan0, so listing it as a WAN iface is inert. The hotspot needs nothing here: hostapd bridges the AP iface into
+ # br-lan (S35wifi), so its clients share the one LAN iface, subnet and DHCP
+ # pool with the USB host.
+ # Re-runnable as `restart` whenever the portal edits the rnsbox configs.
+@@ -28,7 +41,8 @@
+ #      step 3.
+ #   3. $NFT_FILE won't LOAD (e.g. the static fallback's ip6 table on a kernel
+ #      without IPv6) -> built-in IPv4-only emergency ruleset: lo + LAN +
+-#      established in, LAN -> $WAN out (masqueraded), everything else dropped.
++#      established in, LAN -> the WAN iface(s) out (masqueraded), everything
++#      else dropped.
+ #   4. even that fails (nf_tables unusable) -> ip_forward stays 0, so the box
+ #      at least doesn't route for the LAN; logged. Whatever ruleset was live
+ #      before is left as it was.
+@@ -47,7 +61,7 @@ NFT_FILE=/etc/nftables.conf
+ NFT_ERR=/var/log/nftgen.err
+ DNSMASQ_FILE=/etc/dnsmasq.conf
+ NFTGEN="/usr/sbin/rnsbox-portal nftgen"
+-WAN_CANDIDATES="eth0 wlan0"
++WAN_CANDIDATES="eth0 wlan0"   # every iface that can be a WAN (also: interface=auto)
+ 
+ # One LAN, one pool: the USB host and every hotspot client (bridged into
+ # br-lan by hostapd) draw from it. Old wifi.conf ap_ip/ap_dhcp_* keys (the
+@@ -61,14 +75,25 @@ AUTOGEN_DNSMASQ="# --- AUTOGEN MARKER --- per-LAN scopes appended at boot below
+ # isn't made yet (S29fw runs before S30gadget_nic) can't lock out the USB host.
+ FALLBACK_LAN="br-lan usb0"
+ 
++# read_wan — WAN = the wan.conf setting (auto, eth0 or wlan0), WAN_IFACES =
++# the ifaces it makes WAN (space-separated): both candidates for auto.
+ read_wan() {
+-	# wan.conf is now key=value (interface=eth0). Prefer the interface= key;
+-	# fall back to a legacy bare "eth0"/"wlan0" line if no key is present.
++	# wan.conf is now key=value (interface=auto). Prefer the interface= key;
++	# fall back to a legacy bare "eth0"/"wlan0" line if no key is present,
++	# else auto (also for an unknown value). Same rules as S30eth wan_iface.
+ 	WAN=$(grep -E '^[[:space:]]*interface[[:space:]]*=' "$WAN_CONF" 2>/dev/null \
+ 	  | tail -1 | sed -E 's/^[^=]*=[[:space:]]*//' | sed -E 's/[[:space:]]*#.*$//' \
+ 	  | tr -d '[:space:]')
+ 	[ -z "$WAN" ] && WAN=$(grep -vE '^[[:space:]]*#|^[[:space:]]*$|=' "$WAN_CONF" 2>/dev/null | head -1 | tr -d '[:space:]')
+-	case "$WAN" in eth0|wlan0) ;; *) WAN=eth0 ;; esac
++	case "$WAN" in auto|eth0|wlan0) ;; *) WAN=auto ;; esac
++	WAN_IFACES=$WAN
++	[ "$WAN" = auto ] && WAN_IFACES=$WAN_CANDIDATES
++}
++
++# is_wan <iface> — true if <iface> is one of $WAN_IFACES.
++is_wan() {
++	case " $WAN_IFACES " in *" $1 "*) return 0 ;; esac
++	return 1
+ }
+ 
+ # read_lan — LAN_IFACES = the LAN iface S30gadget_nic recorded in
+@@ -109,7 +134,7 @@ regen_nftables() {
+ 	for v6 in "" --no-ipv6; do
+ 		# Line 1 = $TOPO_TAG (a comment to nft; see nft_file_fits). The brace
+ 		# group's status is nftgen's, so its failure is still caught.
+-		if ! { echo "$TOPO_TAG"; $NFTGEN --wan "$WAN" --lan "$LAN_IFACES" $v6; } > "$TMP" 2>>"$NFT_ERR" \
++		if ! { echo "$TOPO_TAG"; $NFTGEN --wan "$(echo $WAN_IFACES | tr ' ' ',')" --lan "$LAN_IFACES" $v6; } > "$TMP" 2>>"$NFT_ERR" \
+ 		   || ! nft_output_ok "$TMP"; then
+ 			note "nftgen failed or wrote an incomplete ruleset (see $NFT_ERR); keeping previous $NFT_FILE"
+ 			rm -f "$TMP"
+@@ -132,13 +157,15 @@ regen_nftables() {
+ 
+ # Last-resort ruleset (step 3 in the header). IPv4-only on purpose so it
+ # loads on any nf_tables kernel; same LAN-only shape as the static fallback
+-# but built from the live WAN name. LAN = $LAN_IFACES plus $FALLBACK_LAN.
++# but built from the live WAN names. LAN = $LAN_IFACES plus $FALLBACK_LAN.
+ emergency_ruleset() {
+ 	lan_set=
+ 	for i in $(echo "$LAN_IFACES" | tr ',' ' ') $FALLBACK_LAN; do
+ 		case ", $lan_set, " in *", \"$i\", "*) continue ;; esac
+ 		lan_set="${lan_set:+$lan_set, }\"$i\""
+ 	done
++	wan_set=
++	for i in $WAN_IFACES; do wan_set="${wan_set:+$wan_set, }\"$i\""; done
+ 	cat <<EOF
+ flush ruleset
+ table ip filter {
+@@ -151,14 +178,14 @@ table ip filter {
+ 	chain forward {
+ 		type filter hook forward priority filter; policy drop;
+ 		ct state established,related accept
+-		iifname { $lan_set } oifname "$WAN" accept
++		iifname { $lan_set } oifname { $wan_set } accept
+ 	}
+ 	chain output { type filter hook output priority filter; policy accept; }
+ }
+ table ip nat {
+ 	chain postrouting {
+ 		type nat hook postrouting priority srcnat; policy accept;
+-		oifname "$WAN" masquerade
++		oifname { $wan_set } masquerade
+ 	}
+ }
+ EOF
+@@ -216,12 +243,13 @@ refresh_qdisc() {
+ 
+ regen_dnsmasq() {
+ 	if grep -q "$AUTOGEN_DNSMASQ" "$DNSMASQ_FILE" 2>/dev/null; then
+-		sed -i "/$AUTOGEN_DNSMASQ/q" "$DNSMASQ_FILE"
++		# busybox sed -i with q prints the cut-off lines to stdout
++		sed -i "/$AUTOGEN_DNSMASQ/q" "$DNSMASQ_FILE" >/dev/null
+ 	fi
+ 	{
+ 		echo
+-		echo "# WAN=$WAN (no DHCP served on the uplink — $WAN is a client there)"
+-		echo "no-dhcp-interface=$WAN"
++		echo "# WAN=$WAN: no DHCP served on an uplink — the box is a client there"
++		for w in $WAN_IFACES; do echo "no-dhcp-interface=$w"; done
+ 		echo
+ 		echo "# Sole DHCP server on the LAN: ACK a renewal for a lease we no longer have (lost table, clock step) instead of NAKing it"
+ 		echo "dhcp-authoritative"
+@@ -239,7 +267,8 @@ start() {
+ 	read_lan
+ 	# Stamped on line 1 of every generated $NFT_FILE (see nft_file_fits).
+ 	TOPO_TAG="# rnsbox-topology wan=$WAN lan=$LAN_IFACES"
+-	echo "S60routing: WAN=$WAN LAN=$LAN_IFACES"
++	w=$WAN; [ "$WAN" = auto ] && w="auto ($WAN_IFACES)"
++	echo "S60routing: WAN=$w LAN=$LAN_IFACES"
+ 
+ 	# --- routing knobs ---
+ 	# (ip_forward is switched on further down, once a ruleset is loaded.)
+@@ -260,12 +289,14 @@ start() {
+ 	# arriving on a real iface is dropped as a martian before INPUT. Forwards
+ 	# to the box's real LAN IP (10.42.0.1) don't need this; loopback ones do.
+ 	# Safe: INPUT's drop policy + the "ct status dnat" gate mean only flows
+-	# our own prerouting DNAT created can reach a local service this way.
+-	# Only the current WAN gets it: reset it on the other WAN candidate, or a
+-	# WAN switch would leave it on the old uplink.
++	# our own prerouting DNAT created can reach a local service this way
++	# (nftgen drops anything else addressed to 127.0.0.0/8 from the WAN
++	# before the open-port rules).
++	# Only the current WAN ifaces get it (both for auto): reset it on any other
++	# candidate, or a WAN switch would leave it on the old uplink.
+ 	for w in $WAN_CANDIDATES; do
+ 		[ -d "/proc/sys/net/ipv4/conf/$w" ] || continue   # no wlan0 on the -e
+-		v=0; [ "$w" = "$WAN" ] && v=1
++		v=0; is_wan "$w" && v=1
+ 		echo $v > "/proc/sys/net/ipv4/conf/$w/route_localnet"
+ 	done
+ 
+@@ -373,6 +404,29 @@ early() {
+ 	  || note "could not load the early fail-closed ruleset (see $NFT_ERR)"
+ }
+ 
++# uplink <from> <to> — S46wanwatch: the default route in use moved from one
++# iface to another (or eth0 was re-addressed). With WAN=auto, flush the IPv4
++# conntrack entries of flows masqueraded out a WAN iface (the ct mark
++# nftgen's nat postrouting sets; `rnsbox-portal ctflush`): masquerade keeps
++# each flow's SNAT binding to the old uplink's address (the kernel drops it
++# only when that iface goes admin-down or loses the address, not on a lost
++# cable or a new, better route), so those flows would leave the new uplink
++# with the old source and hang. Flushed, each is picked up again on its next
++# packet and masqueraded to the new uplink: TCP gets reset by the peer and
++# reconnects, UDP (WireGuard, QUIC) carries on from the new address. LAN <->
++# box flows, the HaLow modem on sl0 and inbound connections keep their
++# entries. (The static fallback and emergency rulesets don't set the mark.)
++# A pinned WAN never moves the LAN's NAT uplink: nothing to do.
++uplink() {
++	read_wan
++	[ "$WAN" = auto ] || return 0
++	if /usr/sbin/rnsbox-portal ctflush 2>>"$NFT_ERR"; then
++		echo "S60routing: WAN=auto uplink $1 -> $2: conntrack flushed"
++	else
++		note "WAN=auto uplink $1 -> $2: conntrack flush failed (see $NFT_ERR)"
++	fi
++}
++
+ stop() {
+ 	# Close, don't open: `nft flush ruleset` left the WAN (e.g. sshd)
+ 	# unfiltered until S50sshd stop / power-off. Emergency ruleset, routing off.
+@@ -394,5 +448,6 @@ case "${1:-start}" in
+ 	# regen. start alone re-applies every knob and swaps the ruleset atomically.
+ 	restart) start ;;
+ 	early)   early ;;
+-	*) echo "Usage: $0 {start|stop|restart|early}" >&2; exit 1 ;;
++	uplink)  uplink "$2" "$3" ;;
++	*) echo "Usage: $0 {start|stop|restart|early|uplink <from> <to>}" >&2; exit 1 ;;
+ esac
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/wan.conf b/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/wan.conf
+index c1d3f39ae..ac87af0b0 100644
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/wan.conf
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/wan.conf
+@@ -2,15 +2,21 @@
+ #
+ # Flat key=value. Parsed by both the C++ portal (store.cpp, in
+ # /usr/sbin/rnsbox-portal — it rewrites this file on save) and the shell init
+-# scripts (S30eth addresses eth0 only when interface=eth0; S60routing picks
+-# the NAT iface).
++# scripts (S30eth configures eth0 unless interface=wlan0; S60routing picks
++# the NAT ifaces).
+ #
+-# interface:  which iface acts as WAN (default route + NAT masquerade attach here)
+-#   eth0    - onboard RJ45 (the only working option on the Nano-e SKU; default)
+-#   wlan0   - WiFi client (W variant only; addressed by S35wifi/dhcpcd, not here).
+-#             eth0 is then left unconfigured (no DHCP client, no address).
++# interface:  which iface(s) act as WAN (NAT masquerade + open ports attach here)
++#   auto    - both eth0 and the wlan0 WiFi client are uplinks (default). The
++#             kernel's route metric picks: eth0 while it has a cable and an
++#             address, otherwise the WiFi client (W variant, WiFi tab ->
++#             mode sta or sta+ap). Nothing to switch by hand when a cable is
++#             plugged in or pulled out. On the Nano-e (no WiFi) this is eth0.
++#   eth0    - onboard RJ45 only; a WiFi client never carries LAN traffic.
++#   wlan0   - WiFi client only (W variant; addressed by S35wifi/dhcpcd, not
++#             here). eth0 is then left unconfigured (no DHCP client, no address).
++#   The box never changes this setting itself: eth0 or wlan0 stays pinned.
+ #
+-# mode:  how eth0 gets its IPv4 address
++# mode:  how eth0 gets its IPv4 address (auto or eth0)
+ #   dhcp    - lease from the upstream router (default)
+ #   static  - use the address/prefix/gateway/dns fields below
+ #
+@@ -23,5 +29,5 @@
+ # Changes take effect after `/etc/init.d/S30eth restart` +
+ # `/etc/init.d/S60routing restart` (the portal does both on save), or a reboot.
+ 
+-interface=eth0
++interface=auto
+ mode=dhcp
+diff --git a/buildroot/package/rnsbox-portal/src/cgi/conntrack.cpp b/buildroot/package/rnsbox-portal/src/cgi/conntrack.cpp
+new file mode 100644
+index 000000000..cfa5d91a6
+--- /dev/null
++++ b/buildroot/package/rnsbox-portal/src/cgi/conntrack.cpp
+@@ -0,0 +1,78 @@
++// conntrack.cpp — see conntrack.h. Kept apart from sysinfo.h: the musl
++// kernel headers pulled in here declare `struct sysinfo`, which clashes with
++// the sysinfo namespace.
++#include "conntrack.h"
++#include <arpa/inet.h>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <linux/netfilter/nfnetlink.h>
++#include <linux/netfilter/nfnetlink_conntrack.h>
++#include <linux/netlink.h>
++#include <sys/socket.h>
++#include <sys/time.h>
++#include <unistd.h>
++
++namespace conntrack {
++
++int flush() {
++    // Delete the IPv4 entries carrying WAN_NAT_MARK: IPCTNL_MSG_CT_DELETE
++    // with no tuple is a flush, a nonzero nfgenmsg version limits it to
++    // nfgen_family, and CTA_MARK/CTA_MARK_MASK to entries whose
++    // (mark & mask) == mark (5.10 ctnetlink_del_conntrack ->
++    // ctnetlink_filter_match). What was mid-flow is picked up again on its
++    // next packet and masqueraded to the current uplink (TCP: the peer
++    // resets it and the client reconnects; UDP such as WireGuard just
++    // continues from the new address).
++    int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_NETFILTER);
++    if (fd < 0) { perror("ctflush: socket"); return 1; }
++    struct timeval tv = {2, 0};
++    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
++    struct {
++        struct nlmsghdr nh;
++        struct nfgenmsg nf;
++        struct nlattr mark_hdr;
++        uint32_t mark;            // big-endian
++        struct nlattr mask_hdr;
++        uint32_t mask;            // big-endian
++    } req;
++    static_assert(sizeof req == NLMSG_LENGTH(sizeof(struct nfgenmsg) + 2 * (NLA_HDRLEN + 4)),
++                  "unpadded netlink request");
++    memset(&req, 0, sizeof req);
++    req.nh.nlmsg_len = sizeof req;
++    req.nh.nlmsg_type = (NFNL_SUBSYS_CTNETLINK << 8) | IPCTNL_MSG_CT_DELETE;
++    req.nh.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
++    req.nh.nlmsg_seq = 1;
++    req.nf.nfgen_family = AF_INET;
++    req.nf.version = 1;
++    req.mark_hdr.nla_len = NLA_HDRLEN + sizeof req.mark;
++    req.mark_hdr.nla_type = CTA_MARK;
++    req.mark = htonl(WAN_NAT_MARK);
++    req.mask_hdr.nla_len = NLA_HDRLEN + sizeof req.mask;
++    req.mask_hdr.nla_type = CTA_MARK_MASK;
++    req.mask = htonl(WAN_NAT_MARK);
++    struct sockaddr_nl sa;
++    memset(&sa, 0, sizeof sa);
++    sa.nl_family = AF_NETLINK;
++    if (sendto(fd, &req, req.nh.nlmsg_len, 0, (struct sockaddr*)&sa, sizeof sa) < 0) {
++        perror("ctflush: send");
++        close(fd);
++        return 1;
++    }
++    char buf[512];
++    ssize_t n = recv(fd, buf, sizeof buf, 0);
++    close(fd);
++    const struct nlmsghdr* h = (const struct nlmsghdr*)buf;
++    if (n < (ssize_t)NLMSG_LENGTH(sizeof(struct nlmsgerr)) || h->nlmsg_type != NLMSG_ERROR) {
++        fprintf(stderr, "ctflush: no acknowledgement from the kernel\n");
++        return 1;
++    }
++    int err = ((const struct nlmsgerr*)NLMSG_DATA(h))->error;
++    if (err) {
++        fprintf(stderr, "ctflush: %s\n", strerror(-err));
++        return 1;
++    }
++    return 0;
++}
++
++}  // namespace conntrack
+diff --git a/buildroot/package/rnsbox-portal/src/cgi/conntrack.h b/buildroot/package/rnsbox-portal/src/cgi/conntrack.h
+new file mode 100644
+index 000000000..04cba8701
+--- /dev/null
++++ b/buildroot/package/rnsbox-portal/src/cgi/conntrack.h
+@@ -0,0 +1,22 @@
++// conntrack.h — `rnsbox-portal ctflush`: delete the IPv4 conntrack entries of
++// flows masqueraded out a WAN iface, over netlink (ctnetlink; no
++// conntrack-tools in the image), so they don't linger with the previous
++// uplink's address after WAN=auto switched between eth0 and the WiFi client
++// (S60routing uplink, run by S46wanwatch).
++#ifndef RNSBOX_CONNTRACK_H
++#define RNSBOX_CONNTRACK_H
++
++namespace conntrack {
++
++// ct mark bit nftgen's nat postrouting sets on every flow it masquerades out
++// a WAN iface (the first packet of a flow is the only one nat sees, so the
++// mark stays for the flow's life). Nothing else in the ruleset uses ct marks.
++// Entries without it — LAN <-> box, the HaLow modem over sl0, inbound to the
++// box, port forwards — are left alone by flush().
++constexpr unsigned WAN_NAT_MARK = 0x1;
++
++// Returns the process exit code (0 = flushed); errors go to stderr.
++int flush();
++
++}  // namespace conntrack
++#endif
+diff --git a/buildroot/package/rnsbox-portal/src/cgi/main.cpp b/buildroot/package/rnsbox-portal/src/cgi/main.cpp
+index e3f47e04f..65a698afe 100644
+--- a/buildroot/package/rnsbox-portal/src/cgi/main.cpp
++++ b/buildroot/package/rnsbox-portal/src/cgi/main.cpp
+@@ -7,7 +7,7 @@
+ // Before either: the Host must be an IP literal or exactly "localhost"
+ // (host_is_literal; the dnsmasq aliases such as setup.lan only redirect to the
+ // IP), and the modem UI lives alone on its own port/origin (MODEM_PORT).
+-// Dual-mode: `nftgen` CLI at boot.
++// Dual-mode: `nftgen` / `ctflush` CLI for the init scripts.
+ #include "http.h"
+ #include "session.h"
+ #include "util.h"
+@@ -15,6 +15,7 @@
+ #include "render.h"
+ #include "routes.h"
+ #include "nftgen.h"
++#include "conntrack.h"
+ #include "store.h"
+ #include <cctype>
+ #include <cstdio>
+@@ -188,7 +189,7 @@ static bool tcp_forwarded(int wan_port) {
+ }
+ 
+ // Request from the LAN or the box itself? Our prerouting DNAT matches only
+-// iifname "<WAN>" (nftgen) and keeps the source address, so for these clients a
++// iifname @wan_ifaces (nftgen) and keeps the source address, so for these clients a
+ // redirect to another port of the same Host reaches us, never a forward's target.
+ // The LAN is one subnet: 10.42.0.1/24 on /run/lan-iface (S30gadget_nic) —
+ // br-lan, which bridges the USB-C host and the WiFi hotspot's clients (one
+@@ -238,6 +239,9 @@ int main(int argc, char** argv) {
+     // CLI mode: `rnsbox-portal nftgen --wan eth0 --lan br-lan` (boot path).
+     if (argc >= 2 && strcmp(argv[1], "nftgen") == 0)
+         return nftgen::cli_main(argc, argv);
++    // `rnsbox-portal ctflush` (S60routing uplink: WAN=auto switched uplinks).
++    if (argc >= 2 && strcmp(argv[1], "ctflush") == 0)
++        return conntrack::flush();
+ 
+     // otherwise: CGI mode (invoked by uhttpd, request in the environment)
+     session::ensure_default_auth();
+diff --git a/buildroot/package/rnsbox-portal/src/cgi/nftgen.cpp b/buildroot/package/rnsbox-portal/src/cgi/nftgen.cpp
+index 9a2e74764..88355af98 100644
+--- a/buildroot/package/rnsbox-portal/src/cgi/nftgen.cpp
++++ b/buildroot/package/rnsbox-portal/src/cgi/nftgen.cpp
+@@ -1,6 +1,7 @@
+-// nftgen.cpp — see nftgen.h. Native port of nftgen.py; the ip filter/nat
+-// tables are byte-identical to it, the ip6 filter table was added after.
++// nftgen.cpp — see nftgen.h. Native port of nftgen.py; the ip6 filter table
++// and the WAN iface set (one WAN, or eth0 + wlan0 for WAN=auto) came after.
+ #include "nftgen.h"
++#include "conntrack.h"
+ #include "store.h"
+ #include "sysinfo.h"
+ #include <cstdio>
+@@ -11,15 +12,22 @@
+ 
+ namespace nftgen {
+ 
+-std::string generate(const std::string& wan, const std::vector<std::string>& lans, bool with_ipv6) {
++// "a", "b" — the elements of an ifname set.
++static std::string ifname_elements(const std::vector<std::string>& names) {
++    std::string out;
++    for (size_t i = 0; i < names.size(); ++i) {
++        if (i) out += ", ";
++        out += "\"" + names[i] + "\"";
++    }
++    return out;
++}
++
++std::string generate(const std::vector<std::string>& wans, const std::vector<std::string>& lans, bool with_ipv6) {
+     auto forwards = store::read_portforwards();
+     auto openports = store::read_openports();
+ 
+-    std::string lan_set;
+-    for (size_t i = 0; i < lans.size(); ++i) {
+-        if (i) lan_set += ", ";
+-        lan_set += "\"" + lans[i] + "\"";
+-    }
++    std::string lan_set = ifname_elements(lans);
++    std::string wan_set = ifname_elements(wans);
+ 
+     std::string L;
+     auto add = [&](const std::string& s) { L += s; L += "\n"; };
+@@ -29,7 +37,8 @@ std::string generate(const std::string& wan, const std::vector<std::string>& lan
+     add("flush ruleset\n");
+ 
+     add("table ip filter {");
+-    add("\tset lan_ifaces { type ifname; elements = { " + lan_set + " } }\n");
++    add("\tset lan_ifaces { type ifname; elements = { " + lan_set + " } }");
++    add("\tset wan_ifaces { type ifname; elements = { " + wan_set + " } }\n");
+ 
+     add("\tchain input {");
+     add("\t\ttype filter hook input priority filter; policy drop;");
+@@ -41,8 +50,13 @@ std::string generate(const std::string& wan, const std::vector<std::string>& lan
+     add("\t\tiifname @lan_ifaces accept");
+     if (!forwards.empty()) {
+         add("\t\t# port forwards whose target is the device itself (DNAT -> INPUT)");
+-        add("\t\tiifname \"" + wan + "\" ct status dnat accept");
++        add("\t\tiifname @wan_ifaces ct status dnat accept");
+     }
++    // route_localnet is on for the WAN ifaces (S60routing), for forwards to
++    // 127.x; anything else addressed to loopback from the WAN never reaches
++    // an open port (a WiFi-client neighbour could otherwise hit a service
++    // bound only to 127.0.0.1).
++    add("\t\tiifname @wan_ifaces ip daddr 127.0.0.0/8 drop");
+     if (!openports.empty()) {
+         std::map<std::string, std::set<int>> pp;   // proto -> sorted unique ports
+         for (const auto& op : openports) pp[op.proto].insert(op.port);
+@@ -57,7 +71,7 @@ std::string generate(const std::string& wan, const std::vector<std::string>& lan
+                 ports += std::to_string(*it);
+             }
+             add("\t\t# user-managed open ports");
+-            add("\t\tiifname \"" + wan + "\" " + kv.first + " dport { " + ports + " } accept");
++            add("\t\tiifname @wan_ifaces " + kv.first + " dport { " + ports + " } accept");
+         }
+     }
+     add("\t}\n");
+@@ -67,11 +81,11 @@ std::string generate(const std::string& wan, const std::vector<std::string>& lan
+     add("\t\tct state invalid drop");
+     add("\t\tct state established,related accept");
+     add("\t\t# LAN -> WAN (free egress)");
+-    add("\t\tiifname @lan_ifaces oifname \"" + wan + "\" accept");
++    add("\t\tiifname @lan_ifaces oifname @wan_ifaces accept");
+     if (!forwards.empty()) {
+         add("\t\t# WAN -> LAN, post-DNAT (port forward destinations)");
+         for (const auto& fw : forwards)
+-            add("\t\tiifname \"" + wan + "\" oifname @lan_ifaces ip daddr " + fw.lan_ip + " " +
++            add("\t\tiifname @wan_ifaces oifname @lan_ifaces ip daddr " + fw.lan_ip + " " +
+                 fw.proto + " dport " + std::to_string(fw.lan_port) + " accept");
+     }
+     add("\t}\n");
+@@ -80,15 +94,20 @@ std::string generate(const std::string& wan, const std::vector<std::string>& lan
+     add("}\n");
+ 
+     add("table ip nat {");
++    add("\tset wan_ifaces { type ifname; elements = { " + wan_set + " } }\n");   // sets are per table
+     add("\tchain prerouting {");
+     add("\t\ttype nat hook prerouting priority dstnat; policy accept;");
+     for (const auto& fw : forwards)
+-        add("\t\tiifname \"" + wan + "\" " + fw.proto + " dport " + std::to_string(fw.wan_port) +
++        add("\t\tiifname @wan_ifaces " + fw.proto + " dport " + std::to_string(fw.wan_port) +
+             " dnat to " + fw.lan_ip + ":" + std::to_string(fw.lan_port));
+     add("\t}\n");
+     add("\tchain postrouting {");
+     add("\t\ttype nat hook postrouting priority srcnat; policy accept;");
+-    add("\t\toifname \"" + wan + "\" masquerade");
++    // The ct mark tags the flow as NATed to this uplink, so `rnsbox-portal
++    // ctflush` can drop just these when WAN=auto moves to the other one.
++    char mark[16];
++    snprintf(mark, sizeof mark, "0x%08x", conntrack::WAN_NAT_MARK);
++    add(std::string("\t\toifname @wan_ifaces ct mark set ct mark or ") + mark + " masquerade");
+     add("\t}");
+     add("}");
+ 
+@@ -125,6 +144,22 @@ std::string generate(const std::string& wan, const std::vector<std::string>& lan
+     return L;
+ }
+ 
++// "a, b,c" -> {"a", "b", "c"} (comma-separated, trimmed, empty parts dropped).
++static std::vector<std::string> split_list(const std::string& s) {
++    std::vector<std::string> out;
++    size_t i = 0;
++    while (i < s.size()) {
++        size_t c = s.find(',', i);
++        if (c == std::string::npos) c = s.size();
++        std::string t = s.substr(i, c - i);
++        size_t a = t.find_first_not_of(" \t");
++        size_t b = t.find_last_not_of(" \t");
++        if (a != std::string::npos) out.push_back(t.substr(a, b - a + 1));
++        i = c + 1;
++    }
++    return out;
++}
++
+ int cli_main(int argc, char** argv) {
+     std::string wan, lan;
+     // ip6 table only on a kernel that has IPv6 (the rootfs can outlive the
+@@ -136,21 +171,10 @@ int cli_main(int argc, char** argv) {
+         else if (!strcmp(argv[i], "--lan") && i + 1 < argc) lan = argv[++i];
+         else if (!strcmp(argv[i], "--no-ipv6")) v6 = false;
+     }
+-    if (wan.empty()) { fprintf(stderr, "usage: rnsbox-portal nftgen --wan <iface> [--lan a,b] [--no-ipv6]\n"); return 2; }
+     if (lan.empty()) lan = sysinfo::lan_iface();
+-    std::vector<std::string> lans;
+-    size_t i = 0;
+-    while (i < lan.size()) {
+-        size_t c = lan.find(',', i);
+-        if (c == std::string::npos) c = lan.size();
+-        std::string t = lan.substr(i, c - i);
+-        // trim
+-        size_t a = t.find_first_not_of(" \t");
+-        size_t b = t.find_last_not_of(" \t");
+-        if (a != std::string::npos) lans.push_back(t.substr(a, b - a + 1));
+-        i = c + 1;
+-    }
+-    std::string out = generate(wan, lans, v6);
++    std::vector<std::string> wans = split_list(wan), lans = split_list(lan);
++    if (wans.empty()) { fprintf(stderr, "usage: rnsbox-portal nftgen --wan <iface>[,iface] [--lan a,b] [--no-ipv6]\n"); return 2; }
++    std::string out = generate(wans, lans, v6);
+     // S60routing trusts this exit status: a short write (ENOSPC) must fail,
+     // or an empty file passes `nft -c` (empty batch) and gets installed.
+     if (fwrite(out.data(), 1, out.size(), stdout) != out.size() || fflush(stdout) != 0) {
+diff --git a/buildroot/package/rnsbox-portal/src/cgi/nftgen.h b/buildroot/package/rnsbox-portal/src/cgi/nftgen.h
+index ec04a517b..7b4b35da2 100644
+--- a/buildroot/package/rnsbox-portal/src/cgi/nftgen.h
++++ b/buildroot/package/rnsbox-portal/src/cgi/nftgen.h
+@@ -1,8 +1,11 @@
+ // nftgen.h — nftables ruleset generator (native port of nftgen.py).
+ // Single source of truth for /etc/nftables.conf, used two ways:
+ //   - the portal's apply path (config change), and
+-//   - the boot path: `rnsbox-portal nftgen --wan eth0 --lan br-lan`
++//   - the boot path: `rnsbox-portal nftgen --wan eth0,wlan0 --lan br-lan`
+ //     invoked by /etc/init.d/S60routing.
++// The WAN is a set of ifaces (@wan_ifaces): the one uplink wan.conf names, or
++// eth0 + wlan0 for interface=auto, where the kernel's route metric decides
++// which carries traffic (S60routing's header).
+ // The LAN is the one iface S30gadget_nic records in /run/lan-iface: the
+ // bridge br-lan (USB-C link + hotspot as ports, one subnet), or usb0 when the
+ // bridge couldn't be made. Traffic between bridge ports is switched at L2 and
+@@ -18,10 +21,10 @@
+ 
+ namespace nftgen {
+ 
+-std::string generate(const std::string& wan_iface, const std::vector<std::string>& lan_ifaces,
++std::string generate(const std::vector<std::string>& wan_ifaces, const std::vector<std::string>& lan_ifaces,
+                      bool with_ipv6 = true);
+ 
+-// CLI: parse --wan/--lan[/--no-ipv6] from argv, print the ruleset to stdout.
++// CLI: parse --wan a[,b]/--lan[/--no-ipv6] from argv, print the ruleset to stdout.
+ // Without --lan: the LAN iface from /run/lan-iface (sysinfo::lan_iface() —
+ // same rule as S60routing read_lan()).
+ // The ip6 table is emitted only if the kernel has IPv6 (/proc/sys/net/ipv6)
+diff --git a/buildroot/package/rnsbox-portal/src/cgi/pages/dashboard.html b/buildroot/package/rnsbox-portal/src/cgi/pages/dashboard.html
+index 590081c06..0ba1eabd7 100644
+--- a/buildroot/package/rnsbox-portal/src/cgi/pages/dashboard.html
++++ b/buildroot/package/rnsbox-portal/src/cgi/pages/dashboard.html
+@@ -37,7 +37,7 @@
+   </section>
+ 
+   <section class="card">
+-    <h3>WAN (__WAN__)</h3>
++    <h3>WAN (<span id="d-wan-label">__WAN__</span>)</h3>
+     <table class="kv">
+       <tr><th>State</th><td id="d-wan-state">__WAN_STATE__</td></tr>
+       <tr><th>Address</th><td id="d-wan-addr">__WAN_ADDR__</td></tr>
+@@ -84,6 +84,7 @@ __HALOW_SCRIPT__
+       var f=$('d-ram-fill'); if(f){ f.style.width=pct+'%'; f.className='meter-fill '+(pct>=90?'crit':pct>=75?'warn':'ok'); }
+       setText('d-ram-note', pct+'% used · '+m.buffcache_mb+' MB buff/cache (reclaimable)');
+     }
++    if(d.wan_label) setText('d-wan-label', d.wan_label);
+     setHTML('d-wan-state', wif.state==='up'?'<span class="badge ok">UP</span>':'<span class="badge err">'+esc(wif.state||'DOWN')+'</span>');
+     setText('d-wan-addr', (wif.addrs&&wif.addrs.length)?wif.addrs.join(', '):'(none)');
+     setText('d-wan-gw', d.gateway||'(none)');
+diff --git a/buildroot/package/rnsbox-portal/src/cgi/pages/network.html b/buildroot/package/rnsbox-portal/src/cgi/pages/network.html
+index 6cc294ea1..088f943ce 100644
+--- a/buildroot/package/rnsbox-portal/src/cgi/pages/network.html
++++ b/buildroot/package/rnsbox-portal/src/cgi/pages/network.html
+@@ -4,15 +4,20 @@
+ <section class="card">
+   <h3>WAN uplink</h3>
+   <p class="muted">Which interface reaches the internet, and how it gets its
+-  address. NAT masquerade + the default route follow this choice.
+-  <strong>wlan0</strong> requires the WiFi client to be connected (WiFi tab →
+-  mode <em>sta</em> or <em>sta+ap</em>) and is always DHCP-addressed by the WiFi
+-  stack — the static fields below apply to <strong>eth0</strong> only.</p>
++  address. NAT masquerade and the open ports follow this choice.
++  <strong>Automatic</strong> (the default) uses <strong>eth0</strong> while it
++  has a cable and an address and the WiFi client otherwise, switching by itself
++  when the cable goes in or out. <strong>eth0</strong> or <strong>wlan0</strong>
++  pins the uplink to that one interface; the box never changes your choice.
++  The WiFi client needs to be connected (WiFi tab → mode <em>sta</em> or
++  <em>sta+ap</em>) and is always DHCP-addressed by the WiFi stack — the static
++  fields below apply to <strong>eth0</strong> only.</p>
+   <form method="post" action="__BASE__/network/wan">
+     <label>Interface
+       <select name="wan">
+-        <option value="eth0"  __SEL_ETH0__>eth0 — wired Ethernet</option>
+-        <option value="wlan0" __SEL_WLAN0__>wlan0 — WiFi client</option>
++        <option value="auto"  __SEL_AUTO__>Automatic — eth0 when plugged in, else WiFi client</option>
++        <option value="eth0"  __SEL_ETH0__>eth0 only — wired Ethernet</option>
++        <option value="wlan0" __SEL_WLAN0__>wlan0 only — WiFi client</option>
+       </select>
+     </label>
+     <label>Addressing
+diff --git a/buildroot/package/rnsbox-portal/src/cgi/pages/settings.html b/buildroot/package/rnsbox-portal/src/cgi/pages/settings.html
+index 0201ea687..dfea7024a 100644
+--- a/buildroot/package/rnsbox-portal/src/cgi/pages/settings.html
++++ b/buildroot/package/rnsbox-portal/src/cgi/pages/settings.html
+@@ -87,7 +87,7 @@
+ <section class="card">
+   <h3>WAN interface</h3>
+   <p>Currently: <strong>__WAN__</strong></p>
+-  <p class="muted">Switch the WAN uplink (eth0 wired ↔ wlan0 WiFi) from the
+-  <a href="__BASE__/network">Network</a> tab. On the W variant, wlan0
+-  WAN also needs the WiFi client connected (<a href="__BASE__/wifi">WiFi</a> tab).</p>
++  <p class="muted">Choose the WAN uplink (automatic, eth0 wired or wlan0 WiFi)
++  on the <a href="__BASE__/network">Network</a> tab. On the W variant, a WiFi
++  uplink also needs the WiFi client connected (<a href="__BASE__/wifi">WiFi</a> tab).</p>
+ </section>
+diff --git a/buildroot/package/rnsbox-portal/src/cgi/routes_dash.cpp b/buildroot/package/rnsbox-portal/src/cgi/routes_dash.cpp
+index 120da5edc..a336024e7 100644
+--- a/buildroot/package/rnsbox-portal/src/cgi/routes_dash.cpp
++++ b/buildroot/package/rnsbox-portal/src/cgi/routes_dash.cpp
+@@ -198,7 +198,8 @@ void dashboard_page(const Request& req, Response& res) {
+     store::WanConfig  wan  = store::read_wan();
+     bool slip_on = slip_enabled(store::read_slip());
+ 
+-    const sysinfo::Iface* wif = find_iface(net, wan.interface);
++    // WAN=auto: the card follows the uplink in use (eth0 or the WiFi client).
++    const sysinfo::Iface* wif = find_iface(net, sysinfo::wan_display_iface(wan.interface, net));
+     std::string lan_if = sysinfo::lan_iface();
+     const sysinfo::Iface* lif = find_iface(net, lan_if);
+ 
+@@ -223,13 +224,14 @@ void dashboard_page(const Request& req, Response& res) {
+     h = R(std::move(h), "__RAM_PCT__", fmt_pct(pct));
+ 
+     // WAN card
+-    h = R(std::move(h), "__WAN__", E(wan.interface));
++    h = R(std::move(h), "__WAN__", E(sysinfo::wan_label(wan.interface, net)));
+     std::string wstate = (wif && wif->state == "up")
+         ? std::string("<span class=\"badge ok\">UP</span>")
+         : "<span class=\"badge err\">" + E((wif && !wif->state.empty()) ? wif->state : std::string("DOWN")) + "</span>";
+     h = R(std::move(h), "__WAN_STATE__", wstate);
+     h = R(std::move(h), "__WAN_ADDR__", (wif && !wif->addrs.empty()) ? join_esc(wif->addrs) : "(none)");
+-    h = R(std::move(h), "__WAN_GW__",   net.default_gateway.empty() ? "(none)" : E(net.default_gateway));
++    std::string wgw = sysinfo::wan_gateway(wan.interface, net);
++    h = R(std::move(h), "__WAN_GW__",   wgw.empty() ? "(none)" : E(wgw));
+     h = R(std::move(h), "__WAN_DNS__",  net.dns.empty() ? "(none)" : join_esc(net.dns));
+     {
+         std::string rx = (wif && !wif->rx.empty()) ? E(wif->rx) : "0";
+@@ -297,7 +299,7 @@ void dashboard_data(const Request& req, Response& res) {
+     sysinfo::Rnsd    rnsd = sysinfo::rnsd_status();
+     sysinfo::Network net  = sysinfo::network_summary();
+     store::WanConfig  wan  = store::read_wan();
+-    const sysinfo::Iface* wif = find_iface(net, wan.interface);
++    const sysinfo::Iface* wif = find_iface(net, sysinfo::wan_display_iface(wan.interface, net));
+     std::string lan_if = sysinfo::lan_iface();
+     const sysinfo::Iface* lif = find_iface(net, lan_if);
+ 
+@@ -318,10 +320,11 @@ void dashboard_data(const Request& req, Response& res) {
+     J += ",\"pid\":"    + (rnsd.pid.empty()  ? std::string("null") : rnsd.pid);
+     J += ",\"rss_mb\":" + (rnsd.rss_mb >= 0  ? std::to_string(rnsd.rss_mb) : std::string("null"));
+     J += "},";
++    J += "\"wan_label\":\"" + JE(sysinfo::wan_label(wan.interface, net)) + "\",";
+     J += "\"wan_if\":" + iface_json(wif) + ",";
+     J += "\"lan_if\":" + iface_json(lif) + ",";
+     J += "\"lan_ports\":" + ports_json(lan_ports(net, lan_if)) + ",";
+-    J += "\"gateway\":\"" + JE(net.default_gateway) + "\",";
++    J += "\"gateway\":\"" + JE(sysinfo::wan_gateway(wan.interface, net)) + "\",";
+     J += "\"dns\":" + str_array_json(net.dns) + ",";
+     J += "\"clock_source\":\"" + JE(sysinfo::clock_source()) + "\",";
+     updatecheck::State u = updatecheck::display();
+diff --git a/buildroot/package/rnsbox-portal/src/cgi/routes_net.cpp b/buildroot/package/rnsbox-portal/src/cgi/routes_net.cpp
+index f138c442f..f61994a34 100644
+--- a/buildroot/package/rnsbox-portal/src/cgi/routes_net.cpp
++++ b/buildroot/package/rnsbox-portal/src/cgi/routes_net.cpp
+@@ -29,7 +29,7 @@ void network_page(const Request& req, Response& res) {
+ 
+     std::string h = render::page_file("network");
+     h = R(std::move(h), "__BASE__", base);
+-    h = R(std::move(h), "__WAN__", E(w.interface));
++    h = R(std::move(h), "__WAN__", E(sysinfo::wan_label(w.interface, net)));
+     // The LAN iface nftables treats as the full-access management side
+     // (/run/lan-iface: br-lan, or usb0 if the bridge couldn't be made) and,
+     // for a bridge, its ports — usb0 always, the hotspot iface while it's up.
+@@ -38,7 +38,9 @@ void network_page(const Request& req, Response& res) {
+     for (const auto& p : sysinfo::bridge_ports(lan_if)) { if (!ports.empty()) ports += ", "; ports += E(p); }
+     if (!ports.empty()) lan += " (" + ports + ")";
+     h = R(std::move(h), "__LAN__", lan);
+-    h = R(std::move(h), "__GATEWAY__", net.default_gateway.empty() ? "(none)" : E(net.default_gateway));
++    std::string gw = sysinfo::wan_gateway(w.interface, net);
++    h = R(std::move(h), "__GATEWAY__", gw.empty() ? "(none)" : E(gw));
++    h = R(std::move(h), "__SEL_AUTO__",  w.interface == "auto"  ? "selected" : "");
+     h = R(std::move(h), "__SEL_ETH0__",  w.interface == "eth0"  ? "selected" : "");
+     h = R(std::move(h), "__SEL_WLAN0__", w.interface == "wlan0" ? "selected" : "");
+     bool is_static = (w.mode == "static");
+@@ -132,7 +134,7 @@ void network_page(const Request& req, Response& res) {
+ 
+ void wan_set(const Request& req, Response& res) {
+     if (!web::require_auth(req, res, false)) return;
+-    std::string iface = util::trim(req.f("wan")); if (iface.empty()) iface = "eth0";
++    std::string iface = util::trim(req.f("wan")); if (iface.empty()) iface = "auto";
+     std::string mode = util::trim(req.f("wan_mode")); if (mode != "static") mode = "dhcp";
+     if (iface == "wlan0" && !wifi::present()) {
+         render::redirect_flash(res, net_redirect(), "error", "No WiFi radio — wlan0 WAN needs the W variant.");
+@@ -154,14 +156,19 @@ void wan_set(const Request& req, Response& res) {
+     }
+     web::run_init("S30eth");
+     web::run_init("S60routing");
+-    if (iface == "wlan0")
++    if (iface == "auto")
+         render::redirect_flash(res, net_redirect(), "success",
+-            "WAN set to wlan0 (WiFi). Make sure WiFi is connected as a client (WiFi tab → mode sta or sta+ap).");
++            std::string("WAN set to automatic: eth0 while it has a cable and an address") +
++            (mode == "static" ? " (static " + c.address + "/" + c.prefix + ")" : "") +
++            (wifi::present() ? ", otherwise the WiFi client (WiFi tab → mode sta or sta+ap)." : "."));
++    else if (iface == "wlan0")
++        render::redirect_flash(res, net_redirect(), "success",
++            "WAN set to wlan0 (WiFi) only. Make sure WiFi is connected as a client (WiFi tab → mode sta or sta+ap).");
+     else if (mode == "static")
+         render::redirect_flash(res, net_redirect(), "success",
+-            "WAN set to eth0 static " + c.address + "/" + c.prefix + ".");
++            "WAN set to eth0 only, static " + c.address + "/" + c.prefix + ".");
+     else
+-        render::redirect_flash(res, net_redirect(), "success", "WAN set to eth0 (DHCP).");
++        render::redirect_flash(res, net_redirect(), "success", "WAN set to eth0 only (DHCP).");
+ }
+ 
+ void pf_add(const Request& req, Response& res) {
+diff --git a/buildroot/package/rnsbox-portal/src/cgi/routes_settings.cpp b/buildroot/package/rnsbox-portal/src/cgi/routes_settings.cpp
+index c9fe7262e..b203cabdf 100644
+--- a/buildroot/package/rnsbox-portal/src/cgi/routes_settings.cpp
++++ b/buildroot/package/rnsbox-portal/src/cgi/routes_settings.cpp
+@@ -82,7 +82,7 @@ void settings_page(const Request& req, Response& res) {
+     std::string base = web::base();
+ 
+     std::string host = sysinfo::hostname();
+-    std::string wan  = store::read_wan().interface;
++    std::string wan  = sysinfo::wan_label(store::read_wan().interface, sysinfo::network_summary());
+ 
+     std::vector<std::string> ntp = store::read_ntp_servers();
+     std::string ntp_joined;
+diff --git a/buildroot/package/rnsbox-portal/src/cgi/routes_wifi.cpp b/buildroot/package/rnsbox-portal/src/cgi/routes_wifi.cpp
+index 6e38e3325..8903ac7f8 100644
+--- a/buildroot/package/rnsbox-portal/src/cgi/routes_wifi.cpp
++++ b/buildroot/package/rnsbox-portal/src/cgi/routes_wifi.cpp
+@@ -2,6 +2,7 @@
+ #include "routes.h"
+ #include "render.h"
+ #include "web.h"
++#include "store.h"
+ #include "wifi.h"
+ #include "util.h"
+ #include <cctype>
+@@ -208,6 +209,15 @@ static std::string ap_psk_problem(const std::string& psk) {
+     return "";
+ }
+ 
++// Appended to a flash that turns the WiFi client on: with the WAN pinned to
++// eth0 (Network tab) the box itself may use the WiFi uplink, but the LAN and
++// hotspot get no internet through it (no NAT there). "" otherwise.
++static std::string wan_note() {
++    if (store::read_wan().interface != "eth0") return "";
++    return " Note: the WAN is set to eth0 only, so the LAN and hotspot won't get internet over WiFi"
++           " — choose Automatic (or wlan0) under Network → WAN uplink.";
++}
++
+ void wifi_connect(const Request& req, Response& res) {
+     if (!web::require_auth(req, res, false)) return;
+     std::string ssid = util::trim(req.f("ssid"));
+@@ -238,11 +248,13 @@ void wifi_connect(const Request& req, Response& res) {
+     wifi::apply();
+     // Joining still works with a weak stored hotspot PSK — S35wifi just keeps
+     // the AP off (and logs why). Say so instead of a silent missing hotspot.
++    std::string note = wan_note();
+     if (mode == "sta+ap" && !wifi::ap_psk_ok(cur["ap_psk"]))
+         render::redirect_flash(res, wifi_redirect(), "warn",
+-            "Connecting to '" + ssid + "'… The hotspot stays off until you set a hotspot password (8-63 characters) below.");
++            "Connecting to '" + ssid + "'… The hotspot stays off until you set a hotspot password (8-63 characters) below." + note);
+     else
+-        render::redirect_flash(res, wifi_redirect(), "success", "Connecting to '" + ssid + "'…");
++        render::redirect_flash(res, wifi_redirect(), note.empty() ? "success" : "warn",
++            "Connecting to '" + ssid + "'…" + note);
+ }
+ 
+ void wifi_ap(const Request& req, Response& res) {
+@@ -324,7 +336,9 @@ void wifi_mode(const Request& req, Response& res) {
+         return;
+     }
+     wifi::apply();
+-    render::redirect_flash(res, wifi_redirect(), "success", "WiFi mode set to " + mode);
++    std::string note = (mode == "sta" || mode == "sta+ap") ? wan_note() : std::string();
++    render::redirect_flash(res, wifi_redirect(), note.empty() ? "success" : "warn",
++                           "WiFi mode set to " + mode + "." + note);
+ }
+ 
+ void wifi_txpower(const Request& req, Response& res) {
+diff --git a/buildroot/package/rnsbox-portal/src/cgi/store.cpp b/buildroot/package/rnsbox-portal/src/cgi/store.cpp
+index 58b1eb932..ccb651474 100644
+--- a/buildroot/package/rnsbox-portal/src/cgi/store.cpp
++++ b/buildroot/package/rnsbox-portal/src/cgi/store.cpp
+@@ -223,14 +223,15 @@ WanConfig read_wan() {
+             c.interface = s;   // legacy single-line
+         }
+     }
+-    if (c.interface != "eth0" && c.interface != "wlan0") c.interface = "eth0";
++    // Same rule as S30eth wan_iface / S60routing read_wan: unknown -> auto.
++    if (c.interface != "auto" && c.interface != "eth0" && c.interface != "wlan0") c.interface = "auto";
+     if (c.mode != "dhcp" && c.mode != "static") c.mode = "dhcp";
+     return c;
+ }
+ 
+ bool write_wan(const WanConfig& in, std::string& err) {
+     WanConfig cfg = in;
+-    if (cfg.interface != "eth0" && cfg.interface != "wlan0") { err = "WAN interface must be eth0 or wlan0"; return false; }
++    if (cfg.interface != "auto" && cfg.interface != "eth0" && cfg.interface != "wlan0") { err = "WAN interface must be auto, eth0 or wlan0"; return false; }
+     if (cfg.mode != "dhcp" && cfg.mode != "static") { err = "WAN mode must be dhcp or static"; return false; }
+     if (cfg.mode == "static") {
+         if (!conf_value_ok(cfg.address) || !conf_value_ok(cfg.prefix) ||
+@@ -252,7 +253,9 @@ bool write_wan(const WanConfig& in, std::string& err) {
+     }
+     std::string o =
+         "# WAN uplink config — managed by the rnsbox-portal Network tab.\n"
+-        "# interface: eth0 (wired RJ45) or wlan0 (WiFi client, requires STA mode).\n"
++        "# interface: auto (eth0 while it has a cable and an address, else the\n"
++        "#            wlan0 WiFi client), eth0 (wired RJ45 only) or wlan0 (WiFi\n"
++        "#            client only, requires STA mode). Never changed by the box.\n"
+         "# mode:      dhcp (lease from upstream) or static.\n"
+         "# Static mode (applied to eth0 by S30eth): address/prefix/gateway/dns.\n";
+     o += "interface=" + cfg.interface + "\n";
+diff --git a/buildroot/package/rnsbox-portal/src/cgi/store.h b/buildroot/package/rnsbox-portal/src/cgi/store.h
+index c3aa335f8..605fdf800 100644
+--- a/buildroot/package/rnsbox-portal/src/cgi/store.h
++++ b/buildroot/package/rnsbox-portal/src/cgi/store.h
+@@ -31,7 +31,7 @@ struct OpenPort {
+ };
+ 
+ struct WanConfig {
+-    std::string interface = "eth0";   // eth0 | wlan0
++    std::string interface = "auto";   // auto (eth0 + wlan0, kernel picks by metric) | eth0 | wlan0
+     std::string mode = "dhcp";        // dhcp | static
+     std::string address, prefix, gateway, dns;
+ };
+diff --git a/buildroot/package/rnsbox-portal/src/cgi/sysinfo.cpp b/buildroot/package/rnsbox-portal/src/cgi/sysinfo.cpp
+index 1568afe14..5ca65452e 100644
+--- a/buildroot/package/rnsbox-portal/src/cgi/sysinfo.cpp
++++ b/buildroot/package/rnsbox-portal/src/cgi/sysinfo.cpp
+@@ -2,12 +2,14 @@
+ #include "sysinfo.h"
+ #include "util.h"
+ #include <algorithm>
++#include <map>
+ #include <cctype>
+ #include <cerrno>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+ #include <ctime>
++#include <arpa/inet.h>
+ #include <dirent.h>
+ #include <fcntl.h>
+ #include <sys/stat.h>
+@@ -225,10 +227,43 @@ Network network_summary() {
+         i.master = bridge_of(dev);                // usb0 / wlan1 -> br-lan
+         net.ifaces.push_back(std::move(i));
+     }
+-    // default gateway
+-    for (const auto& ln : split_lines(run_ip({"-4", "route", "show", "default"}))) {
+-        auto p = split_ws(ln);
+-        if (p.size() >= 5 && p[0] == "default") { net.default_gateway = p[2]; break; }
++    // The default route in use: the lowest-metric IPv4 default route of the
++    // main table whose iface has carrier. An unplugged eth0 keeps its lease's
++    // route, which the kernel skips (S30eth: ignore_routes_with_linkdown), so
++    // with WAN=auto the WiFi client's route is the live one. /proc/net/route
++    // prints each __be32 as a host-order integer: read back into s_addr it is
++    // the address again, on any endianness.
++    // gateway_of keeps each iface's own (lowest-metric) default gateway, so a
++    // pinned WAN card shows its iface's gateway even while another is in use.
++    {
++        long best = -1;
++        std::map<std::string, long> dev_best;
++        bool first = true;
++        for (const auto& ln : split_lines(slurp("/proc/net/route"))) {
++            auto p = split_ws(ln);
++            if (first) { first = false; continue; }   // header
++            if (p.size() < 8 || p[1] != "00000000" || p[7] != "00000000") continue;
++            unsigned long flags = strtoul(p[3].c_str(), nullptr, 16);
++            if (!(flags & 0x1) || !ifname_ok(p[0])) continue;   // RTF_UP
++            long metric = strtol(p[6].c_str(), nullptr, 10);
++            std::string gw;
++            if (flags & 0x2) {                                  // RTF_GATEWAY
++                struct in_addr a;
++                a.s_addr = (in_addr_t)strtoul(p[2].c_str(), nullptr, 16);
++                char buf[INET_ADDRSTRLEN];
++                if (inet_ntop(AF_INET, &a, buf, sizeof buf)) gw = buf;
++            }
++            auto it = dev_best.find(p[0]);
++            if (it == dev_best.end() || metric < it->second) {
++                dev_best[p[0]] = metric;
++                net.gateway_of[p[0]] = gw;
++            }
++            if (slurp_trim("/sys/class/net/" + p[0] + "/carrier") != "1") continue;
++            if (best >= 0 && metric >= best) continue;
++            best = metric;
++            net.default_dev = p[0];
++            net.default_gateway = gw;
++        }
+     }
+     // dns
+     for (const auto& ln : split_lines(slurp("/etc/resolv.conf"))) {
+@@ -241,6 +276,24 @@ Network network_summary() {
+     return net;
+ }
+ 
++std::string wan_display_iface(const std::string& wan_setting, const Network& net) {
++    if (wan_setting != "auto") return wan_setting;
++    if (net.default_dev == "eth0" || net.default_dev == "wlan0") return net.default_dev;
++    return "eth0";
++}
++
++std::string wan_gateway(const std::string& wan_setting, const Network& net) {
++    if (wan_setting == "auto") return net.default_gateway;
++    auto it = net.gateway_of.find(wan_setting);
++    return it == net.gateway_of.end() ? std::string() : it->second;
++}
++
++std::string wan_label(const std::string& wan_setting, const Network& net) {
++    if (wan_setting != "auto") return wan_setting;
++    if (net.default_dev == "eth0" || net.default_dev == "wlan0") return "auto → " + net.default_dev;
++    return "auto (no uplink)";
++}
++
+ static std::string find_rnsd_pid() {
+     // 1. pidfile (authoritative — S82rnsd writes /var/run/rnsd.pid). Digits
+     // only: the pid is emitted raw into JSON ("pid":N) and a /proc path, so a
+diff --git a/buildroot/package/rnsbox-portal/src/cgi/sysinfo.h b/buildroot/package/rnsbox-portal/src/cgi/sysinfo.h
+index 1cc7a6eb7..957166167 100644
+--- a/buildroot/package/rnsbox-portal/src/cgi/sysinfo.h
++++ b/buildroot/package/rnsbox-portal/src/cgi/sysinfo.h
+@@ -5,6 +5,7 @@
+ #ifndef RNSBOX_SYSINFO_H
+ #define RNSBOX_SYSINFO_H
+ 
++#include <map>
+ #include <string>
+ #include <vector>
+ 
+@@ -33,11 +34,26 @@ struct Iface {
+ };
+ struct Network {
+     std::vector<Iface> ifaces;        // sorted, lo excluded
+-    std::string default_gateway;
++    std::string default_gateway;      // of the default route in use ("" = none / no gateway)
++    std::string default_dev;          // its iface, e.g. "wlan0" ("" = no usable default route)
++    std::map<std::string, std::string> gateway_of;   // iface -> its own default gateway, carrier or not
+     std::vector<std::string> dns;
+ };
+ Network network_summary();
+ 
++// The iface the WAN card/labels describe for wan.conf's interface= value:
++// eth0 / wlan0 as set; for "auto" the iface of the default route in use if it
++// is one of the two, else eth0 (nothing is up: show the wired port's state).
++std::string wan_display_iface(const std::string& wan_setting, const Network& net);
++
++// The gateway to show for the WAN setting: the one in use for "auto", else
++// the pinned iface's own default gateway ("" = none).
++std::string wan_gateway(const std::string& wan_setting, const Network& net);
++
++// Human label for the WAN setting: "eth0", "wlan0", "auto → wlan0",
++// "auto (no uplink)". Plain text (the caller escapes).
++std::string wan_label(const std::string& wan_setting, const Network& net);
++
+ struct Rnsd {
+     bool running = false;
+     std::string pid;          // empty when not running
+-- 
+2.47.3
+

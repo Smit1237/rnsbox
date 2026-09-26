@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: smit1237 <smit1237@gmail.com>
 Date: Wed, 9 Sep 2026 18:06:39 +0300
-Subject: [PATCH 21/23] =?UTF-8?q?portal:=20Time=20&=20Clock=20settings=20?=
+Subject: [PATCH 21/30] =?UTF-8?q?portal:=20Time=20&=20Clock=20settings=20?=
  =?UTF-8?q?=E2=80=94=20sync=20clock=20to=20browser=20+=20NTP=20servers?=
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -24,18 +24,18 @@ All three routes are login-gated; the epoch is int-validated (incl.
 OverflowError for 'inf') before use, and NTP server names are character-
 validated before they reach the config file.
 ---
- .../rnsbox-portal/src/cgi/pages/settings.html |  82 ++++++++++
- .../rnsbox-portal/src/cgi/routes_settings.cpp | 149 ++++++++++++++++++
- 2 files changed, 231 insertions(+)
+ .../rnsbox-portal/src/cgi/pages/settings.html |  83 ++++++++
+ .../rnsbox-portal/src/cgi/routes_settings.cpp | 201 ++++++++++++++++++
+ 2 files changed, 284 insertions(+)
  create mode 100644 buildroot/package/rnsbox-portal/src/cgi/pages/settings.html
  create mode 100644 buildroot/package/rnsbox-portal/src/cgi/routes_settings.cpp
 
 diff --git a/buildroot/package/rnsbox-portal/src/cgi/pages/settings.html b/buildroot/package/rnsbox-portal/src/cgi/pages/settings.html
 new file mode 100644
-index 000000000..951114e03
+index 000000000..92403c8e4
 --- /dev/null
 +++ b/buildroot/package/rnsbox-portal/src/cgi/pages/settings.html
-@@ -0,0 +1,82 @@
+@@ -0,0 +1,83 @@
 +<h2>Settings</h2>
 +
 +<section class="card">
@@ -50,7 +50,8 @@ index 000000000..951114e03
 +  <h4>Sync to browser</h4>
 +  <p class="muted">The board has no real-time clock, so it boots at 1970. Set the
 +  clock to this device's time — the quickest way to get a correct clock on a box
-+  with no internet. rnsd picks up the new time on its own.</p>
++  with no internet. Setting it also starts rnsd (and nomadnet/lxmd if enabled),
++  which wait for a valid clock.</p>
 +  <p>This browser reads <strong id="browser-time">…</strong> UTC</p>
 +  <form method="post" action="__BASE__/settings/time/browser"
 +        onsubmit="this.epoch.value = Math.floor(Date.now()/1000)">
@@ -120,10 +121,10 @@ index 000000000..951114e03
 +</section>
 diff --git a/buildroot/package/rnsbox-portal/src/cgi/routes_settings.cpp b/buildroot/package/rnsbox-portal/src/cgi/routes_settings.cpp
 new file mode 100644
-index 000000000..bd70158f5
+index 000000000..7a2c4d3de
 --- /dev/null
 +++ b/buildroot/package/rnsbox-portal/src/cgi/routes_settings.cpp
-@@ -0,0 +1,149 @@
+@@ -0,0 +1,201 @@
 +// routes_settings.cpp — Settings tab: server-rendered page + POST-redirect-GET forms.
 +// Time/clock, NTP, admin password, hostname. Ported from the old Flask settings*
 +// routes (app.py) — matches their field names, validation order, and flash text.
@@ -205,6 +206,8 @@ index 000000000..bd70158f5
 +void hostname_set(const Request& req, Response& res) {
 +    if (!web::require_auth(req, res, false)) return;
 +    std::string h = util::trim(req.f("hostname"));
++    // Strict charset (alnum, '-', '_') — this also rejects CR/LF/control chars
++    // before anything reaches /etc/hostname.
 +    bool ok = !h.empty() && h.size() <= 63 && h[0] != '-';
 +    for (char c : h) if (!(isalnum((unsigned char)c) || c == '-' || c == '_')) ok = false;
 +    if (!ok) {
@@ -213,6 +216,36 @@ index 000000000..bd70158f5
 +    }
 +    util::write_file_atomic("/etc/hostname", h + "\n", 0644);
 +    util::run({"/bin/hostname", h}, "", 5);
++    // 127.0.1.1 -> the new name, so dnsmasq and local lookups resolve it
++    // (buildroot generates that line from the build-time hostname). Left
++    // alone if it can't be read: rewriting from nothing would drop localhost.
++    std::string hosts = util::read_file("/etc/hosts");
++    if (!hosts.empty()) {
++        std::string o;
++        bool done = false;
++        size_t i = 0;
++        while (i < hosts.size()) {
++            size_t e = hosts.find('\n', i);
++            if (e == std::string::npos) e = hosts.size();
++            std::string ln = hosts.substr(i, e - i);
++            if (!done && ln.compare(0, 9, "127.0.1.1") == 0 && (ln.size() == 9 || isspace((unsigned char)ln[9]))) {
++                ln = "127.0.1.1\t" + h;
++                done = true;
++            }
++            o += ln + "\n";
++            i = e + 1;
++        }
++        if (!done) o += "127.0.1.1\t" + h + "\n";
++        util::write_file_atomic("/etc/hosts", o, 0644);
++    }
++    // S10uuid applies /boot/hostname (sd_gen ships "rnsbox") at every boot, so
++    // without this the reboot would put the old name back.
++    if (!util::write_file_atomic("/boot/hostname", h + "\n", 0644)) {
++        render::redirect_flash(res, settings_redirect(), "error",
++            "Hostname changed to '" + h + "' for now, but /boot/hostname could not be written: "
++            "it reverts at the next reboot.");
++        return;
++    }
 +    render::redirect_flash(res, settings_redirect(), "success",
 +        "Hostname changed to '" + h + "'. Reboot to apply everywhere.");
 +}
@@ -220,6 +253,16 @@ index 000000000..bd70158f5
 +void ntp_set(const Request& req, Response& res) {
 +    if (!web::require_auth(req, res, false)) return;
 +    std::string raw = req.f("servers");
++    // One server per line is the textarea's format, so CR/LF/TAB are just
++    // separators here; any OTHER control char means garbage — refuse the lot
++    // (nothing written) rather than silently dropping pieces of it.
++    for (unsigned char c : raw) {
++        if ((c < 0x20 && c != '\r' && c != '\n' && c != '\t') || c == 0x7f) {
++            render::redirect_flash(res, settings_redirect(), "error",
++                "NTP servers must not contain control characters; nothing was saved.");
++            return;
++        }
++    }
 +    for (auto& c : raw) if (c == ',') c = ' ';
 +    std::vector<std::string> servers;
 +    size_t i = 0;
@@ -267,9 +310,19 @@ index 000000000..bd70158f5
 +    time_t e = (time_t)epoch;
 +    char stamp[40]; struct tm tmv; gmtime_r(&e, &tmv);
 +    strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &tmv);
-+    util::run({"/bin/date", "-s", "@" + std::to_string(epoch)}, "", 5);
++    if (util::run({"/bin/date", "-s", "@" + std::to_string(epoch)}, "", 5).exit_code != 0) {
++        render::redirect_flash(res, settings_redirect(), "error", "Could not set the clock; nothing changed.");
++        return;
++    }
++    // S45ntpsync is the only other writer of this flag and it needs a default
++    // route, so without this an off-grid box (USB LAN + SLIP modem, no WAN)
++    // never starts rnsd/lxmd/nomadnet. The browser time was range-checked above.
++    util::write_file_atomic("/run/clock-synced", "", 0644);
++    web::run_init("S82rnsd", "kick");   // honours an explicit stop; no-op if running
++    web::run_init("S83nomadnet", "start");
++    web::run_init("S85lxmd", "start");
 +    render::redirect_flash(res, settings_redirect(), "success",
-+        "Clock set to " + std::string(stamp) + " UTC (from your browser). rnsd picks up the new time on its own.");
++        "Clock set to " + std::string(stamp) + " UTC (from your browser); time-gated services started.");
 +}
 +
 +}  // namespace routes

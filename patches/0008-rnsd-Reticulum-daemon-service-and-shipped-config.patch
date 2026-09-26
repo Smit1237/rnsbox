@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: smit1237 <smit1237@gmail.com>
 Date: Tue, 8 Sep 2026 22:47:48 +0300
-Subject: [PATCH 08/23] rnsd: Reticulum daemon service and shipped config
+Subject: [PATCH 08/30] rnsd: Reticulum daemon service and shipped config
 
 S82rnsd runs rnsd once the clock is synced; S81router runs the admin portal.
 Ship an opinionated /etc/reticulum/config: transport enabled, a shared
@@ -9,10 +9,10 @@ instance, an AutoInterface on usb0, a TCPServerInterface on 0.0.0.0:4242, and
 two public RNS-testnet TCP uplinks so the node joins the testnet with no
 manual peer configuration.
 ---
- .../SG200X/overlay/etc/init.d/S81router       | 60 ++++++++++++++
- .../cvitek/SG200X/overlay/etc/init.d/S82rnsd  | 82 +++++++++++++++++++
- .../SG200X/overlay/etc/reticulum/config       | 66 +++++++++++++++
- 3 files changed, 208 insertions(+)
+ .../SG200X/overlay/etc/init.d/S81router       |  60 ++++
+ .../cvitek/SG200X/overlay/etc/init.d/S82rnsd  | 277 ++++++++++++++++++
+ .../SG200X/overlay/etc/reticulum/config       |  73 +++++
+ 3 files changed, 410 insertions(+)
  create mode 100755 buildroot/board/cvitek/SG200X/overlay/etc/init.d/S81router
  create mode 100755 buildroot/board/cvitek/SG200X/overlay/etc/init.d/S82rnsd
  create mode 100644 buildroot/board/cvitek/SG200X/overlay/etc/reticulum/config
@@ -85,10 +85,10 @@ index 000000000..16a86094d
 +esac
 diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S82rnsd b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S82rnsd
 new file mode 100755
-index 000000000..a68497ae1
+index 000000000..30b792b4f
 --- /dev/null
 +++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S82rnsd
-@@ -0,0 +1,82 @@
+@@ -0,0 +1,277 @@
 +#!/bin/sh
 +# S82rnsd — Reticulum Network Stack daemon.
 +#
@@ -108,20 +108,132 @@ index 000000000..a68497ae1
 +# AutoInterface on usb0). The nftables INPUT chain in S60routing only
 +# accepts inbound :4242 on WAN if the user added it to
 +# /etc/rnsbox/openports.conf via the portal.
++#
++# Logging: rnsd prints its log to stdout, and Python block-buffers a
++# redirected stdout — a quiet rnsd never filled the buffer, so the old
++# /var/log/rnsd.log stayed empty. rnsd now runs unbuffered and its output
++# goes to syslog via logger: /var/log/messages, tag "rnsd[<pid>]", rotated
++# by syslogd so it stays bounded in RAM. The pipe goes through a FIFO rather
++# than `rnsd | logger &` so that $! — and so /var/run/rnsd.pid, which the
++# portal and S46wanwatch read — is the rnsd process itself, not logger.
++#
++# Secrets: rnsd keeps its transport identity (a private key) under
++# /etc/reticulum/storage. It runs with umask 077, and start() tightens any
++# file an older build left group/world-readable (plus the config dir itself,
++# since the config can hold IFAC passphrases) on every start, even one that
++# refuses on an unsynced clock — the full storage walk once per boot, a
++# top-level check after that; the portal writes the config 0600. Everything
++# that reads them — rnsd, rnstatus, lxmd, nomadnet, the portal (uhttpd) —
++# runs as root.
 +
 +NAME=rnsd
 +DAEMON=/usr/bin/rnsd
 +PIDFILE=/var/run/$NAME.pid
-+LOG=/var/log/$NAME.log
++LOGPIPE=/var/run/$NAME.logpipe
 +CFG_DIR=/etc/reticulum
++# Present while the running rnsd was started before usb0 had its IPv6
++# link-local address (see usb0_ll); S46wanwatch tests it too.
++LL_MARK=/run/rnsd-usb0-no-ll
++# Present after an explicit `S82rnsd stop` (rcK at shutdown, or the operator)
++# until the next explicit start/restart. S46wanwatch and S84cron use
++# `kick`/`kick-restart`, which check it under the lock and never clear it, so
++# they don't resurrect rnsd while it exists.
++STOPPED_MARK=/run/rnsd.stopped
++# Present once this boot's full permission walk over storage/ succeeded.
++PERMS_MARK=/run/rnsd-perms-done
 +
 +[ -x "$DAEMON" ] || exit 0
 +
-+start() {
-+	mkdir -p /var/log /var/run "$CFG_DIR"
++# is_rnsd PID — true if PID is the rnsd daemon. rnsd is a python
++# console-script and the kernel names a script process after the script file,
++# so its comm is "rnsd" (argv: "/usr/bin/python /usr/bin/rnsd --config ...").
++# If it was started through the interpreter instead (comm python*), look at
++# argv[0]/argv[1]. A recycled pid, this script ("S82rnsd") or logger's
++# "rnsd[<pid>]" tag never match.
++is_rnsd() {
++	comm=
++	{ read -r comm <"/proc/$1/comm"; } 2>/dev/null
++	case "$comm" in
++		rnsd)    return 0 ;;
++		python*) tr '\0' '\n' <"/proc/$1/cmdline" 2>/dev/null | head -n 2 \
++		           | grep -qE '(^|/)rnsd$' ;;
++		*)       return 1 ;;
++	esac
++}
 +
-+	if [ -f "$PIDFILE" ] && kill -0 "$(cat $PIDFILE)" 2>/dev/null; then
-+		echo "S82rnsd: already running (pid $(cat $PIDFILE))"
++# rnsd_pid — print the running rnsd's pid: the pidfile if it still names
++# rnsd, else a /proc scan, so a lost or stale pidfile can't lead to a second
++# rnsd being started (or to stop missing the live one).
++rnsd_pid() {
++	p=
++	{ read -r p <"$PIDFILE"; } 2>/dev/null
++	case "$p" in
++		''|*[!0-9]*) ;;
++		*) is_rnsd "$p" && { echo "$p"; return 0; } ;;
++	esac
++	for d in /proc/[0-9]*; do
++		p=${d#/proc/}
++		is_rnsd "$p" && { echo "$p"; return 0; }
++	done
++	return 1
++}
++
++# usb0_ll — true once usb0 has a usable IPv6 link-local address (scope 0x20,
++# DAD done: neither tentative 0x40 nor dadfailed 0x08), read from
++# /proc/net/if_inet6 with builtins only. Same test as S46wanwatch.
++usb0_ll() {
++	[ -r /proc/net/if_inet6 ] || return 1
++	while read -r _addr _idx _plen scope flags dev; do
++		[ "$dev" = usb0 ] && [ "$scope" = 20 ] || continue
++		case "$flags" in [0-9a-f][0-9a-f]) ;; *) continue ;; esac
++		[ $((0x$flags & 0x48)) -eq 0 ] && return 0
++	done </proc/net/if_inet6
++	return 1
++}
++
++# auto_wants_usb0 — true if $CFG_DIR/config has an AutoInterface that would
++# adopt usb0: a [[...]] stanza with type = AutoInterface, enabled (or
++# interface_enabled) true (RNS starts an interface only then; either one
++# suffices), and no devices list (all ifaces) or one that names usb0. Without
++# this, a disabled or re-pointed AutoInterface would still leave $LL_MARK and
++# S46wanwatch would bounce rnsd for nothing when a USB host attaches.
++auto_wants_usb0() {
++	awk '
++	function chk() { if (t == "autointerface" && e && (d == "" || d ~ /(^|[[:space:],])usb0([[:space:],]|$)/)) hit = 1 }
++	/^[[:space:]]*\[/ { chk(); t = ""; e = 0; d = ""; next }
++	{ l = tolower($0); sub(/#.*/, "", l); gsub(/"/, "", l) }
++	l ~ /^[[:space:]]*type[[:space:]]*=/ { sub(/^[^=]*=[[:space:]]*/, "", l); gsub(/[[:space:]]/, "", l); t = l; next }
++	l ~ /^[[:space:]]*(interface_)?enabled[[:space:]]*=/ { if (l ~ /=[[:space:]]*(yes|true|on|1)[[:space:]]*$/) e = 1; next }
++	l ~ /^[[:space:]]*devices[[:space:]]*=/ { sub(/^[^=]*=[[:space:]]*/, "", l); d = l }
++	END { chk(); exit !hit }' "$CFG_DIR/config" 2>/dev/null
++}
++
++start() {
++	mkdir -p /var/run "$CFG_DIR"
++
++	# Tighten what an older build (umask 022) or the 0755 overlay left
++	# readable - before the clock gate, so an unsynced box is covered too.
++	# `find -perm` only touches files that still need it, so a normal boot
++	# writes nothing to the SD card; `! -type l` so chmod never follows a
++	# symlink out. The recursive walk over storage/ (thousands of
++	# announce-cache files on the SD card: seconds on the C906, on a restart
++	# already close to the portal's 25 s limit) runs once per boot; later
++	# starts check only storage/ and its top level (transport_identity lives
++	# there). Anything created since is rnsd's own, under umask 077, and the
++	# config dir itself is 0700 either way.
++	find "$CFG_DIR" -maxdepth 0 -perm /077 -exec chmod go-rwx {} + 2>/dev/null
++	if [ -d "$CFG_DIR/storage" ]; then
++		if [ -f "$PERMS_MARK" ]; then
++			find "$CFG_DIR/storage" -maxdepth 1 ! -type l -perm /077 -exec chmod go-rwx {} + 2>/dev/null
++		else
++			find "$CFG_DIR/storage" ! -type l -perm /077 -exec chmod go-rwx {} + 2>/dev/null \
++				&& : > "$PERMS_MARK"
++		fi
++	fi
++
++	if PID=$(rnsd_pid); then
++		echo "$PID" > "$PIDFILE"   # re-adopt if the pidfile was lost/stale
++		echo "S82rnsd: already running (pid $PID)"
 +		return 0
 +	fi
 +
@@ -132,18 +244,43 @@ index 000000000..a68497ae1
 +		return 1
 +	fi
 +
++	# RNS's AutoInterface adopts an iface only if it already has its IPv6
++	# link-local when rnsd starts, and usb0 only gets one once a USB host has
++	# brought the link up. If that hasn't happened yet (host slow to bind the
++	# NCM driver, or the box powered separately) and an enabled AutoInterface
++	# covers usb0, leave a marker: S46wanwatch restarts rnsd once when the
++	# address appears.
++	if [ -r /proc/net/if_inet6 ] && ! usb0_ll && auto_wants_usb0; then
++		: > "$LL_MARK"
++	else
++		rm -f "$LL_MARK"
++	fi
++
 +	printf "Starting %s: " "$NAME"
 +	# --config points at our config dir; rnsd auto-creates files inside.
-+	# -s detaches to its own process group; we still pidfile-track so
-+	# the watchdog (S46wanwatch) can detect it cleanly.
-+	"$DAEMON" --config "$CFG_DIR" >>"$LOG" 2>&1 &
-+	PID=$!
++	# The subshell sets umask 077 + PYTHONUNBUFFERED for rnsd only and exec's
++	# it, so $! is rnsd's pid. Its open of the FIFO completes once logger opens
++	# the read end.
++	rm -f "$LOGPIPE"
++	if command -v logger >/dev/null 2>&1 && mkfifo -m 600 "$LOGPIPE" 2>/dev/null; then
++		(
++			umask 077
++			export PYTHONUNBUFFERED=1
++			exec "$DAEMON" --config "$CFG_DIR"
++		) 9>&- >"$LOGPIPE" 2>&1 &
++		PID=$!
++		logger -t "$NAME[$PID]" -p daemon.notice 9>&- <"$LOGPIPE" &
++	else
++		# no logger/FIFO: run unlogged rather than not at all
++		( umask 077; exec "$DAEMON" --config "$CFG_DIR" ) 9>&- >/dev/null 2>&1 &
++		PID=$!
++	fi
 +	echo "$PID" > "$PIDFILE"
 +	sleep 0.3
 +	if kill -0 "$PID" 2>/dev/null; then
 +		echo "OK (pid $PID)"
 +	else
-+		echo "FAIL (see $LOG)"
++		echo "FAIL (see /var/log/messages)"
 +		rm -f "$PIDFILE"
 +		return 1
 +	fi
@@ -151,32 +288,90 @@ index 000000000..a68497ae1
 +
 +stop() {
 +	printf "Stopping %s: " "$NAME"
-+	if [ -f "$PIDFILE" ]; then
-+		kill "$(cat $PIDFILE)" 2>/dev/null
-+		# Reticulum drains active links cleanly on SIGTERM; give it a moment.
-+		for _ in 1 2 3 4 5; do
-+			[ -f "$PIDFILE" ] && kill -0 "$(cat $PIDFILE)" 2>/dev/null || break
-+			sleep 1
++	rm -f "$LL_MARK"
++	if PID=$(rnsd_pid); then
++		kill "$PID" 2>/dev/null
++		# Reticulum drains active links on SIGTERM and then persists its path
++		# table, packet hashlist and known destinations. That is pure Python and
++		# takes several seconds on the C906 once the caches are large. Wait
++		# until the pid is really gone: if stop returned while rnsd was still
++		# exiting, restart's start() would find it (comm is still "rnsd"),
++		# adopt it, and leave nothing running once it exits. 18 s plus the
++		# SIGKILL fallback keeps one restart at ~21 s on its own, inside the
++		# 25 s web::run_init allows; updatecheck.py allows RESTART_TIMEOUT
++		# (50 s) because the lock below can queue it, for up to 25 s, behind
++		# another S82rnsd operation. (A SIGKILL mid-persist can only truncate
++		# destination_table/tunnels/packet_hashlist.raw, which RNS discards on
++		# load and rebuilds; known_destinations is replaced atomically.)
++		# (logger exits by itself when rnsd's end of the FIFO closes.)
++		i=0
++		while kill -0 "$PID" 2>/dev/null && [ "$i" -lt 18 ]; do
++			sleep 1; i=$((i + 1))
 +		done
++		if kill -0 "$PID" 2>/dev/null && is_rnsd "$PID"; then
++			kill -9 "$PID" 2>/dev/null
++			sleep 1
++		fi
 +		rm -f "$PIDFILE"
 +		echo "OK"
 +	else
++		rm -f "$PIDFILE"
 +		echo "(not running)"
 +	fi
 +}
 +
++# Serialize start/stop/restart on one lock. S46wanwatch runs `kick` whenever
++# its 10 s tick finds no rnsd, and that includes the gap inside a `restart`
++# (portal, cron, update apply) and rcS's own boot-time start. Two unserialized
++# starts both pass rnsd_pid before either exec's rnsd, leaving two rnsd (the
++# second a shared-instance client with no interfaces). The lock is held on
++# fd 9 for this invocation; the spawn lines close it (9>&-, first, so it is
++# gone before the FIFO open can block) so a long-lived rnsd or logger can't
++# pin it and deadlock the next call. Same pattern as S35wifi.
++# The wait is bounded, so a wedged holder can't stall every later call (rcS's
++# boot-time start included): past the cap we log and exit 1 without doing
++# anything. kick/kick-restart (S46wanwatch's tick, cron) just come back later,
++# so they give up after 5 s; start/stop/restart wait out one full restart
++# (~21 s, see stop()) and give up after 25 s. `flock -n` in a loop, not -w:
++# busybox flock has no -w.
 +case "${1:-start}" in
-+	start)   start ;;
-+	stop)    stop ;;
-+	restart) stop; sleep 1; start ;;
-+	*) echo "Usage: $0 {start|stop|restart}" >&2; exit 1 ;;
++	kick|kick-restart) LOCK_WAIT=5 ;;
++	*)                 LOCK_WAIT=25 ;;
++esac
++exec 9>/run/rnsd.lock
++if command -v flock >/dev/null 2>&1; then
++	i=0
++	until flock -n 9 2>/dev/null; do
++		if [ "$i" -ge "$LOCK_WAIT" ]; then
++			msg="${1:-start}: /run/rnsd.lock still held after ${LOCK_WAIT}s - not done"
++			echo "S82rnsd: $msg" >&2
++			logger -t S82rnsd -p daemon.warning "$msg" 2>/dev/null
++			exit 1
++		fi
++		sleep 1; i=$((i + 1))
++	done
++fi
++
++case "${1:-start}" in
++	# An explicit start (incl. rcS's boot-time one that refuses on an unsynced
++	# clock) or restart re-arms S46wanwatch step 2.
++	start)   rm -f "$STOPPED_MARK"; start ;;
++	# $STOPPED_MARK first, so S46wanwatch holds off during stop's wait too.
++	stop)    : > "$STOPPED_MARK"; stop ;;
++	restart) stop; sleep 1; rm -f "$STOPPED_MARK"; start ;;
++	# S46wanwatch / S84cron: honour an explicit stop, re-checked under the lock
++	# (a kick queued behind rcK's or the operator's stop sees its mark), and
++	# never clear the mark.
++	kick)         [ -f "$STOPPED_MARK" ] && exit 0; start ;;
++	kick-restart) [ -f "$STOPPED_MARK" ] && exit 0; stop; sleep 1; start ;;
++	*) echo "Usage: $0 {start|stop|restart|kick|kick-restart}" >&2; exit 1 ;;
 +esac
 diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/reticulum/config b/buildroot/board/cvitek/SG200X/overlay/etc/reticulum/config
 new file mode 100644
-index 000000000..75382cabd
+index 000000000..ba1365ef5
 --- /dev/null
 +++ b/buildroot/board/cvitek/SG200X/overlay/etc/reticulum/config
-@@ -0,0 +1,66 @@
+@@ -0,0 +1,73 @@
 +# Reticulum config — opinionated default for the RNSBox router.
 +#
 +# rnsd creates this file with stock defaults if it's missing. We ship
@@ -209,6 +404,13 @@ index 000000000..75382cabd
 +  # LAN-side auto-discovery on the USB-C gadget network. Reticulum
 +  # multicasts node announcements over usb0 so any client device
 +  # tethered via USB-C finds this node with no config.
++  # Runs purely over IPv6 link-local: usb0's fe80:: address, the ff12::
++  # link-scope group, UDP 29716/29717 (discovery) + 42671 (data). usb0 is
++  # the only iface with IPv6 on this box (S09ipv6 / S30gadget_nic), and
++  # its link-local appears only once a USB host has brought the link up.
++  # rnsd adopts usb0 only if it already has one when rnsd starts; if the
++  # host attaches later, S46wanwatch restarts rnsd once when the address
++  # appears (or restart rnsd yourself from the portal Reticulum tab).
 +  [[USB LAN AutoInterface]]
 +    type = AutoInterface
 +    enabled = True

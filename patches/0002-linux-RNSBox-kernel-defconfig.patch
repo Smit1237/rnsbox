@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: smit1237 <smit1237@gmail.com>
 Date: Tue, 8 Sep 2026 22:47:47 +0300
-Subject: [PATCH 02/23] linux: RNSBox kernel defconfig
+Subject: [PATCH 02/30] linux: RNSBox kernel defconfig
 
 Strip media/framebuffer/sound/Bluetooth/ION/CMA and other unused subsystems;
 trim the USB gadget to CDC-NCM plus mass-storage; build cfg80211 in (=y) and
@@ -11,18 +11,28 @@ mass-storage buffer count. Reticulum does all crypto in userspace via PyCA
 cryptography, so the kernel crypto-API ChaCha20/Poly1305/Curve25519 symbols
 are left explicitly unset.
 ---
- .../linux/sg2002_licheervnano_sd_defconfig    | 243 ++++++++++--------
- 1 file changed, 137 insertions(+), 106 deletions(-)
+ .../linux/sg2002_licheervnano_sd_defconfig    | 260 +++++++++++-------
+ 1 file changed, 154 insertions(+), 106 deletions(-)
 
 diff --git a/build/boards/sg200x/sg2002_licheervnano_sd/linux/sg2002_licheervnano_sd_defconfig b/build/boards/sg200x/sg2002_licheervnano_sd/linux/sg2002_licheervnano_sd_defconfig
-index 3740c364d..52c3d1bbb 100644
+index 3740c364d..d383d0cfd 100644
 --- a/build/boards/sg200x/sg2002_licheervnano_sd/linux/sg2002_licheervnano_sd_defconfig
 +++ b/build/boards/sg200x/sg2002_licheervnano_sd/linux/sg2002_licheervnano_sd_defconfig
-@@ -43,7 +43,13 @@ CONFIG_UNIX=y
+@@ -42,8 +42,22 @@ CONFIG_PACKET=y
+ CONFIG_UNIX=y
  CONFIG_INET=y
  # CONFIG_INET_DIAG is not set
- # CONFIG_IPV6 is not set
+-# CONFIG_IPV6 is not set
 -CONFIG_CFG80211=m
++# RNSBox: IPv6 is built in ONLY for Reticulum's AutoInterface on usb0 (it
++# runs purely over fe80:: link-local + ff12:: multicast; without IPv6 it shows
++# "Up" but can never find a peer). It also lets NF_TABLES_IPV6/INET resolve.
++# Confined to the USB LAN at runtime: /etc/init.d/S09ipv6 disables it on every
++# other iface (eth0/wlan*/sl0/...) and nftgen adds a drop-policy ip6 table.
++# Minimal: no SIT/tunnels/GRE/multiple-tables (see the IPv6 block below).
++# CONFIG_IPV6 appears three times in this file (last assignment wins in
++# kconfig) — keep all three =y.
++CONFIG_IPV6=y
 +# RNSBox W variant: AIC8800 is a fullmac (cfg80211) SDIO chip. cfg80211 is
 +# BUILT-IN (=y, not =m) so its EXPORT_SYMBOLs land in the kernel
 +# Module.symvers that the out-of-tree aic8800_fdrv modpost reads — otherwise
@@ -33,7 +43,7 @@ index 3740c364d..52c3d1bbb 100644
  CONFIG_RFKILL=y
  CONFIG_UEVENT_HELPER=y
  CONFIG_DEVTMPFS=y
-@@ -135,15 +141,15 @@ CONFIG_THERMAL_NETLINK=y
+@@ -135,15 +149,15 @@ CONFIG_THERMAL_NETLINK=y
  CONFIG_THERMAL_WRITABLE_TRIPS=y
  CONFIG_THERMAL_EMULATION=y
  CONFIG_WATCHDOG=y
@@ -58,7 +68,7 @@ index 3740c364d..52c3d1bbb 100644
  #
  # Media SPI Adapters
  #
-@@ -356,28 +362,28 @@ CONFIG_VIDEO_CVITEK_MIPI_TX=m
+@@ -356,28 +370,28 @@ CONFIG_VIDEO_CVITEK_MIPI_TX=m
  # CONFIG_DVB_DYNAMIC_MINORS is not set
  # end of Digital TV options
  
@@ -103,7 +113,7 @@ index 3740c364d..52c3d1bbb 100644
  CONFIG_USB=y
  CONFIG_USB_DWC2=y
  CONFIG_USB_GADGET=y
-@@ -396,33 +402,33 @@ CONFIG_DW_DMAC_CVITEK=y
+@@ -396,33 +410,33 @@ CONFIG_DW_DMAC_CVITEK=y
  CONFIG_RTC_CLASS=y
  # CONFIG_VIRTIO_MENU is not set
  CONFIG_STAGING=y
@@ -149,7 +159,7 @@ index 3740c364d..52c3d1bbb 100644
  CONFIG_NLS_CODEPAGE_437=y
  CONFIG_NLS_ISO8859_1=y
  CONFIG_NLS_ISO8859_2=y
-@@ -434,7 +440,7 @@ CONFIG_CRYPTO_SHA256=y
+@@ -434,7 +448,7 @@ CONFIG_CRYPTO_SHA256=y
  # CONFIG_XZ_DEC_IA64 is not set
  # CONFIG_XZ_DEC_ARMTHUMB is not set
  # CONFIG_XZ_DEC_SPARC is not set
@@ -158,7 +168,7 @@ index 3740c364d..52c3d1bbb 100644
  CONFIG_CMA_SIZE_MBYTES=0
  CONFIG_PRINTK_TIME=y
  CONFIG_DYNAMIC_DEBUG=y
-@@ -462,105 +468,109 @@ CONFIG_CHR_DEV_SG=y
+@@ -462,105 +476,109 @@ CONFIG_CHR_DEV_SG=y
  CONFIG_USB=y
  CONFIG_USB_OTG=y
  CONFIG_USB_OTG_FSM=y
@@ -258,7 +268,6 @@ index 3740c364d..52c3d1bbb 100644
 -CONFIG_USB_F_ACM=y
 -CONFIG_USB_F_EEM=y
 -CONFIG_USB_GADGET_VBUS_DRAW=500
--CONFIG_IPV6=y
 +# CONFIG_USB_CONFIGFS_EEM is not set
 +# CONFIG_USB_CONFIGFS_ACM is not set
 +# CONFIG_USB_F_ACM is not set
@@ -268,7 +277,7 @@ index 3740c364d..52c3d1bbb 100644
 +# pipelining for the f_mass_storage data path. Paired with lun.0/nofua=1 in
 +# S08usbdev (the bigger win — stops force-syncing every host write).
 +CONFIG_USB_GADGET_STORAGE_NUM_BUFFERS=4
-+# CONFIG_IPV6 is not set
+ CONFIG_IPV6=y
  # CONFIG_IPV6_SIT is not set
  CONFIG_PACKET_DIAG=y
  CONFIG_UNIX_DIAG=y
@@ -329,7 +338,7 @@ index 3740c364d..52c3d1bbb 100644
  CONFIG_SPI=y
  CONFIG_SPI_MASTER=y
  CONFIG_SPI_DESIGNWARE=y
-@@ -591,7 +601,7 @@ CONFIG_NET_NS=y
+@@ -591,7 +609,7 @@ CONFIG_NET_NS=y
  CONFIG_EPOLL=y
  CONFIG_IO_URING=y
  CONFIG_SIGNALFD=y
@@ -338,19 +347,16 @@ index 3740c364d..52c3d1bbb 100644
  
  #
  # Networking options
-@@ -624,9 +634,9 @@ CONFIG_SYN_COOKIES=y
+@@ -624,7 +642,7 @@ CONFIG_SYN_COOKIES=y
  CONFIG_TCP_CONG_ADVANCED=y
  CONFIG_TCP_CONG_CUBIC=y
  CONFIG_TCP_CONG_BBR=y
 -CONFIG_DEFAULT_TCP_CONG="cubic"
 +CONFIG_DEFAULT_TCP_CONG="bbr"
  # CONFIG_TCP_MD5SIG is not set
--CONFIG_IPV6=y
-+# CONFIG_IPV6 is not set
+ CONFIG_IPV6=y
  # CONFIG_IPV6_ROUTER_PREF is not set
- # CONFIG_IPV6_OPTIMISTIC_DAD is not set
- # CONFIG_INET6_AH is not set
-@@ -636,9 +646,9 @@ CONFIG_IPV6=y
+@@ -636,9 +654,9 @@ CONFIG_IPV6=y
  # CONFIG_IPV6_ILA is not set
  # CONFIG_IPV6_VTI is not set
  # CONFIG_IPV6_SIT is not set
@@ -363,7 +369,20 @@ index 3740c364d..52c3d1bbb 100644
  # CONFIG_IPV6_MROUTE is not set
  # CONFIG_IPV6_SEG6_LWTUNNEL is not set
  # CONFIG_IPV6_SEG6_HMAC is not set
-@@ -1010,3 +1020,24 @@ CONFIG_USB_SERIAL_OPTION=y
+@@ -934,7 +952,11 @@ CONFIG_NF_FLOW_TABLE_IPV6=y
+ CONFIG_NF_DUP_IPV6=y
+ CONFIG_NF_REJECT_IPV6=y
+ CONFIG_NF_LOG_IPV6=y
+-CONFIG_IP6_NF_IPTABLES=y
++# RNSBox: legacy ip6tables is never used (the firewall is nftables:
++# NF_TABLES_IPV6 above), so keep it out now that IPV6=y re-enables this block.
++# This also switches off every IP6_NF_* line below (they sit under
++# `if IP6_NF_IPTABLES` in net/ipv6/netfilter/Kconfig).
++# CONFIG_IP6_NF_IPTABLES is not set
+ CONFIG_IP6_NF_MATCH_AH=y
+ CONFIG_IP6_NF_MATCH_EUI64=y
+ CONFIG_IP6_NF_MATCH_FRAG=y
+@@ -1010,3 +1032,29 @@ CONFIG_USB_SERIAL_OPTION=y
  CONFIG_USB_ACM=y
  
  CONFIG_VETH=y
@@ -386,6 +405,11 @@ index 3740c364d..52c3d1bbb 100644
 +CONFIG_NET_SCHED=y
 +CONFIG_NET_SCH_FQ=y
 +CONFIG_NET_SCH_FQ_CODEL=y
++# fq as the boot-time default qdisc, so ifaces raised before S60routing sets
++# default_qdisc (eth0, usb0, wlan0, sl0 from S31slip) never start on
++# pfifo_fast. S60routing still sets it and re-attaches as a safety net.
++CONFIG_NET_SCH_DEFAULT=y
++CONFIG_DEFAULT_FQ=y
 +# TUN already on; just being explicit
 +CONFIG_TUN=y
 -- 

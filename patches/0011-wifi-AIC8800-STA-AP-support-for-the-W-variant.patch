@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: smit1237 <smit1237@gmail.com>
 Date: Tue, 8 Sep 2026 22:47:49 +0300
-Subject: [PATCH 11/23] wifi: AIC8800 STA/AP support for the W variant
+Subject: [PATCH 11/30] wifi: AIC8800 STA/AP support for the W variant
 
 Build the out-of-tree AIC8800 fullmac driver from osdrv (Bluetooth disabled,
 Cvitek cross-build, other wireless vendors gated off in the M= pass) and
@@ -11,13 +11,13 @@ a clean no-op on the radio-less board. The board defconfig also disables the
 MIPI panel and camera sensors.
 ---
  .../sg2002_licheervnano_sd_defconfig          |  21 +-
- .../cvitek/SG200X/overlay/etc/init.d/S35wifi  | 400 ++++++++++++++++++
- .../SG200X/overlay/etc/init.d/S36wifiwatch    |  90 ++++
- .../SG200X/overlay/etc/rnsbox/wifi.conf       |  62 +++
+ .../cvitek/SG200X/overlay/etc/init.d/S35wifi  | 461 ++++++++++++++++++
+ .../SG200X/overlay/etc/init.d/S36wifiwatch    | 104 ++++
+ .../SG200X/overlay/etc/rnsbox/wifi.conf       |  70 +++
  osdrv/extdrv/wireless/Makefile                |  23 +-
  osdrv/extdrv/wireless/aic8800/Makefile        |   8 +-
  .../wireless/aic8800/aic8800_fdrv/Makefile    |   2 +-
- 7 files changed, 588 insertions(+), 18 deletions(-)
+ 7 files changed, 671 insertions(+), 18 deletions(-)
  create mode 100755 buildroot/board/cvitek/SG200X/overlay/etc/init.d/S35wifi
  create mode 100755 buildroot/board/cvitek/SG200X/overlay/etc/init.d/S36wifiwatch
  create mode 100644 buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/wifi.conf
@@ -62,10 +62,10 @@ index aa1ebfb00..b8405ed67 100644
  # CONFIG_TARGET_PACKAGE_GATORD is not set
 diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S35wifi b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S35wifi
 new file mode 100755
-index 000000000..14ca48d83
+index 000000000..888411980
 --- /dev/null
 +++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S35wifi
-@@ -0,0 +1,400 @@
+@@ -0,0 +1,461 @@
 +#!/bin/sh
 +# S35wifi — AIC8800 WiFi bring-up for the LicheeRV Nano-e W variant.
 +#
@@ -85,6 +85,10 @@ index 000000000..14ca48d83
 +STA_IF=wlan0
 +AP_IF_CONCURRENT=wlan1
 +LOG=/var/log/wifi.log
++# Present while the AP is refused for a weak ap_psk (holds the reason). Lets
++# the refusal be logged once per start/restart instead of on every
++# S36wifiwatch revive attempt (every few seconds in sta+ap; /var/log is tiny).
++AP_REFUSED=/run/wifi-ap-refused
 +
 +# 2.4 GHz channel centre frequencies (ch1..13, MHz). Used to pin the STA to
 +# 2.4 GHz in concurrent sta+ap mode so it is ALWAYS co-band with the AP. The
@@ -103,6 +107,25 @@ index 000000000..14ca48d83
 +	  | sed -E "s/^[^=]*=[[:space:]]*//" | sed -E 's/[[:space:]]*#.*$//' \
 +	  | sed -E 's/[[:space:]]*$//' | tr -d '"'
 +}
++
++# ap_psk_ok <psk> — hotspot WPA2 passphrase policy (mirrors the portal's
++# wifi::ap_psk_ok): 8..63 printable ASCII and NOT the old published factory
++# default. An empty PSK must never mean "open hotspot" (gen_hostapd_conf would
++# emit no wpa= lines), so it is refused too.
++ap_psk_ok() {
++	_p="$1"
++	[ "$_p" = "changeme123" ] && return 1
++	[ "${#_p}" -ge 8 ] && [ "${#_p}" -le 63 ] || return 1
++	case "$_p" in *[!\ -~]*) return 1 ;; esac
++	return 0
++}
++
++# ap_refuse <reason> — record why the AP is not started; log only the first time.
++ap_refuse() {
++	[ -f "$AP_REFUSED" ] || log "AP NOT started: $* — set a hotspot password (8-63 chars) in the portal WiFi tab"
++	echo "$*" > "$AP_REFUSED"
++}
++AP_PSK_REASON="ap_psk is empty, not 8-63 printable ASCII chars, or the old published default 'changeme123'"
 +
 +load_modules() {
 +	if ! grep -q '^cfg80211 ' /proc/modules 2>/dev/null; then
@@ -292,7 +315,7 @@ index 000000000..14ca48d83
 +	# and hostapd below.
 +	wpa_supplicant -B -i "$STA_IF" -c "$WPA_CONF" -P /var/run/wpa_supplicant-wlan0.pid >>"$LOG" 2>&1 9>&-
 +	apply_txpower "$STA_IF"
-+	dhcpcd -n "$STA_IF" >>"$LOG" 2>&1 9>&- &
++	dhcpcd -b -n "$STA_IF" >>"$LOG" 2>&1 9>&- &
 +	log "STA started on $STA_IF ssid=$ssid${band:+ (2.4 GHz pinned — concurrent)}"
 +}
 +
@@ -310,6 +333,12 @@ index 000000000..14ca48d83
 +	ssid=$(cfg ap_ssid); psk=$(cfg ap_psk); chan=$(cfg ap_channel)
 +	hidden=$(cfg ap_hidden); ap_ip=$(cfg ap_ip); htmode=$(cfg ap_htmode)
 +	[ -z "$ssid" ] && { log "AP requested but ap_ssid empty; skipping"; return 0; }
++	if ! ap_psk_ok "$psk"; then
++		ap_refuse "$AP_PSK_REASON"
++		rm -f /run/wifi-ap-iface      # no AP: don't let S60routing/portal think one is up
++		return 0
++	fi
++	rm -f "$AP_REFUSED"
 +	[ -z "$chan" ] && chan=6
 +	[ -z "$ap_ip" ] && ap_ip=192.168.42.1
 +	[ -z "$htmode" ] && htmode=ht20
@@ -372,6 +401,11 @@ index 000000000..14ca48d83
 +
 +start() {
 +	mkdir -p /var/log /var/run
++	# wifi.conf holds sta_psk/ap_psk: keep it root-only. The portal writes it
++	# 0600; this narrows copies left 0644 by older images (go-rwx only ever
++	# removes bits, so an even stricter mode is kept).
++	[ -f "$CONF" ] && chmod go-rwx "$CONF" 2>/dev/null
++	rm -f "$AP_REFUSED"     # fresh start/restart: log a PSK refusal once again
 +	mode=$(cfg mode); [ -z "$mode" ] && mode=off
 +
 +	load_modules
@@ -392,10 +426,14 @@ index 000000000..14ca48d83
 +			# ap_channel — the hotspot is the priority — and S36wifiwatch
 +			# re-syncs the AP to the STA's channel if/when it later joins.
 +			start_sta concurrent
-+			if wait_sta_connected 20; then
-+				log "STA associated — starting co-channel AP"
-+			else
-+				log "STA not associated after 20s — starting AP on ap_channel (AP priority); watchdog re-syncs when STA joins"
++			# A weak ap_psk refuses only the AP (start_ap logs why); the STA
++			# above keeps working. No point waiting 20 s for it in that case.
++			if ap_psk_ok "$(cfg ap_psk)"; then
++				if wait_sta_connected 20; then
++					log "STA associated — starting co-channel AP"
++				else
++					log "STA not associated after 20s — starting AP on ap_channel (AP priority); watchdog re-syncs when STA joins"
++				fi
 +			fi
 +			start_ap "$AP_IF_CONCURRENT"
 +			;;
@@ -408,7 +446,24 @@ index 000000000..14ca48d83
 +	[ -f /var/run/wpa_supplicant-wlan0.pid ] && { kill "$(cat /var/run/wpa_supplicant-wlan0.pid)" 2>/dev/null; rm -f /var/run/wpa_supplicant-wlan0.pid; }
 +	killall hostapd wpa_supplicant 2>/dev/null
 +	dhcpcd -x "$STA_IF" 2>/dev/null
++	# Drop the STA's DNS from openresolv (no-op if dhcpcd's STOP hook already did).
++	resolvconf -d "$STA_IF.dhcp" -f 2>/dev/null
 +	iw dev "$AP_IF_CONCURRENT" del 2>/dev/null
++	# The AP iface (wlan0 in AP-only mode) stays LAN in the LIVE ruleset
++	# (S60routing's @lan_ifaces) until S60routing next runs, and wlan0 keeps
++	# the hotspot's $ap_ip/24. Left alone, a wlan0 that now becomes a STA would
++	# be LAN-trusted on the upstream WLAN (dnsmasq serving DHCP there too), and
++	# in sta+ap its 192.168.42.0/24 route would shadow wlan1's, so replies to
++	# hotspot clients would go out wlan0. Drop both now; the S60routing
++	# restart that follows (portal apply) adds the new AP iface back.
++	ap=$(cat /run/wifi-ap-iface 2>/dev/null | tr -d '[:space:]')
++	case "$ap" in
++		"$STA_IF"|"$AP_IF_CONCURRENT")
++			for fam in ip ip6; do
++				nft delete element "$fam" filter lan_ifaces "{ \"$ap\" }" 2>/dev/null
++			done ;;
++	esac
++	ip addr flush dev "$STA_IF" 2>/dev/null
 +	rm -f /run/wifi-ap-iface
 +}
 +
@@ -447,6 +502,12 @@ index 000000000..14ca48d83
 +		# instead of a redundant teardown/rebuild (one avoidable blip). The
 +		# channel re-sync path still uses ap_restart (always restarts).
 +		if ! pidof hostapd >/dev/null 2>&1; then
++			# Refused PSK: bail before load_modules (which sleeps 1 s) — the
++			# watchdog calls this every few seconds while hostapd is absent.
++			if ! ap_psk_ok "$(cfg ap_psk)"; then
++				ap_refuse "$AP_PSK_REASON"
++				exit 0
++			fi
 +			load_modules
 +			start_ap "$AP_IF_CONCURRENT"
 +		fi
@@ -468,10 +529,10 @@ index 000000000..14ca48d83
 +esac
 diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S36wifiwatch b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S36wifiwatch
 new file mode 100755
-index 000000000..c637e17af
+index 000000000..7b7c04796
 --- /dev/null
 +++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S36wifiwatch
-@@ -0,0 +1,90 @@
+@@ -0,0 +1,104 @@
 +#!/bin/sh
 +# S36wifiwatch — AP-priority watchdog for concurrent WiFi (mode=sta+ap).
 +#
@@ -497,6 +558,9 @@ index 000000000..c637e17af
 +STA_IF=wlan0
 +AP_IF=wlan1
 +LOG=/var/log/wifi.log
++# Written by S35wifi when it refuses to start the AP (weak/empty ap_psk). While
++# it exists there is no hotspot to revive or protect — see loop().
++AP_REFUSED=/run/wifi-ap-refused
 +GRACE=8          # seconds the STA may be down before we protect the AP
 +IDLE_RETRY=30    # seconds between STA reconnect attempts, but only while idle
 +STEP=4           # poll interval
@@ -515,6 +579,17 @@ index 000000000..c637e17af
 +	down=0; protected=0; last_retry=0
 +	while sleep "$STEP"; do
 +		[ "$(cfg mode)" = "sta+ap" ] || { down=0; protected=0; continue; }
++
++		# AP refused by S35wifi (its password is empty/too short/the old
++		# published default): reviving it would only re-log the refusal every
++		# STEP seconds, and freezing the STA scan would protect nothing. Leave
++		# the STA to wpa_supplicant (undoing our own disconnect, if we issued
++		# one) until an S35wifi restart with a valid password clears the marker.
++		if [ -f "$AP_REFUSED" ]; then
++			[ "$protected" = 1 ] && wpa reconnect
++			down=0; protected=0
++			continue
++		fi
 +
 +		# The AP is the priority: if the firmware dropped it, bring it back.
 +		# ap_ensure (not ap_restart) so that if this blocks on the wifi lock
@@ -564,10 +639,10 @@ index 000000000..c637e17af
 +esac
 diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/wifi.conf b/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/wifi.conf
 new file mode 100644
-index 000000000..ea3f7baa1
+index 000000000..a2b76073b
 --- /dev/null
 +++ b/buildroot/board/cvitek/SG200X/overlay/etc/rnsbox/wifi.conf
-@@ -0,0 +1,62 @@
+@@ -0,0 +1,70 @@
 +# RNSBox WiFi config — read at boot by /etc/init.d/S35wifi.
 +#
 +# Only meaningful on the LicheeRV Nano-e **W** variant (AIC8800 chip). On
@@ -599,7 +674,15 @@ index 000000000..ea3f7baa1
 +
 +# --- AP (hotspot) ---
 +ap_ssid=RNSBox-AP
-+ap_psk=changeme123
++# ap_psk: WPA2 passphrase, 8..63 printable ASCII (no '#' or '"' — this file
++# can't store them). Ships EMPTY on purpose: a default password printed in
++# public source is no password at all (every box would share it). The portal
++# refuses to enable the hotspot until you set one, and refuses the old
++# published default "changeme123"; S35wifi likewise refuses to start an AP
++# with an empty/short/old-default PSK (logged to /var/log/wifi.log) — in
++# sta+ap the client side still comes up. This file is kept 0600 (it holds
++# both passwords).
++ap_psk=
 +# ap_channel: 1..13, or "auto" (hostapd ACS picks the least-congested 2.4GHz
 +# channel; falls back to ch6 if the driver can't survey). In concurrent
 +# sta+ap mode the AP always follows the STA channel regardless of this

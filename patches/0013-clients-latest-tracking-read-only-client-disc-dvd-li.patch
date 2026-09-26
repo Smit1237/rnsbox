@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: smit1237 <smit1237@gmail.com>
 Date: Tue, 8 Sep 2026 22:47:49 +0300
-Subject: [PATCH 13/23] clients: latest-tracking read-only client disc +
+Subject: [PATCH 13/30] clients: latest-tracking read-only client disc +
  dvd/lite variants
 
 fetch-clients.sh resolves each Reticulum client's latest stable GitHub release
@@ -14,18 +14,18 @@ limit. Client binaries are downloaded at build time and git-ignored; build-host
 paths are derived from the script location. dvd = NCM + clients disc, lite =
 NCM-only.
 ---
- .gitignore                                    |   6 +
- build-rnsbox-clients.sh                       |  44 ++++++
- build-rnsbox-kclean.sh                        |  61 ++++++++
- build-rnsbox-massstorage.sh                   |  70 ++++++++++
- build-rnsbox-wifi.sh                          |  39 ++++++
- build-rnsbox.sh                               |  96 +++++++++++++
+ .gitignore                                    |   7 +
+ build-rnsbox-clients.sh                       |  44 +++++
+ build-rnsbox-kclean.sh                        |  74 +++++++++
+ build-rnsbox-massstorage.sh                   |  70 ++++++++
+ build-rnsbox-wifi.sh                          |  39 +++++
+ build-rnsbox.sh                               | 157 ++++++++++++++++++
  .../partition/partition_sd.xml                |   8 +-
- build/clients-stick/build-clients-img.sh      |  64 +++++++++
- build/clients-stick/extra/README.txt          |  79 +++++++++++
- build/clients-stick/extra/index.html          |  98 +++++++++++++
- fetch-clients.sh                              | 132 ++++++++++++++++++
- 11 files changed, 696 insertions(+), 1 deletion(-)
+ build/clients-stick/build-clients-img.sh      |  64 +++++++
+ build/clients-stick/extra/README.txt          |  79 +++++++++
+ build/clients-stick/extra/index.html          |  98 +++++++++++
+ fetch-clients.sh                              | 132 +++++++++++++++
+ 11 files changed, 771 insertions(+), 1 deletion(-)
  create mode 100755 build-rnsbox-clients.sh
  create mode 100755 build-rnsbox-kclean.sh
  create mode 100755 build-rnsbox-massstorage.sh
@@ -37,10 +37,18 @@ NCM-only.
  create mode 100755 fetch-clients.sh
 
 diff --git a/.gitignore b/.gitignore
-index ce0f83185..9deeae5f6 100644
+index ce0f83185..1993dbf78 100644
 --- a/.gitignore
 +++ b/.gitignore
-@@ -422,3 +422,9 @@ middleware/v2/lib
+@@ -4,6 +4,7 @@
+ *.ko
+ *.d
+ !init.d
++!sysctl.d
+ host-tools/
+ host-tools
+ *.sqfs
+@@ -422,3 +423,9 @@ middleware/v2/lib
  host-tools/
  kvm/
  .vscode*
@@ -52,7 +60,7 @@ index ce0f83185..9deeae5f6 100644
 +*.pyc
 diff --git a/build-rnsbox-clients.sh b/build-rnsbox-clients.sh
 new file mode 100755
-index 000000000..b510ae928
+index 000000000..d35284e6e
 --- /dev/null
 +++ b/build-rnsbox-clients.sh
 @@ -0,0 +1,44 @@
@@ -84,7 +92,7 @@ index 000000000..b510ae928
 +echo "clients image: $((sz/1024/1024)) MiB"
 +
 +echo "--- force-refresh local rnsbox-portal pkg ---"
-+rm -rf "$BRD"/output/build/rnsbox-portal-0.1.0
++rm -rf "$BRD"/output/build/rnsbox-portal-*
 +export PATH=/usr/sbin:/sbin:$PATH
 +
 +echo "--- pack_rootfs (overlay → rootfs.ext4, now sized 1500M) ---"
@@ -102,10 +110,10 @@ index 000000000..b510ae928
 +echo "DONE-SENTINEL-OK"
 diff --git a/build-rnsbox-kclean.sh b/build-rnsbox-kclean.sh
 new file mode 100755
-index 000000000..c241dc2c5
+index 000000000..ed76fd14d
 --- /dev/null
 +++ b/build-rnsbox-kclean.sh
-@@ -0,0 +1,61 @@
+@@ -0,0 +1,74 @@
 +#!/bin/bash
 +# Clean kernel + osdrv rebuild so EVERY shipped .ko carries the new
 +# 5.10.4-rnsbox vermagic. The previous (incremental) build re-stamped only the
@@ -129,6 +137,9 @@ index 000000000..c241dc2c5
 +KCFG=linux_5.10/build/sg2002_licheervnano_sd/.config
 +KREL_FILE=linux_5.10/build/sg2002_licheervnano_sd/include/config/kernel.release
 +
++echo "--- clean_osdrv (BEFORE build_kernel: its clean rm's \$SYSTEM_OUT_DIR/ko/*.ko) ---"
++clean_osdrv || echo "warn: clean_osdrv returned nonzero (continuing)"
++
 +echo "--- clean_kernel (distclean → full module recompile, re-stamps vermagic) ---"
 +clean_kernel || { echo "FATAL: clean_kernel failed"; exit 93; }
 +
@@ -141,23 +152,33 @@ index 000000000..c241dc2c5
 +case "$KREL" in *-rnsbox) echo "tag OK" ;; *) echo "FATAL: release '$KREL' != *-rnsbox"; exit 95 ;; esac
 +grep -q '^CONFIG_USB_CONFIGFS_MASS_STORAGE=y' "$KCFG" || { echo "FATAL: no mass storage in .config"; exit 96; }
 +
-+echo "--- clean_osdrv + build_osdrv (aic8800 against the clean kernel) ---"
-+clean_osdrv || echo "warn: clean_osdrv returned nonzero (continuing)"
++echo "--- build_osdrv (aic8800 against the clean kernel) ---"
 +build_osdrv || { echo "FATAL: build_osdrv failed"; exit 97; }
 +
++# Checks $SYSTEM_OUT_DIR/ko — the set that ships once the overlay/target
++# copies are purged below. Only the vermagic STRING: it can't catch a module
++# built against an older config of the same release (CONFIG_IPV6 changes
++# struct layouts but not vermagic); the clean rebuild + purge is what does.
 +echo "--- VERMAGIC CONSISTENCY: every shipped .ko must be 5.10.4-rnsbox ---"
 +BADV=0
-+for f in $(find buildroot/board/cvitek/SG200X/overlay/mnt/system/ko -name '*.ko' 2>/dev/null); do
++for f in $(find "$SYSTEM_OUT_DIR/ko" -name '*.ko' 2>/dev/null); do
 +	vm=$(strings "$f" 2>/dev/null | grep -m1 '^vermagic=' | sed 's/vermagic=//;s/ .*//')
 +	if [ "$vm" != "$KREL" ]; then
 +		echo "  MISMATCH: $(basename "$f") = $vm (expected $KREL)"
 +		BADV=1
 +	fi
 +done
-+[ "$BADV" = 0 ] && echo "all overlay .ko vermagic == $KREL  OK" || { echo "FATAL: vermagic mismatch — WiFi would fail to load"; exit 98; }
++[ "$BADV" = 0 ] && echo "all shipped .ko vermagic == $KREL  OK" || { echo "FATAL: vermagic mismatch — WiFi would fail to load"; exit 98; }
++
++echo "--- purge overlay/target .ko (br-rootfs-prepare re-copies the fresh set) ---"
++# neither br-rootfs-prepare's cp nor buildroot's overlay rsync ever deletes,
++# so without this the pre-rebuild copies would keep shipping.
++[ -f "$SYSTEM_OUT_DIR/ko/usbnet.ko" ] || { echo "FATAL: in-tree .ko missing from \$SYSTEM_OUT_DIR/ko"; exit 98; }
++rm -f "${BR_OVERLAY_DIR:?}"/mnt/system/ko/*.ko "$BR_OVERLAY_DIR"/mnt/system/ko/3rd/*.ko \
++      "$BRD"/output/target/mnt/system/ko/*.ko "$BRD"/output/target/mnt/system/ko/3rd/*.ko
 +
 +echo "--- force-refresh local rnsbox-portal pkg ---"
-+rm -rf "$BRD"/output/build/rnsbox-portal-0.1.0
++rm -rf "$BRD"/output/build/rnsbox-portal-*
 +export PATH=/usr/sbin:/sbin:$PATH
 +
 +echo "--- pack_rootfs + pack_burn_image ---"
@@ -169,7 +190,7 @@ index 000000000..c241dc2c5
 +echo "DONE-SENTINEL-OK"
 diff --git a/build-rnsbox-massstorage.sh b/build-rnsbox-massstorage.sh
 new file mode 100755
-index 000000000..daca9cc76
+index 000000000..06ffa4de8
 --- /dev/null
 +++ b/build-rnsbox-massstorage.sh
 @@ -0,0 +1,70 @@
@@ -229,7 +250,7 @@ index 000000000..daca9cc76
 +fi
 +
 +echo "--- force-refresh local rnsbox-portal pkg (cached by VERSION) ---"
-+rm -rf "$BRD"/output/build/rnsbox-portal-0.1.0
++rm -rf "$BRD"/output/build/rnsbox-portal-*
 +
 +echo "--- PATH fix so genimage's mkdosfs resolves ---"
 +export PATH=/usr/sbin:/sbin:$PATH
@@ -245,7 +266,7 @@ index 000000000..daca9cc76
 +echo "DONE-SENTINEL-OK"
 diff --git a/build-rnsbox-wifi.sh b/build-rnsbox-wifi.sh
 new file mode 100755
-index 000000000..3db23c45b
+index 000000000..fd1174ade
 --- /dev/null
 +++ b/build-rnsbox-wifi.sh
 @@ -0,0 +1,39 @@
@@ -273,8 +294,8 @@ index 000000000..3db23c45b
 +BRD="${BR_DIR:-$(cd "$(dirname "$(readlink -f "$0")")" && pwd)/buildroot}"
 +
 +echo "--- force-refresh local rnsbox-portal pkg (VERSION cached otherwise) ---"
-+rm -rf "$BRD"/output/build/rnsbox-portal-0.1.0
-+echo "removed: $BRD/output/build/rnsbox-portal-0.1.0 (rc=$?)"
++rm -rf "$BRD"/output/build/rnsbox-portal-*
++echo "removed: $BRD/output/build/rnsbox-portal-* (rc=$?)"
 +
 +echo "--- PATH fix so genimage's mkdosfs resolves ---"
 +export PATH=/usr/sbin:/sbin:$PATH
@@ -290,10 +311,10 @@ index 000000000..3db23c45b
 +echo "DONE-SENTINEL-OK"
 diff --git a/build-rnsbox.sh b/build-rnsbox.sh
 new file mode 100755
-index 000000000..bd7a4f80b
+index 000000000..8912f09fa
 --- /dev/null
 +++ b/build-rnsbox.sh
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,157 @@
 +#!/bin/bash
 +# Unified RNSBox build — DVD or LITE variant from one switch.
 +#
@@ -329,7 +350,7 @@ index 000000000..bd7a4f80b
 +	sed -i 's/^BR2_TARGET_ROOTFS_EXT2_SIZE=.*/BR2_TARGET_ROOTFS_EXT2_SIZE="2800M"/' "$DEFCONFIG"
 +	sed -i 's#\(<partition label="ROOTFS" size_in_kb=\)"[0-9]*"#\1"3072000"#' "$PARTXML"
 +	# ensure the usb.disk0 lines are present in genimage (DVD shape)
-+	grep -q '"usb.disk0"' "$GENIMG" || sed -i 's#\("usb.ncm.mac",\)#\1\n                        "usb.disk0",\n                        "usb.disk0.size",#' "$GENIMG"
++	grep -q '"usb.disk0"' "$GENIMG" || sed -i 's#\("usb.ncm",\)#\1\n                        "usb.disk0",\n                        "usb.disk0.size",#' "$GENIMG"
 +	# restore the ISO into the overlay if we stashed it
 +	[ -f "$ISO_STASH" ] && [ ! -f "$ISO_OVERLAY" ] && { mkdir -p "$(dirname "$ISO_OVERLAY")"; mv "$ISO_STASH" "$ISO_OVERLAY"; }
 +}
@@ -349,7 +370,7 @@ index 000000000..bd7a4f80b
 +	echo "--- DVD: ISO ${ISO_MB}M -> rootfs ${EXT2_MB}M, partition $(( PART_KB / 1024 ))MiB ---"
 +	sed -i "s/^BR2_TARGET_ROOTFS_EXT2_SIZE=.*/BR2_TARGET_ROOTFS_EXT2_SIZE=\"${EXT2_MB}M\"/" "$DEFCONFIG"
 +	sed -i "s#\(<partition label=\"ROOTFS\" size_in_kb=\)\"[0-9]*\"#\1\"${PART_KB}\"#" "$PARTXML"
-+	grep -q '"usb.disk0"' "$GENIMG" || sed -i 's#\("usb.ncm.mac",\)#\1\n                        "usb.disk0",\n                        "usb.disk0.size",#' "$GENIMG"
++	grep -q '"usb.disk0"' "$GENIMG" || sed -i 's#\("usb.ncm",\)#\1\n                        "usb.disk0",\n                        "usb.disk0.size",#' "$GENIMG"
 +	SUFFIX=dvd
 +else
 +	export RNSBOX_WITH_DVD=0
@@ -371,12 +392,73 @@ index 000000000..bd7a4f80b
 +# missing execute bit can never reach the image again.
 +chmod 0755 buildroot/board/cvitek/SG200X/overlay/etc/init.d/S* 2>/dev/null
 +
++# This driver never rebuilds the kernel. Warn if the built kernel predates
++# the board defconfig's CONFIG_IPV6=y (needed by Reticulum's AutoInterface on
++# usb0): the image would still boot fine — every IPv6 piece in the rootfs
++# degrades to IPv4-only — but AutoInterface can't find peers. Rebuild the
++# kernel (build_all, or ./build-rnsbox-kclean.sh). The matching module
++# refresh is enforced below (after defconfig): aic8800 is rebuilt if it
++# predates the kernel config, and the in-tree modules are re-copied from the
++# kernel's modules_install output with the old overlay/target copies purged,
++# so a plain build_kernel can no longer ship a stale driver.
++KDEFCONFIG=build/boards/sg200x/sg2002_licheervnano_sd/linux/sg2002_licheervnano_sd_defconfig
++KBUILTCFG=linux_5.10/build/sg2002_licheervnano_sd/.config
++if grep -q '^CONFIG_IPV6=y' "$KDEFCONFIG" && [ -f "$KBUILTCFG" ] \
++   && ! grep -q '^CONFIG_IPV6=y' "$KBUILTCFG"; then
++	echo "WARNING: the built kernel has no IPv6 but the defconfig enables it —"
++	echo "         this image keeps the old kernel. Rebuild kernel + osdrv"
++	echo "         (build_all, or ./build-rnsbox-kclean.sh) for AutoInterface."
++fi
++
 +echo "--- source cvisetup + defconfig ---"
 +source build/cvisetup.sh || { echo "FATAL: cvisetup"; exit 93; }
 +defconfig sg2002_licheervnano_sd || { echo "FATAL: defconfig"; exit 94; }
 +BRD="${BR_DIR:-$ROOT/buildroot}"
-+rm -rf "$BRD"/output/build/rnsbox-portal-0.1.0
++rm -rf "$BRD"/output/build/rnsbox-portal-*
 +export PATH=/usr/sbin:/sbin:$PATH
++
++# aic8800 (osdrv, out-of-tree) must be rebuilt whenever the kernel config
++# changes: CONFIG_MODVERSIONS is off and vermagic doesn't encode config, so a
++# .ko built before e.g. CONFIG_IPV6=y (adds ndisc_ops to struct net_device)
++# still insmods on a W board and corrupts memory. build_kernel alone leaves
++# the old .ko in place, so rebuild it here if it predates the kernel config.
++# Checked: the copies in $SYSTEM_OUT_DIR/ko/3rd (set by defconfig above),
++# which pack_rootfs ships; cp_ext_wireless re-copies them on every
++# build_osdrv. Against include/generated/autoconf.h, which kconfig rewrites
++# on every syncconfig. A false positive only costs a cheap build_osdrv.
++KAUTOCONF="$KERNEL_PATH/$KERNEL_OUTPUT_FOLDER/include/generated/autoconf.h"
++ko_stale() {
++	local m ko
++	for m in aic8800_bsp aic8800_fdrv; do
++		ko="$SYSTEM_OUT_DIR/ko/3rd/$m.ko"
++		[ -f "$KAUTOCONF" ] && { [ ! -f "$ko" ] || [ "$ko" -ot "$KAUTOCONF" ]; } && return 0
++	done
++	return 1
++}
++if ko_stale; then
++	echo "--- aic8800 .ko predates the kernel config: build_osdrv ---"
++	build_osdrv || { echo "FATAL: build_osdrv"; exit 97; }
++	ko_stale && { echo "FATAL: aic8800 .ko still older than kernel config"; exit 97; }
++fi
++
++# Same trap for the in-tree =m modules (usbnet, cdc_ncm, asix, tcp_bic, ...):
++# clean_osdrv (build-rnsbox-kclean.sh) rm's $SYSTEM_OUT_DIR/ko/*.ko after
++# build_kernel copied them, and neither br-rootfs-prepare's cp nor buildroot's
++# overlay rsync ever deletes, so copies built against an older kernel config
++# (identical vermagic) keep shipping from the overlay. Re-copy the installed
++# modules (as copy_ko_action does) and purge the overlay/target copies so
++# pack_rootfs ships exactly $SYSTEM_OUT_DIR/ko. Checked on the modules_install
++# output (re-copied on every build_kernel), not the build-tree .ko (kbuild
++# doesn't recompile unrelated modules after a config change -> false FATAL).
++KMODS="$KERNEL_PATH/$KERNEL_OUTPUT_FOLDER/modules"
++if [ -f "$KAUTOCONF" ] && [ -d "$KMODS" ]; then
++	[ -n "$(find "$KMODS" -name '*.ko' ! -newer "$KAUTOCONF")" ] \
++		&& { echo "FATAL: installed kernel modules predate the kernel config: build_kernel"; exit 97; }
++	mkdir -p "$SYSTEM_OUT_DIR/ko"
++	find "$KMODS" -name '*.ko' -exec cp -f {} "$SYSTEM_OUT_DIR/ko/" \;
++fi
++rm -f "${BR_OVERLAY_DIR:?}"/mnt/system/ko/*.ko "$BR_OVERLAY_DIR"/mnt/system/ko/3rd/*.ko \
++      "$BRD"/output/target/mnt/system/ko/*.ko "$BRD"/output/target/mnt/system/ko/3rd/*.ko
 +
 +echo "--- pack_rootfs ---"
 +pack_rootfs || { echo "FATAL: pack_rootfs"; exit 95; }

@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: smit1237 <smit1237@gmail.com>
+Date: Fri, 25 Sep 2026 00:33:47 +0300
+Subject: [PATCH 29/30] rnsd: create the transport identity before the first
+ start
+
+On a first boot rnsd writes its transport identity only once it has
+finished starting, many seconds in when the uplinks are unreachable. An
+RNS client attaching meanwhile (rnstatus, the portal Reticulum tab)
+found no identity, created its own and saved it over rnsd's, so every
+client then got "digest received was wrong" until rnsd restarted.
+S82rnsd now creates it with RNS before rnsd's first launch, so rnsd and
+every client load the same file. Verified on the board.
+---
+ .../cvitek/SG200X/overlay/etc/init.d/S82rnsd  | 20 +++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S82rnsd b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S82rnsd
+index fcf801c9f..2257c417a 100755
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S82rnsd
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S82rnsd
+@@ -317,6 +317,26 @@ start() {
+ 		rm -f "$LL_MARK"
+ 	fi
+ 
++	# First boot: create the transport identity before rnsd's first launch.
++	# rnsd itself writes it only once it has finished starting (after its
++	# interfaces, i.e. many seconds on a first boot with unreachable uplinks),
++	# and an RNS client that attaches meanwhile (rnstatus, the portal's
++	# Reticulum tab) finds no identity, creates its own and saves it over
++	# rnsd's: every client then derives the wrong RPC key ("digest received
++	# was wrong") until rnsd restarts. Created here, rnsd and every client load
++	# the same file. RNS's own generator, so the format always matches.
++	ident="$CFG_DIR/storage/transport_identity"
++	if [ ! -s "$ident" ]; then
++		mkdir -p "$CFG_DIR/storage"
++		if ( umask 077; python3 -c 'import sys, RNS; RNS.Identity().to_file(sys.argv[1])' "$ident" ) \
++			</dev/null >/dev/null 2>&1 && [ -s "$ident" ]; then
++			logger -t S82rnsd -p daemon.notice "created the transport identity before rnsd's first start" 2>/dev/null
++		else
++			rm -f "$ident"
++			logger -t S82rnsd -p daemon.warning "could not pre-create the transport identity; rnsd creates it" 2>/dev/null
++		fi
++	fi
++
+ 	# No rnsd is running. If the last one exited on its own (S46wanwatch's kick
+ 	# after a crash, say), end what it left running before its number in
+ 	# $PIDFILE is overwritten below - the only record of it.
+-- 
+2.47.3
+

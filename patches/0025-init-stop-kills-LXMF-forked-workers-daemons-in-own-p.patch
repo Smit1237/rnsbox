@@ -1,0 +1,934 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: smit1237 <smit1237@gmail.com>
+Date: Thu, 24 Sep 2026 16:37:43 +0300
+Subject: [PATCH 25/30] init: stop kills LXMF forked workers; daemons in own
+ process groups; no held stdout
+
+- rnsd, lxmd and nomadnet start in their own session/process group
+  (setsid; pidfile == daemon pid == pgid). stop SIGTERMs the daemon,
+  waits (bounded), then SIGKILLs the whole group and its logger, so
+  LXMF's forked stamp workers can no longer be orphaned at 100% CPU.
+  Workers never get SIGTERM: they inherit the daemon's handler and
+  would rewrite LXMF state from a stale fork-time copy.
+- No init script leaves a background child holding the caller's
+  stdin/stdout/stderr (loggers, watchdog loops, udhcpc, dhcpcd, the
+  delayed update check, resize2fs, adbd), so `S82rnsd restart | cat`
+  and friends return promptly.
+---
+ .../SG200X/overlay/etc/init.d/S08usbdev       |   4 +-
+ .../cvitek/SG200X/overlay/etc/init.d/S30eth   |  10 +-
+ .../cvitek/SG200X/overlay/etc/init.d/S35wifi  |   6 +-
+ .../SG200X/overlay/etc/init.d/S36wifiwatch    |   6 +-
+ .../SG200X/overlay/etc/init.d/S46wanwatch     |   7 +-
+ .../cvitek/SG200X/overlay/etc/init.d/S82rnsd  | 161 +++++++++++++--
+ .../SG200X/overlay/etc/init.d/S83nomadnet     | 193 ++++++++++++++++--
+ .../cvitek/SG200X/overlay/etc/init.d/S84cron  |   6 +-
+ .../cvitek/SG200X/overlay/etc/init.d/S85lxmd  | 188 +++++++++++++++--
+ .../SG200X/overlay/etc/init.d/S99nettest      |   2 +-
+ .../SG200X/overlay/etc/init.d/S99resizefs     |   5 +-
+ 11 files changed, 523 insertions(+), 65 deletions(-)
+
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S08usbdev b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S08usbdev
+index 4d2648658..5eb2e4262 100755
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S08usbdev
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S08usbdev
+@@ -234,7 +234,7 @@ then
+ 			ln -s functions/ffs.adb configs/c.1/
+ 			mkdir -p /dev/usb-ffs/adb
+ 			mount -t functionfs adb /dev/usb-ffs/adb/
+-			/usr/bin/adbd &
++			/usr/bin/adbd </dev/null >/dev/null 2>&1 &   # not the caller's stdio
+ 			for i in $(seq 1 40); do
+ 				if [ -e /dev/usb-ffs/adb/ep2 ]; then
+ 					break
+@@ -255,7 +255,7 @@ then
+         if [ -e /boot/usb.adbd ]
+         then
+             if [ -z "$(ps aux | grep adbd_monitor | grep -v grep)" ]; then
+-                /etc/adbd_monitor.sh &
++                /etc/adbd_monitor.sh </dev/null >/dev/null 2>&1 &
+             fi
+         fi
+ 	fi
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S30eth b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S30eth
+index 5bf026886..98ee97d70 100755
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S30eth
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S30eth
+@@ -110,8 +110,16 @@ start_dhcp() {
+ 	#   empty value is skipped by udhcpc, not fatal. (Keep "-i eth0" followed
+ 	#   by another argument: stop_dhcp matches " -i eth0 ".)
+ 	# -r (renew only): the address to ask for, see renew.
++	# stdio to /dev/null: udhcpc stays in the foreground until it has a lease
++	#   or its tries run out (~10 s with no answer), printing to its stdout,
++	#   which held the caller's pipe open (`S30eth restart | cat` waited for
++	#   it). Its messages and default.script's chatter are dropped. -S (also
++	#   log to syslog) is left off on purpose: it keeps syslog logging after
++	#   backgrounding, and with no lease (eth0 unplugged, no DHCP server) udhcpc
++	#   logs "broadcasting discover" ~40 times a minute forever, rotating the
++	#   rnsd/lxmd/nomadnet logs out of /var/log/messages within hours.
+ 	(udhcpc -i eth0 -x hostname:"$(hostname)" -t 10 -T 1 -A 5 -b -p /run/udhcpc.eth0.pid \
+-	  ${REQUEST_IP:+-r "$REQUEST_IP"}) &
++	  ${REQUEST_IP:+-r "$REQUEST_IP"}) </dev/null >/dev/null 2>&1 &
+ 	echo "dhcp"
+ }
+ 
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S35wifi b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S35wifi
+index 888411980..c19c258ea 100755
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S35wifi
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S35wifi
+@@ -244,10 +244,12 @@ start_sta() {
+ 	# 9>&- closes the /run/wifi.lock fd (held by the caller) for the daemon, so
+ 	# a long-lived wpa_supplicant can't pin the lock after S35wifi exits and
+ 	# deadlock the next invocation (portal apply / watchdog). Same for dhcpcd
+-	# and hostapd below.
++	# and hostapd below. (wpa_supplicant -B and hostapd -B detach onto
++	# /dev/null themselves; the backgrounded dhcpcd gets </dev/null so it
++	# doesn't keep the caller's stdin either.)
+ 	wpa_supplicant -B -i "$STA_IF" -c "$WPA_CONF" -P /var/run/wpa_supplicant-wlan0.pid >>"$LOG" 2>&1 9>&-
+ 	apply_txpower "$STA_IF"
+-	dhcpcd -b -n "$STA_IF" >>"$LOG" 2>&1 9>&- &
++	dhcpcd -b -n "$STA_IF" </dev/null >>"$LOG" 2>&1 9>&- &
+ 	log "STA started on $STA_IF ssid=$ssid${band:+ (2.4 GHz pinned — concurrent)}"
+ }
+ 
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S36wifiwatch b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S36wifiwatch
+index 7b7c04796..ceb1e7da4 100755
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S36wifiwatch
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S36wifiwatch
+@@ -97,8 +97,12 @@ loop() {
+ 	done
+ }
+ 
++# `( loop )` with its own stdio, so neither the loop nor what it runs keeps the
++# caller's stdin/stdout/stderr (`S36wifiwatch start | cat` waited forever);
++# wpa_cli's "OK" replies go to /dev/null, errors to $LOG. Not `loop ... &`:
++# ash would keep a saved copy of the caller's stdout (see S45ntpsync launch).
+ case "${1:-start}" in
+-	start) loop & ;;
++	start) ( loop ) </dev/null >/dev/null 2>>"$LOG" & ;;
+ 	stop)  : ;;
+ 	*) echo "usage: $0 {start|stop}"; exit 1 ;;
+ esac
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S46wanwatch b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S46wanwatch
+index 33ba7d6c0..985bb36d4 100755
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S46wanwatch
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S46wanwatch
+@@ -321,7 +321,12 @@ start() {
+ 		echo "S46wanwatch: already running (pid $(cat "$PIDFILE"))"
+ 		return 0
+ 	fi
+-	loop &
++	# `( loop )` with its own stdio: the loop and everything it runs (sleep,
++	# the S82rnsd kicks) never keep the caller's stdin/stdout/stderr, which
++	# made `S46wanwatch start | cat` wait forever. Not `loop ... &`: ash keeps
++	# a backgrounded function's redirections as saved pushes, so the loop
++	# would still hold a copy of the caller's stdout (see S45ntpsync launch).
++	( loop ) </dev/null >>"$LOG" 2>&1 &
+ 	echo $! > "$PIDFILE"
+ 	echo "S46wanwatch: started (pid $(cat "$PIDFILE"))"
+ }
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S82rnsd b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S82rnsd
+index 4e484c094..5d39cb2ac 100755
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S82rnsd
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S82rnsd
+@@ -40,6 +40,17 @@
+ # than `rnsd | logger &` so that $! — and so /var/run/rnsd.pid, which the
+ # portal and S46wanwatch read — is the rnsd process itself, not logger.
+ #
++# Process group: rnsd leads a session and process group of its own
++# (setsid; its pid is still $! and the pidfile's), so stop can end
++# everything rnsd started (a PipeInterface's command, say) along with it,
++# and nothing is tied to the caller's terminal. If rnsd exits on its own
++# (a crash, the OOM killer, a restart killed partway through stop), what it
++# started keeps running; the next start or stop ends that too (see
++# reap_dead_group), so a kick after a crash doesn't leave a PipeInterface
++# command holding its port or serial device until reboot. Neither rnsd nor
++# logger keeps the caller's stdin/stdout/stderr: `S82rnsd restart | tee`
++# over SSH used to hang until rnsd exited.
++#
+ # Secrets: rnsd keeps its transport identity (a private key) under
+ # /etc/reticulum/storage. It runs with umask 077, and start() tightens any
+ # file an older build left group/world-readable (plus the config dir itself,
+@@ -68,6 +79,8 @@ STOPPED_MARK=/run/rnsd.stopped
+ ARMED_MARK=/run/rnsd.armed
+ # Present once this boot's full permission walk over storage/ succeeded.
+ PERMS_MARK=/run/rnsd-perms-done
++# The logger reading $LOGPIPE (start), ended by stop if rnsd's exit leaves it.
++LOGGER_PIDFILE=/var/run/$NAME.logger.pid
+ # start() sets a path table aside only when it is dated more than this far
+ # after the current clock (see there).
+ CLOCK_SLACK=3600
+@@ -108,6 +121,76 @@ rnsd_pid() {
+ 	return 1
+ }
+ 
++# pstat PID — PSTATE, PPGRP and PSID = PID's state, process group and
++# session (fields 3, 5 and 6 of /proc/PID/stat, counted after comm's last
++# ")": comm may hold spaces); false once PID is gone. Builtins only. Same as
++# S83nomadnet/S85lxmd, plus PSID.
++pstat() {
++	PSTATE=; PPGRP=; PSID=
++	case "$1" in ''|*[!0-9]*) return 1 ;; esac
++	_s=
++	{ read -r _s <"/proc/$1/stat"; } 2>/dev/null || return 1
++	set -- ${_s##*) }
++	PSTATE=$1; PPGRP=$3; PSID=$4
++}
++
++# group_alive PGID — true while process group PGID has a member that has not
++# exited (a zombie holds nothing open). Builtins only.
++group_alive() {
++	for _d in /proc/[0-9]*; do
++		pstat "${_d#/proc/}" && [ "$PPGRP" = "$1" ] && [ "$PSTATE" != Z ] && return 0
++	done
++	return 1
++}
++
++# reap_dead_group — SIGKILL what an rnsd that exited on its own left running;
++# true (REAPED = its pid) if there was any. start ran rnsd as the leader of a
++# session and process group numbered by the pid in $PIDFILE, and the kernel
++# never hands that number out again while any process still has it as its
++# group or session. So once that pid is gone (or a zombie), live processes
++# whose group and session are both that number are what rnsd started. A live
++# process at that pid is not rnsd (callers have checked), so the pid was
++# reused and the group, if any, is not rnsd's. SIGKILL, not SIGTERM, as in
++# stop: a fork would run rnsd's inherited Python SIGTERM handler. Callers run
++# this while $PIDFILE still names the exited rnsd: start before it records
++# the new one, stop before removing it. Costs one /proc scan, and only when
++# the pidfile names a pid that is gone.
++reap_dead_group() {
++	REAPED=
++	_p=
++	{ read -r _p <"$PIDFILE"; } 2>/dev/null
++	case "$_p" in ''|*[!0-9]*) return 1 ;; esac
++	pstat "$_p" && [ "$PSTATE" != Z ] && return 1
++	_hit=
++	for _d in /proc/[0-9]*; do
++		pstat "${_d#/proc/}" && [ "$PPGRP" = "$_p" ] && [ "$PSID" = "$_p" ] \
++			&& [ "$PSTATE" != Z ] && { _hit=1; break; }
++	done
++	[ -n "$_hit" ] || return 1
++	kill -KILL "-$_p" 2>/dev/null
++	logger -t S82rnsd -p daemon.notice "rnsd (pid $_p) had exited, leaving processes it started running - killed them" 2>/dev/null
++	# up to 1 s for them to be gone (and so to close the FIFO)
++	_i=0
++	while group_alive "$_p" && [ "$_i" -lt 5 ]; do
++		sleep 0.2; _i=$((_i + 1))
++	done
++	REAPED=$_p
++}
++
++# logger_pid — print the logger start ran for rnsd's output, while
++# $LOGGER_PIDFILE names one: comm "logger" and an "rnsd[<pid>]" tag in its
++# argv (a zombie's argv reads empty), so a recycled pid never matches.
++logger_pid() {
++	l=
++	{ read -r l <"$LOGGER_PIDFILE"; } 2>/dev/null
++	case "$l" in ''|*[!0-9]*) return 1 ;; esac
++	c=
++	{ read -r c <"/proc/$l/comm"; } 2>/dev/null
++	[ "$c" = logger ] || return 1
++	tr '\0' '\n' <"/proc/$l/cmdline" 2>/dev/null | grep -q "^$NAME\[[0-9]*\]\$" || return 1
++	echo "$l"
++}
++
+ # usb0_ll — true once usb0 has a usable IPv6 link-local address (scope 0x20,
+ # DAD done: neither tentative 0x40 nor dadfailed 0x08), read from
+ # /proc/net/if_inet6 with builtins only. Same test as S46wanwatch.
+@@ -210,23 +293,39 @@ start() {
+ 		rm -f "$LL_MARK"
+ 	fi
+ 
++	# No rnsd is running. If the last one exited on its own (S46wanwatch's kick
++	# after a crash, say), end what it left running before its number in
++	# $PIDFILE is overwritten below - the only record of it.
++	reap_dead_group && echo "S82rnsd: killed what the exited rnsd (pid $REAPED) left running"
++
+ 	printf "Starting %s: " "$NAME"
+ 	# --config points at our config dir; rnsd auto-creates files inside.
+ 	# The subshell sets umask 077 + PYTHONUNBUFFERED for rnsd only and exec's
+-	# it, so $! is rnsd's pid. Its open of the FIFO completes once logger opens
+-	# the read end.
+-	rm -f "$LOGPIPE"
++	# setsid, which exec's rnsd, so $! is rnsd's pid - and, setsid having
++	# made it a session and group leader, its process group (see stop).
++	# busybox setsid forks only when its caller leads a process group, and
++	# the backgrounded subshell never does (no job control in a script).
++	# Without setsid rnsd still runs, and stop signals it alone. rnsd's open
++	# of the FIFO completes once logger opens the read end. stdin is
++	# /dev/null, rnsd writes only to the FIFO and logger only to syslog:
++	# nothing keeps the caller's stdin/stdout/stderr. logger gets a session of
++	# its own too; a logger left by an rnsd that died goes first.
++	SETSID=
++	command -v setsid >/dev/null 2>&1 && SETSID=setsid
++	LPID=$(logger_pid) && kill "$LPID" 2>/dev/null
++	rm -f "$LOGPIPE" "$LOGGER_PIDFILE"
+ 	if command -v logger >/dev/null 2>&1 && mkfifo -m 600 "$LOGPIPE" 2>/dev/null; then
+ 		(
+ 			umask 077
+ 			export PYTHONUNBUFFERED=1
+-			exec "$DAEMON" --config "$CFG_DIR"
+-		) 9>&- >"$LOGPIPE" 2>&1 &
++			exec $SETSID "$DAEMON" --config "$CFG_DIR"
++		) 9>&- </dev/null >"$LOGPIPE" 2>&1 &
+ 		PID=$!
+-		logger -t "$NAME[$PID]" -p daemon.notice 9>&- <"$LOGPIPE" &
++		$SETSID logger -t "$NAME[$PID]" -p daemon.notice 9>&- <"$LOGPIPE" >/dev/null 2>&1 &
++		echo $! > "$LOGGER_PIDFILE"
+ 	else
+ 		# no logger/FIFO: run unlogged rather than not at all
+-		( umask 077; exec "$DAEMON" --config "$CFG_DIR" ) 9>&- >/dev/null 2>&1 &
++		( umask 077; exec $SETSID "$DAEMON" --config "$CFG_DIR" ) 9>&- </dev/null >/dev/null 2>&1 &
+ 		PID=$!
+ 	fi
+ 	echo "$PID" > "$PIDFILE"
+@@ -243,7 +342,13 @@ start() {
+ stop() {
+ 	printf "Stopping %s: " "$NAME"
+ 	rm -f "$LL_MARK"
++	LPID=$(logger_pid)
+ 	if PID=$(rnsd_pid); then
++		# rnsd's process group, if start made rnsd its leader (setsid): all
++		# rnsd started is in it. Otherwise rnsd is signalled alone, never the
++		# group it shares with whoever started it.
++		GRP=
++		pstat "$PID" && [ "$PPGRP" = "$PID" ] && GRP=$PID
+ 		kill "$PID" 2>/dev/null
+ 		# Reticulum drains active links on SIGTERM and then persists its path
+ 		# table, packet hashlist and known destinations. That is pure Python and
+@@ -251,27 +356,49 @@ stop() {
+ 		# until the pid is really gone: if stop returned while rnsd was still
+ 		# exiting, restart's start() would find it (comm is still "rnsd"),
+ 		# adopt it, and leave nothing running once it exits. 18 s plus the
+-		# SIGKILL fallback keeps one restart at ~21 s on its own, inside the
+-		# 25 s web::run_init allows; updatecheck.py allows RESTART_TIMEOUT
+-		# (50 s) because the lock below can queue it, for up to 25 s, behind
+-		# another S82rnsd operation. (A SIGKILL mid-persist can only truncate
+-		# destination_table/tunnels/packet_hashlist.raw, which RNS discards on
+-		# load and rebuilds; known_destinations is replaced atomically.)
+-		# (logger exits by itself when rnsd's end of the FIFO closes.)
++		# SIGKILL fallback (at most 1 s more) keeps one restart at ~21 s on its
++		# own, inside the 25 s web::run_init allows; updatecheck.py allows
++		# RESTART_TIMEOUT (50 s) because the lock below can queue it, for up to
++		# 25 s, behind another S82rnsd operation. (A SIGKILL mid-persist can
++		# only truncate destination_table/tunnels/packet_hashlist.raw, which RNS
++		# discards on load and rebuilds; known_destinations is replaced
++		# atomically.)
+ 		i=0
+ 		while kill -0 "$PID" 2>/dev/null && [ "$i" -lt 18 ]; do
+ 			sleep 1; i=$((i + 1))
+ 		done
+-		if kill -0 "$PID" 2>/dev/null && is_rnsd "$PID"; then
++		# Then SIGKILL whatever is left of the group - rnsd if it overran, and
++		# anything it started that outlived it (still holding the FIFO, and so
++		# logger). SIGKILL, not SIGTERM, for those too: a fork would run
++		# rnsd's inherited Python SIGTERM handler.
++		if [ -n "$GRP" ]; then
++			group_alive "$GRP" && kill -KILL "-$GRP" 2>/dev/null
++		elif kill -0 "$PID" 2>/dev/null && is_rnsd "$PID"; then
+ 			kill -9 "$PID" 2>/dev/null
+-			sleep 1
+ 		fi
++		# Up to 1 s for all of it to be gone. logger reads EOF and exits once
++		# the last writer of the FIFO has; one still running then (a writer
++		# outside the group) is killed.
++		i=0
++		while [ "$i" -lt 5 ]; do
++			kill -0 "$PID" 2>/dev/null || { [ -n "$GRP" ] && group_alive "$GRP"; } \
++				|| { [ -n "$LPID" ] && [ "$(logger_pid)" = "$LPID" ]; } || break
++			sleep 0.2; i=$((i + 1))
++		done
++		[ -n "$LPID" ] && [ "$(logger_pid)" = "$LPID" ] && kill "$LPID" 2>/dev/null
+ 		rm -f "$PIDFILE"
+ 		echo "OK"
+ 	else
++		# rnsd exited on its own: end what it left running (reap_dead_group).
++		# That can take up to 1 s, so logger is re-checked before it is killed.
++		MSG="(not running)"
++		reap_dead_group && MSG="(not running; killed what pid $REAPED left running)"
+ 		rm -f "$PIDFILE"
+-		echo "(not running)"
++		# no rnsd left to log for
++		[ -n "$LPID" ] && [ "$(logger_pid)" = "$LPID" ] && kill "$LPID" 2>/dev/null
++		echo "$MSG"
+ 	fi
++	rm -f "$LOGGER_PIDFILE"
+ }
+ 
+ # Serialize start/stop/restart on one lock. S46wanwatch runs `kick` whenever
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S83nomadnet b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S83nomadnet
+index 87342fa9a..81bdf04eb 100755
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S83nomadnet
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S83nomadnet
+@@ -32,16 +32,23 @@
+ # and with unbuffered stdout/stderr fed to syslog (/var/log/messages, tag
+ # "nomadnet[<pid>]") through a FIFO, so $! / the pidfile is nomadnet itself.
+ # --console: log to stdout (-> syslog) instead of $configdir/logfile on the SD
+-# card; --config (not --configdir) is nomadnet's flag.
++# card; --config (not --configdir) is nomadnet's flag. It leads a session and
++# process group of its own (setsid), and stop ends that whole group: nomadnet
++# embeds the same LXMF router as lxmd, whose forked stamp workers outlived a
++# SIGTERM to lxmd alone (see stop_nomadnet), and runs page scripts as child
++# processes. Nothing started here keeps the caller's stdin/stdout/stderr, so
++# `S83nomadnet start | head` returns at once instead of when nomadnet exits.
+ 
+ NAME=nomadnet
+ DAEMON=/usr/bin/nomadnet
+ CONF=/etc/rnsbox/nomadnet.conf
+ PIDFILE=/var/run/$NAME.pid
+ LOGPIPE=/var/run/$NAME.logpipe
++LOGGER_PIDFILE=/var/run/$NAME.logger.pid   # the logger reading $LOGPIPE
+ DEFAULT_CONFIGDIR=/var/lib/nomadnetwork
+ PERMS_MARK=/run/nomadnet-perms-done   # configdir whose full walk ran this boot
+ DEPS_MARK=/run/wanwatch-deps-pending  # S46wanwatch starts us once rnsd's up
++STOP_WAIT=10   # s nomadnet gets to persist its state and exit after SIGTERM
+ 
+ # Not installed: nothing to run (and `enabled` answers no).
+ if [ ! -x "$DAEMON" ]; then
+@@ -67,6 +74,142 @@ rns_shared_up() {
+ 	return 1
+ }
+ 
++# pidfile_pid FILE — print the pid FILE holds; false if none (or not a pid).
++pidfile_pid() {
++	_p=
++	{ read -r _p <"$1"; } 2>/dev/null
++	case "$_p" in ''|*[!0-9]*) return 1 ;; esac
++	echo "$_p"
++}
++
++# pstat PID — PSTATE and PPGRP = PID's state and process group (fields 3 and
++# 5 of /proc/PID/stat, counted after comm's last ")": comm may hold spaces);
++# false once PID is gone. Builtins only. Same as S82rnsd/S85lxmd.
++pstat() {
++	PSTATE=; PPGRP=
++	case "$1" in ''|*[!0-9]*) return 1 ;; esac
++	_s=
++	{ read -r _s <"/proc/$1/stat"; } 2>/dev/null || return 1
++	set -- ${_s##*) }
++	PSTATE=$1; PPGRP=$3
++}
++
++# is_nomadnet PID — true if PID is a live nomadnet, or a fork of one (LXMF's
++# stamp workers are forks without exec, so they keep its comm). nomadnet is a
++# python console-script and the kernel names a script process after the
++# script file, so its comm is "nomadnet"; started through the interpreter
++# instead (comm python*) it is confirmed on argv[0]/argv[1]. A zombie, a
++# recycled pid or logger's "nomadnet[<pid>]" tag never match.
++is_nomadnet() {
++	pstat "$1" && [ "$PSTATE" != Z ] || return 1
++	comm=
++	{ read -r comm <"/proc/$1/comm"; } 2>/dev/null
++	case "$comm" in
++		nomadnet) return 0 ;;
++		python*)  tr '\0' '\n' <"/proc/$1/cmdline" 2>/dev/null | head -n 2 \
++		            | grep -qE '(^|/)nomadnet$' ;;
++		*)        return 1 ;;
++	esac
++}
++
++# group_alive PGID — true while process group PGID has a member that has not
++# exited (a zombie holds nothing open). Builtins only.
++group_alive() {
++	for _d in /proc/[0-9]*; do
++		pstat "${_d#/proc/}" && [ "$PPGRP" = "$1" ] && [ "$PSTATE" != Z ] && return 0
++	done
++	return 1
++}
++
++# group_has_nomadnet PGID — true if nomadnet, or a fork of it, is alive in
++# process group PGID: nomadnet's group, even once nomadnet itself is gone and
++# only its forks are left.
++group_has_nomadnet() {
++	for _d in /proc/[0-9]*; do
++		pstat "${_d#/proc/}" && [ "$PPGRP" = "$1" ] && is_nomadnet "${_d#/proc/}" && return 0
++	done
++	return 1
++}
++
++# is_our_logger PID — true if PID is the logger start ran for nomadnet's
++# output: comm "logger" and a "nomadnet[<pid>]" tag in its argv (a zombie's
++# argv reads empty), so a stale $LOGGER_PIDFILE naming a recycled pid never
++# matches.
++is_our_logger() {
++	_c=
++	{ read -r _c <"/proc/$1/comm"; } 2>/dev/null
++	[ "$_c" = logger ] || return 1
++	tr '\0' '\n' <"/proc/$1/cmdline" 2>/dev/null | grep -q "^$NAME\[[0-9]*\]\$"
++}
++
++# stop_nomadnet — stop nomadnet and everything it started; false if nothing
++# was running. start made nomadnet the leader of a session and process group
++# of its own (setsid), numbered by the pid in $PIDFILE, and all it forks or
++# runs stays in that group. Same steps as S85lxmd's stop_lxmd, whose stamp
++# workers (the same LXMF code runs in nomadnet) survived a SIGTERM to lxmd
++# alone on the box, at ~100% CPU each and holding the FIFO open:
++#   1. SIGSTOP the group (so LXMF's CPU-bound forks don't starve the save on
++#      the one core), SIGTERM nomadnet and SIGCONT it alone: it tears down its
++#      links, persists its state and exits. Wait up to STOP_WAIT s for it.
++#      The three kills stay back to back: nomadnet frozen between STOP and
++#      CONT would still count as running.
++#   2. SIGKILL to whatever is left of the group: forks, page scripts, and
++#      nomadnet itself if it overran. Not SIGTERM: a fork inherits nomadnet's
++#      Python signal handlers, and a stamp worker given SIGTERM would run
++#      LXMRouter's exit handler - rewrite peers, transient-id caches and node
++#      stats from its stale fork-time copy, and send link teardowns down the
++#      shared-instance socket.
++#   3. Wait up to 1 s for the group and logger to be gone. logger reads EOF
++#      once the last writer of the FIFO has exited; one still running then
++#      (a writer outside the group) is killed.
++# nomadnet found gone with its forks still running (it crashed, or was killed
++# on its own) skips to 2 - start runs this for that case too. A stale pidfile
++# is harmless: a recycled pid is no nomadnet (is_nomadnet), and while any
++# member of nomadnet's group lives the kernel never hands out its number
++# again, so a group under that number with a nomadnet in it is nomadnet's. A
++# daemon that is not its own group leader (setsid missing) is signalled
++# alone, never its group.
++stop_nomadnet() {
++	p=$(pidfile_pid "$PIDFILE")
++	lp=$(pidfile_pid "$LOGGER_PIDFILE") && ! is_our_logger "$lp" && lp=
++	lead=; grp=
++	if [ -n "$p" ] && is_nomadnet "$p"; then
++		lead=$p
++		[ "$PPGRP" = "$p" ] && grp=$p
++	elif [ -n "$p" ] && group_has_nomadnet "$p"; then
++		grp=$p
++	fi
++	if [ -z "$lead$grp" ]; then
++		# no nomadnet left to log for
++		[ -n "$lp" ] && kill "$lp" 2>/dev/null
++		rm -f "$LOGGER_PIDFILE"
++		return 1
++	fi
++	if [ -n "$lead" ]; then
++		[ -n "$grp" ] && kill -STOP "-$grp" 2>/dev/null
++		kill "$lead" 2>/dev/null
++		kill -CONT "$lead" 2>/dev/null
++		i=0
++		while [ "$i" -lt "$STOP_WAIT" ] && is_nomadnet "$lead"; do
++			sleep 1; i=$((i + 1))
++		done
++	fi
++	if [ -n "$grp" ]; then
++		group_alive "$grp" && kill -KILL "-$grp" 2>/dev/null
++	elif is_nomadnet "$lead"; then
++		kill -KILL "$lead" 2>/dev/null
++	fi
++	i=0
++	while [ "$i" -lt 5 ]; do
++		{ [ -n "$grp" ] && group_alive "$grp"; } || is_nomadnet "$lead" \
++			|| { [ -n "$lp" ] && is_our_logger "$lp"; } || break
++		sleep 0.2; i=$((i + 1))
++	done
++	[ -n "$lp" ] && is_our_logger "$lp" && kill "$lp" 2>/dev/null
++	rm -f "$LOGGER_PIDFILE"
++	return 0
++}
++
+ # --- read the enable flag (single key=value lines, no shell sourcing) ---
+ read_conf() {
+ 	enabled="no"
+@@ -99,10 +242,13 @@ start() {
+ 
+ 	mkdir -p /var/run "$configdir"
+ 
+-	if [ -f "$PIDFILE" ] && kill -0 "$(cat $PIDFILE)" 2>/dev/null; then
+-		echo "S83nomadnet: already running (pid $(cat $PIDFILE))"
++	if p=$(pidfile_pid "$PIDFILE") && is_nomadnet "$p"; then
++		echo "S83nomadnet: already running (pid $p)"
+ 		return 0
+ 	fi
++	# What a nomadnet that died left behind: its forks (stamp workers still
++	# spinning) and its logger.
++	stop_nomadnet && echo "S83nomadnet: ended the forks of a nomadnet that had exited (pid ${p:-?})"
+ 
+ 	# Attach to rnsd's shared instance — never open it ourselves.
+ 	if [ -z "$(pidof rnsd)" ]; then
+@@ -136,17 +282,31 @@ start() {
+ 	fi
+ 
+ 	printf "Starting %s: " "$NAME"
+-	rm -f "$LOGPIPE"
++	# setsid: nomadnet leads a session and process group of its own
++	# (stop_nomadnet ends that group), with no controlling terminal. busybox
++	# setsid forks only when its caller leads a process group, and the
++	# backgrounded subshell never does (no job control in a script): it
++	# exec's setsid, which exec's nomadnet (--daemon doesn't fork either), so
++	# $! is nomadnet's pid and its process group. Without setsid nomadnet
++	# still runs, and stop signals it alone. stdin is /dev/null, nomadnet
++	# writes only to the FIFO and logger only to syslog: nothing keeps the
++	# caller's stdin/stdout/stderr open. logger gets a session of its own too,
++	# and its pid is kept for stop.
++	SETSID=
++	command -v setsid >/dev/null 2>&1 && SETSID=setsid
++	rm -f "$LOGPIPE" "$LOGGER_PIDFILE"
+ 	if command -v logger >/dev/null 2>&1 && mkfifo -m 600 "$LOGPIPE" 2>/dev/null; then
+ 		(
+ 			umask 077
+ 			export PYTHONUNBUFFERED=1
+-			exec "$DAEMON" --daemon --console --config "$configdir"
+-		) 9>&- >"$LOGPIPE" 2>&1 &
++			exec $SETSID "$DAEMON" --daemon --console --config "$configdir"
++		) 9>&- </dev/null >"$LOGPIPE" 2>&1 &
+ 		PID=$!
+-		logger -t "$NAME[$PID]" -p daemon.notice 9>&- <"$LOGPIPE" &
++		$SETSID logger -t "$NAME[$PID]" -p daemon.notice 9>&- <"$LOGPIPE" >/dev/null 2>&1 &
++		echo $! > "$LOGGER_PIDFILE"
+ 	else
+-		( umask 077; exec "$DAEMON" --daemon --console --config "$configdir" ) 9>&- >/dev/null 2>&1 &
++		( umask 077; exec $SETSID "$DAEMON" --daemon --console --config "$configdir" ) \
++			9>&- </dev/null >/dev/null 2>&1 &
+ 		PID=$!
+ 	fi
+ 	echo "$PID" > "$PIDFILE"
+@@ -162,17 +322,12 @@ start() {
+ 
+ stop() {
+ 	printf "Stopping %s: " "$NAME"
+-	if [ -f "$PIDFILE" ]; then
+-		kill "$(cat $PIDFILE)" 2>/dev/null
+-		for _ in 1 2 3 4 5; do
+-			[ -f "$PIDFILE" ] && kill -0 "$(cat $PIDFILE)" 2>/dev/null || break
+-			sleep 1
+-		done
+-		rm -f "$PIDFILE"
++	if stop_nomadnet; then
+ 		echo "OK"
+ 	else
+ 		echo "(not running)"
+ 	fi
++	rm -f "$PIDFILE"
+ }
+ 
+ # Opt-in, checked first: a start while disabled returns before the lock
+@@ -185,7 +340,9 @@ esac
+ # Serialize start/stop/restart on /run/nomadnet.lock: two starts that both
+ # passed the pidfile check would run two nomadnets. The spawn lines close
+ # fd 9 (first, before the FIFO open can block) so nomadnet and logger can't
+-# pin the lock. Bounded wait (busybox flock has no -w), as in S82rnsd.
++# pin the lock. Bounded wait (busybox flock has no -w), as in S82rnsd; 15 s
++# outlasts a restart queued ahead (stop: up to STOP_WAIT + 1 s, then 1 s and
++# a start).
+ case "${1:-start}" in
+ 	start|stop|restart)
+ 		exec 9>/run/$NAME.lock
+@@ -209,8 +366,8 @@ case "${1:-start}" in
+ 	status)
+ 		read_conf
+ 		echo "enabled in conf: $enabled"
+-		if [ -f "$PIDFILE" ] && kill -0 "$(cat $PIDFILE)" 2>/dev/null; then
+-			echo "running:         pid $(cat $PIDFILE)"
++		if p=$(pidfile_pid "$PIDFILE") && is_nomadnet "$p"; then
++			echo "running:         pid $p"
+ 		else
+ 			echo "running:         no"
+ 		fi
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S84cron b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S84cron
+index 9fb76e7a0..16940dada 100755
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S84cron
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S84cron
+@@ -111,8 +111,10 @@ bootcheck() {
+ 		return 0
+ 	fi
+ 	# Backgrounded so it never blocks boot/wanwatch; the short delay lets rnsd
+-	# and the freshly-up WAN settle first. Quiet when offline.
+-	( sleep 30; /usr/sbin/rnsbox-update-check ) >>"$LOG" 2>&1 &
++	# and the freshly-up WAN settle first. Quiet when offline. stdin is
++	# /dev/null too, so it keeps none of its caller's stdio (S46wanwatch, the
++	# portal, an SSH shell).
++	( sleep 30; /usr/sbin/rnsbox-update-check ) </dev/null >>"$LOG" 2>&1 &
+ 	echo "S84cron: boot-time update check scheduled"
+ }
+ 
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S85lxmd b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S85lxmd
+index 052bd0aa0..6ea684837 100755
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S85lxmd
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S85lxmd
+@@ -32,7 +32,11 @@
+ # Like S82rnsd: runs with umask 077 (its identity key is /etc/lxmd/identity;
+ # start() tightens anything left group/world-readable) and with unbuffered
+ # output fed to syslog (/var/log/messages, tag "lxmd[<pid>]") through a FIFO,
+-# so $! / the pidfile is lxmd itself.
++# so $! / the pidfile is lxmd itself. It leads a session and process group of
++# its own (setsid), and stop ends that whole group: LXMF forks its stamp
++# workers, which outlived a SIGTERM to lxmd alone (see stop_lxmd). Nothing
++# started here keeps the caller's stdin/stdout/stderr, so `S85lxmd start |
++# head` returns at once instead of when lxmd exits.
+ 
+ NAME=lxmd
+ DAEMON=/usr/bin/lxmd
+@@ -41,8 +45,10 @@ LXMD_CONFIGDIR=/etc/lxmd
+ RNS_CONFIGDIR=/etc/reticulum
+ PIDFILE=/var/run/$NAME.pid
+ LOGPIPE=/var/run/$NAME.logpipe
++LOGGER_PIDFILE=/var/run/$NAME.logger.pid   # the logger reading $LOGPIPE
+ PERMS_MARK=/run/lxmd-perms-done   # this boot's full walk of $LXMD_CONFIGDIR ran
+ DEPS_MARK=/run/wanwatch-deps-pending  # S46wanwatch starts us once rnsd's up
++STOP_WAIT=10   # s lxmd gets to persist its state and exit after SIGTERM
+ 
+ # Not installed: nothing to run (and `enabled` answers no).
+ if [ ! -x "$DAEMON" ]; then
+@@ -88,6 +94,140 @@ mem_available_mb() {
+ 	awk '/^MemAvailable:/{print int($2/1024); found=1} END{if(!found) print 0}' /proc/meminfo 2>/dev/null
+ }
+ 
++# pidfile_pid FILE — print the pid FILE holds; false if none (or not a pid).
++pidfile_pid() {
++	_p=
++	{ read -r _p <"$1"; } 2>/dev/null
++	case "$_p" in ''|*[!0-9]*) return 1 ;; esac
++	echo "$_p"
++}
++
++# pstat PID — PSTATE and PPGRP = PID's state and process group (fields 3 and
++# 5 of /proc/PID/stat, counted after comm's last ")": comm may hold spaces);
++# false once PID is gone. Builtins only. Same as S82rnsd/S83nomadnet.
++pstat() {
++	PSTATE=; PPGRP=
++	case "$1" in ''|*[!0-9]*) return 1 ;; esac
++	_s=
++	{ read -r _s <"/proc/$1/stat"; } 2>/dev/null || return 1
++	set -- ${_s##*) }
++	PSTATE=$1; PPGRP=$3
++}
++
++# is_lxmd PID — true if PID is a live lxmd, or a fork of one (LXMF's stamp
++# workers are forks without exec, so they keep its comm). lxmd is a python
++# console-script and the kernel names a script process after the script file,
++# so its comm is "lxmd"; started through the interpreter instead (comm
++# python*) it is confirmed on argv[0]/argv[1]. A zombie, a recycled pid or
++# logger's "lxmd[<pid>]" tag never match.
++is_lxmd() {
++	pstat "$1" && [ "$PSTATE" != Z ] || return 1
++	comm=
++	{ read -r comm <"/proc/$1/comm"; } 2>/dev/null
++	case "$comm" in
++		lxmd)    return 0 ;;
++		python*) tr '\0' '\n' <"/proc/$1/cmdline" 2>/dev/null | head -n 2 \
++		           | grep -qE '(^|/)lxmd$' ;;
++		*)       return 1 ;;
++	esac
++}
++
++# group_alive PGID — true while process group PGID has a member that has not
++# exited (a zombie holds nothing open). Builtins only.
++group_alive() {
++	for _d in /proc/[0-9]*; do
++		pstat "${_d#/proc/}" && [ "$PPGRP" = "$1" ] && [ "$PSTATE" != Z ] && return 0
++	done
++	return 1
++}
++
++# group_has_lxmd PGID — true if lxmd, or a fork of it, is alive in process
++# group PGID: lxmd's group, even once lxmd itself is gone and only its forks
++# are left.
++group_has_lxmd() {
++	for _d in /proc/[0-9]*; do
++		pstat "${_d#/proc/}" && [ "$PPGRP" = "$1" ] && is_lxmd "${_d#/proc/}" && return 0
++	done
++	return 1
++}
++
++# is_our_logger PID — true if PID is the logger start ran for lxmd's output:
++# comm "logger" and an "lxmd[<pid>]" tag in its argv (a zombie's argv reads
++# empty), so a stale $LOGGER_PIDFILE naming a recycled pid never matches.
++is_our_logger() {
++	_c=
++	{ read -r _c <"/proc/$1/comm"; } 2>/dev/null
++	[ "$_c" = logger ] || return 1
++	tr '\0' '\n' <"/proc/$1/cmdline" 2>/dev/null | grep -q "^$NAME\[[0-9]*\]\$"
++}
++
++# stop_lxmd — stop lxmd and everything it started; false if nothing was
++# running. start made lxmd the leader of a session and process group of its
++# own (setsid), numbered by the pid in $PIDFILE, and all it forks stays in
++# that group. On the box, LXMF's stamp workers survived a SIGTERM to lxmd
++# alone: reparented to init, at ~100% CPU and ~25 MB each, holding the FIFO
++# open so that logger never exited either. So:
++#   1. SIGSTOP the group (so LXMF's CPU-bound forks don't starve the save on
++#      the one core), SIGTERM lxmd and SIGCONT it alone: it tears down its
++#      links, persists its state and exits. Wait up to STOP_WAIT s for it.
++#      The three kills stay back to back: lxmd frozen between STOP and CONT
++#      would still count as running.
++#   2. SIGKILL to whatever is left of the group: the forks, and lxmd itself if
++#      it overran. Not SIGTERM: a fork inherits lxmd's Python signal handlers,
++#      and a stamp worker given SIGTERM would run LXMRouter's exit handler -
++#      rewrite peers, transient-id caches and node stats from its stale
++#      fork-time copy, and send link teardowns down lxmd's shared-instance
++#      socket.
++#   3. Wait up to 1 s for the group and logger to be gone. logger reads EOF
++#      once the last writer of the FIFO has exited; one still running then
++#      (a writer outside the group) is killed.
++# lxmd found gone with its forks still running (it crashed, or was killed on
++# its own) skips to 2 - start runs this for that case too. A stale pidfile is
++# harmless: a recycled pid is no lxmd (is_lxmd), and while any member of
++# lxmd's group lives the kernel never hands out its number again, so a group
++# under that number with an lxmd in it is lxmd's. A daemon that is not its
++# own group leader (setsid missing) is signalled alone, never its group.
++stop_lxmd() {
++	p=$(pidfile_pid "$PIDFILE")
++	lp=$(pidfile_pid "$LOGGER_PIDFILE") && ! is_our_logger "$lp" && lp=
++	lead=; grp=
++	if [ -n "$p" ] && is_lxmd "$p"; then
++		lead=$p
++		[ "$PPGRP" = "$p" ] && grp=$p
++	elif [ -n "$p" ] && group_has_lxmd "$p"; then
++		grp=$p
++	fi
++	if [ -z "$lead$grp" ]; then
++		# no lxmd left to log for
++		[ -n "$lp" ] && kill "$lp" 2>/dev/null
++		rm -f "$LOGGER_PIDFILE"
++		return 1
++	fi
++	if [ -n "$lead" ]; then
++		[ -n "$grp" ] && kill -STOP "-$grp" 2>/dev/null
++		kill "$lead" 2>/dev/null
++		kill -CONT "$lead" 2>/dev/null
++		i=0
++		while [ "$i" -lt "$STOP_WAIT" ] && is_lxmd "$lead"; do
++			sleep 1; i=$((i + 1))
++		done
++	fi
++	if [ -n "$grp" ]; then
++		group_alive "$grp" && kill -KILL "-$grp" 2>/dev/null
++	elif is_lxmd "$lead"; then
++		kill -KILL "$lead" 2>/dev/null
++	fi
++	i=0
++	while [ "$i" -lt 5 ]; do
++		{ [ -n "$grp" ] && group_alive "$grp"; } || is_lxmd "$lead" \
++			|| { [ -n "$lp" ] && is_our_logger "$lp"; } || break
++		sleep 0.2; i=$((i + 1))
++	done
++	[ -n "$lp" ] && is_our_logger "$lp" && kill "$lp" 2>/dev/null
++	rm -f "$LOGGER_PIDFILE"
++	return 0
++}
++
+ # disabled — true, with a note, unless $CONF says enabled=yes (also loads
+ # min_free_mb). Every start path runs this first.
+ disabled() {
+@@ -101,10 +241,13 @@ disabled() {
+ start() {
+ 	disabled && return 0
+ 
+-	if [ -f "$PIDFILE" ] && kill -0 "$(cat $PIDFILE)" 2>/dev/null; then
+-		echo "S85lxmd: already running (pid $(cat $PIDFILE))"
++	if p=$(pidfile_pid "$PIDFILE") && is_lxmd "$p"; then
++		echo "S85lxmd: already running (pid $p)"
+ 		return 0
+ 	fi
++	# What an lxmd that died left behind: its stamp workers (still spinning)
++	# and its logger.
++	stop_lxmd && echo "S85lxmd: ended the forks of an lxmd that had exited (pid ${p:-?})"
+ 
+ 	# Attach to rnsd's shared instance — don't start a second transport stack.
+ 	if [ -z "$(pidof rnsd)" ]; then
+@@ -147,17 +290,30 @@ start() {
+ 	# -p = propagation node; --rnsconfig points at rnsd's shared instance.
+ 	# No -s: log to stdout -> syslog (tmpfs, rotated) instead of a logfile on
+ 	# the rootfs.
+-	rm -f "$LOGPIPE"
++	# setsid: lxmd leads a session and process group of its own (stop_lxmd
++	# ends that group), with no controlling terminal. busybox setsid forks
++	# only when its caller leads a process group, and the backgrounded
++	# subshell never does (no job control in a script): it exec's setsid,
++	# which exec's lxmd, so $! is lxmd's pid and its process group. Without
++	# setsid lxmd still runs, and stop signals it alone. stdin is /dev/null,
++	# lxmd writes only to the FIFO and logger only to syslog: nothing keeps
++	# the caller's stdin/stdout/stderr open. logger gets a session of its own
++	# too, and its pid is kept for stop.
++	SETSID=
++	command -v setsid >/dev/null 2>&1 && SETSID=setsid
++	rm -f "$LOGPIPE" "$LOGGER_PIDFILE"
+ 	if command -v logger >/dev/null 2>&1 && mkfifo -m 600 "$LOGPIPE" 2>/dev/null; then
+ 		(
+ 			umask 077
+ 			export PYTHONUNBUFFERED=1
+-			exec "$DAEMON" -p --rnsconfig "$RNS_CONFIGDIR" --config "$LXMD_CONFIGDIR"
+-		) 9>&- >"$LOGPIPE" 2>&1 &
++			exec $SETSID "$DAEMON" -p --rnsconfig "$RNS_CONFIGDIR" --config "$LXMD_CONFIGDIR"
++		) 9>&- </dev/null >"$LOGPIPE" 2>&1 &
+ 		PID=$!
+-		logger -t "$NAME[$PID]" -p daemon.notice 9>&- <"$LOGPIPE" &
++		$SETSID logger -t "$NAME[$PID]" -p daemon.notice 9>&- <"$LOGPIPE" >/dev/null 2>&1 &
++		echo $! > "$LOGGER_PIDFILE"
+ 	else
+-		( umask 077; exec "$DAEMON" -p --rnsconfig "$RNS_CONFIGDIR" --config "$LXMD_CONFIGDIR" ) 9>&- >/dev/null 2>&1 &
++		( umask 077; exec $SETSID "$DAEMON" -p --rnsconfig "$RNS_CONFIGDIR" --config "$LXMD_CONFIGDIR" ) \
++			9>&- </dev/null >/dev/null 2>&1 &
+ 		PID=$!
+ 	fi
+ 	echo "$PID" > "$PIDFILE"
+@@ -173,17 +329,12 @@ start() {
+ 
+ stop() {
+ 	printf "Stopping %s: " "$NAME"
+-	if [ -f "$PIDFILE" ]; then
+-		kill "$(cat $PIDFILE)" 2>/dev/null
+-		for _ in 1 2 3 4 5; do
+-			[ -f "$PIDFILE" ] && kill -0 "$(cat $PIDFILE)" 2>/dev/null || break
+-			sleep 1
+-		done
+-		rm -f "$PIDFILE"
++	if stop_lxmd; then
+ 		echo "OK"
+ 	else
+ 		echo "(not running)"
+ 	fi
++	rm -f "$PIDFILE"
+ }
+ 
+ # Opt-in, checked first: a start while disabled returns before the lock
+@@ -196,7 +347,8 @@ esac
+ # Serialize start/stop/restart on /run/lxmd.lock: two starts that both passed
+ # the pidfile check would run two lxmds. The spawn lines close fd 9 (first,
+ # before the FIFO open can block) so lxmd and logger can't pin the lock.
+-# Bounded wait (busybox flock has no -w), as in S82rnsd.
++# Bounded wait (busybox flock has no -w), as in S82rnsd; 15 s outlasts a
++# restart queued ahead (stop: up to STOP_WAIT + 1 s, then 1 s and a start).
+ case "${1:-start}" in
+ 	start|stop|restart)
+ 		exec 9>/run/$NAME.lock
+@@ -220,8 +372,8 @@ case "${1:-start}" in
+ 	status)
+ 		read_conf
+ 		echo "enabled in conf: $enabled  (min_free_mb=$min_free_mb, free now $(mem_available_mb) MB)"
+-		if [ -f "$PIDFILE" ] && kill -0 "$(cat $PIDFILE)" 2>/dev/null; then
+-			echo "running:         pid $(cat $PIDFILE)"
++		if p=$(pidfile_pid "$PIDFILE") && is_lxmd "$p"; then
++			echo "running:         pid $p"
+ 		else
+ 			echo "running:         no"
+ 		fi
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S99nettest b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S99nettest
+index e24ae24f5..d53b8fa1f 100755
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S99nettest
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S99nettest
+@@ -91,7 +91,7 @@ case "$1" in
+ 	    echo "eth0 download test: ${eth0_dl_time}" | fbbar 144 $colorfg $colorbg
+             sleep 0.5
+     done
+-    ) &
++    ) </dev/null >/dev/null 2>&1 &   # RNSBox: never keep the caller's stdio
+     [ $? = 0 ] && echo "OK" || echo "FAIL"
+   ;;
+   stop)
+diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S99resizefs b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S99resizefs
+index b0d1d81f0..1d4b2fcab 100755
+--- a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S99resizefs
++++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S99resizefs
+@@ -9,6 +9,7 @@ then
+ 	echo "yes
+ 	100%
+ 	" | parted ---pretend-input-tty /dev/mmcblk0 "resizepart 2 100%"
+-	# resize data filesystem
+-	(resize2fs /dev/mmcblk0p2) &
++	# resize data filesystem (in the background, output to its own log so it
++	# doesn't keep the caller's stdout: `S99resizefs start | cat` waited)
++	(resize2fs /dev/mmcblk0p2) </dev/null >/var/log/resizefs.log 2>&1 &
+ fi
+-- 
+2.47.3
+

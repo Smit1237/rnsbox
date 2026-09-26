@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: smit1237 <smit1237@gmail.com>
 Date: Tue, 8 Sep 2026 22:47:48 +0300
-Subject: [PATCH 04/23] time: NTP clock discipline for the RTC-less board
+Subject: [PATCH 04/30] time: NTP clock discipline for the RTC-less board
 
 The Nano-e has no RTC, so the clock starts in 1970. S45ntpsync steps the clock
 from anycast NTP IPs (no DNS dependency during early boot) and touches
@@ -9,17 +9,17 @@ from anycast NTP IPs (no DNS dependency during early boot) and touches
 restarts rnsd once the clock is good. rnsd and nomadnet gate on
 /run/clock-synced so announcement timestamps are sane.
 ---
- .../SG200X/overlay/etc/init.d/S45ntpsync      | 84 ++++++++++++++++++
- .../SG200X/overlay/etc/init.d/S46wanwatch     | 85 +++++++++++++++++++
- .../board/cvitek/SG200X/overlay/etc/ntp.conf  | 26 ++++++
- 3 files changed, 195 insertions(+)
+ .../SG200X/overlay/etc/init.d/S45ntpsync      |  84 +++++++
+ .../SG200X/overlay/etc/init.d/S46wanwatch     | 216 ++++++++++++++++++
+ .../board/cvitek/SG200X/overlay/etc/ntp.conf  |  26 +++
+ 3 files changed, 326 insertions(+)
  create mode 100755 buildroot/board/cvitek/SG200X/overlay/etc/init.d/S45ntpsync
  create mode 100755 buildroot/board/cvitek/SG200X/overlay/etc/init.d/S46wanwatch
  create mode 100644 buildroot/board/cvitek/SG200X/overlay/etc/ntp.conf
 
 diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S45ntpsync b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S45ntpsync
 new file mode 100755
-index 000000000..e23019deb
+index 000000000..4d9aa8a3f
 --- /dev/null
 +++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S45ntpsync
 @@ -0,0 +1,84 @@
@@ -48,10 +48,10 @@ index 000000000..e23019deb
 +start() {
 +	rm -f "$FLAG"
 +
-+	# Wait up to 30s for ANY default route from dhcpcd (eth0 on the
-+	# Nano-e SKU; future WiFi variant would also surface here per
-+	# /etc/rnsbox/wan.conf). If it never appears, fail immediately —
-+	# no point trying NTP without WAN.
++	# Wait up to 30s for ANY default route — from S30eth (eth0 WAN:
++	# udhcpc lease or static gateway) or from dhcpcd (wlan0 WAN on the W
++	# variant), per /etc/rnsbox/wan.conf. If it never appears, fail
++	# immediately — no point trying NTP without WAN.
 +	printf "Waiting for default route: "
 +	have_route=0
 +	for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
@@ -109,10 +109,10 @@ index 000000000..e23019deb
 +esac
 diff --git a/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S46wanwatch b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S46wanwatch
 new file mode 100755
-index 000000000..0cf752a83
+index 000000000..2843a65a8
 --- /dev/null
 +++ b/buildroot/board/cvitek/SG200X/overlay/etc/init.d/S46wanwatch
-@@ -0,0 +1,85 @@
+@@ -0,0 +1,216 @@
 +#!/bin/sh
 +# S46wanwatch — background watchdog that retries S45ntpsync + S82rnsd if
 +# a default route appears AFTER the boot-time one-shot already gave up.
@@ -123,7 +123,24 @@ index 000000000..0cf752a83
 +#      set. S82rnsd refuses to start. Later the user plugs in the
 +#      cable — this watchdog notices the default route, runs S45+S82.
 +#   2. Reticulum crash. rnsd's PID file goes stale; the watchdog
-+#      restarts it.
++#      restarts it. Not after an explicit `S82rnsd stop` (rcK or the
++#      operator); `S82rnsd start` re-arms it.
++#   3. The once-per-boot rnsd update check (S84cron bootcheck) needs a
++#      synced clock; when the clock syncs late (scenario 1) the watchdog
++#      triggers it.
++#   4. USB host attached (or its NCM driver bound) only after rnsd started:
++#      usb0 had no IPv6 link-local yet, so the AutoInterface skipped it; the
++#      watchdog restarts rnsd once when the address appears.
++#   5. nomadnet / lxmd enabled by the operator but refused at boot (no
++#      synced clock, or no rnsd yet): started once the watchdog brings rnsd up.
++#   6. Clock set without NTP (portal "Sync clock to browser", `date -s`, an
++#      off-grid box with no default route): S45ntpsync never ran to create
++#      /run/clock-synced, so the watchdog creates it once the year is sane.
++#   7. eth0 cable re-plugged, possibly into another network. busybox udhcpc
++#      doesn't watch carrier (dhcpcd used to, back when it ran on eth0), so
++#      the old address + default route would stay until T1/T2; the watchdog
++#      has S30eth restart udhcpc asking for its old address — a brief WAN
++#      re-acquire; the same network re-grants the same address.
 +#
 +# Purely additive: boot-time S45/S82 still run first. The watchdog
 +# only does work when something becomes finishable that the boot
@@ -132,14 +149,87 @@ index 000000000..0cf752a83
 +PIDFILE=/var/run/wanwatch.pid
 +LOG=/var/log/wanwatch.log
 +RNSD_PIDFILE=/var/run/rnsd.pid
++BOOTCHECK_MARK=/run/rnsbox-update-bootcheck   # created by S84cron bootcheck
++LL_MARK=/run/rnsd-usb0-no-ll                  # created by S82rnsd start
++STOPPED_MARK=/run/rnsd.stopped                # explicit `S82rnsd stop`
++DEPS_MARK=/run/wanwatch-deps-pending         # step 2 started rnsd
 +
 +log() {
 +	printf '%s: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG"
 +}
 +
++# is_rnsd PID — true if PID is the rnsd daemon (same test as S82rnsd). rnsd
++# is a python console-script and the kernel names a script process after the
++# script file, so comm is "rnsd"; a python* comm (started through the
++# interpreter) is confirmed on argv[0]/argv[1]. Busybox pidof has no -x, so
++# it can't be used for this.
++is_rnsd() {
++	comm=
++	{ read -r comm <"/proc/$1/comm"; } 2>/dev/null
++	case "$comm" in
++		rnsd)    return 0 ;;
++		python*) tr '\0' '\n' <"/proc/$1/cmdline" 2>/dev/null | head -n 2 \
++		           | grep -qE '(^|/)rnsd$' ;;
++		*)       return 1 ;;
++	esac
++}
++
++# rnsd_running — the pidfile if it still names rnsd (builtins only, so the
++# steady-state 10 s tick forks nothing); otherwise a /proc scan, so a lost or
++# stale pidfile can never make us start a second rnsd. A live rnsd found by
++# the scan is re-recorded in the pidfile for the portal and S82rnsd stop.
++rnsd_running() {
++	p=
++	{ read -r p <"$RNSD_PIDFILE"; } 2>/dev/null
++	case "$p" in
++		''|*[!0-9]*) ;;
++		*) is_rnsd "$p" && return 0 ;;
++	esac
++	for d in /proc/[0-9]*; do
++		p=${d#/proc/}
++		if is_rnsd "$p"; then
++			log "rnsd running as pid $p but $RNSD_PIDFILE was stale -> re-recorded"
++			echo "$p" > "$RNSD_PIDFILE"
++			return 0
++		fi
++	done
++	return 1
++}
++
++# usb0_ll — true once usb0 has a usable IPv6 link-local address (scope 0x20,
++# DAD done: neither tentative 0x40 nor dadfailed 0x08). Same test as S82rnsd;
++# builtins only.
++usb0_ll() {
++	[ -r /proc/net/if_inet6 ] || return 1
++	while read -r _addr _idx _plen scope flags dev; do
++		[ "$dev" = usb0 ] && [ "$scope" = 20 ] || continue
++		case "$flags" in [0-9a-f][0-9a-f]) ;; *) continue ;; esac
++		[ $((0x$flags & 0x48)) -eq 0 ] && return 0
++	done </proc/net/if_inet6
++	return 1
++}
++
++# eth0_link — set CARRIER (1 = link up; empty/0 while down, and the carrier
++# file reads EINVAL while eth0 is admin-down) and UPS (carrier_up_count, which
++# also counts an unplug/replug that fits between two ticks). Builtins only.
++eth0_link() {
++	CARRIER=; UPS=
++	{ read -r CARRIER </sys/class/net/eth0/carrier; } 2>/dev/null
++	{ read -r UPS </sys/class/net/eth0/carrier_up_count; } 2>/dev/null
++}
++
 +loop() {
 +	log "started"
++	eth0_link; eth_carrier=$CARRIER; eth_ups=$UPS
 +	while sleep 10; do
++		# Step 0: the clock is already sane but S45ntpsync never set the
++		# flag (no default route: browser sync, `date -s`, off-grid box).
++		# Same success test as S45ntpsync.
++		if [ ! -f /run/clock-synced ] && [ "$(date +%Y)" -ge 2024 ]; then
++			log "clock already set ($(date '+%Y-%m-%d %H:%M:%S')) but /run/clock-synced absent -> creating it"
++			: > /run/clock-synced
++		fi
++
 +		# Step 1: if clock-synced is absent but a default route exists,
 +		# try S45. We must stop the running ntpd daemon first because
 +		# `ntpd -gq` binds UDP/123 and would EADDRINUSE otherwise.
@@ -155,22 +245,63 @@ index 000000000..0cf752a83
 +
 +		# Step 2: clock-synced but rnsd not running -> kick S82.
 +		# S82rnsd refuses to start if /run/clock-synced is absent, so
-+		# rerunning is cheap when it shouldn't run anyway.
-+		if [ -f /run/clock-synced ]; then
-+			running=0
-+			if [ -f "$RNSD_PIDFILE" ] && kill -0 "$(cat "$RNSD_PIDFILE")" 2>/dev/null; then
-+				running=1
-+			elif pidof -x rnsd >/dev/null 2>&1; then
-+				# -x: /usr/bin/rnsd is a python console-script, so its comm is
-+				# "python3" and a bare `pidof rnsd` never matches. -x matches
-+				# the script by argv basename.
-+				running=1
-+			fi
-+			if [ "$running" -eq 0 ]; then
-+				log "clock-synced but rnsd not running -> kicking S82rnsd"
-+				/etc/init.d/S82rnsd start >> "$LOG" 2>&1
++		# rerunning is cheap when it shouldn't run anyway. Not after an
++		# explicit `S82rnsd stop` ($STOPPED_MARK): rcK stops S82rnsd well
++		# before S46wanwatch at shutdown, and an operator's stop must stick.
++		# The check here is only a cheap filter: `kick` re-checks the mark
++		# under S82rnsd's lock (a kick queued behind rcK's stop sees it) and,
++		# unlike `start`, never clears it.
++		if [ -f /run/clock-synced ] && [ ! -f "$STOPPED_MARK" ] && ! rnsd_running; then
++			log "clock-synced but rnsd not running -> kicking S82rnsd"
++			/etc/init.d/S82rnsd kick >> "$LOG" 2>&1
++			rnsd_running && : > "$DEPS_MARK"
++		# Step 2b: rnsd came up from step 2 (late clock, crash) - one tick
++		# later, so its shared instance is listening, start what rcS refused
++		# without a synced clock / rnsd. Both are no-ops when disabled in
++		# their conf or already running.
++		elif [ -f "$DEPS_MARK" ]; then
++			rm -f "$DEPS_MARK"
++			if [ ! -f "$STOPPED_MARK" ] && rnsd_running; then
++				for svc in S83nomadnet S85lxmd; do
++					[ -x "/etc/init.d/$svc" ] && "/etc/init.d/$svc" start >> "$LOG" 2>&1
++				done
 +			fi
 +		fi
++
++		# Step 3: once per boot, after the clock is synced, the post-boot
++		# rnsd update check. S84cron bootcheck is a no-op once its /run
++		# marker exists (and it honours cron.conf update_check), so this
++		# fires at most once per boot.
++		if [ -f /run/clock-synced ] && [ ! -d "$BOOTCHECK_MARK" ] \
++		   && [ -x /etc/init.d/S84cron ]; then
++			/etc/init.d/S84cron bootcheck >> "$LOG" 2>&1
++		fi
++
++		# Step 4: rnsd started before usb0 had its IPv6 link-local (no USB
++		# host had brought the link up yet), so its AutoInterface never
++		# adopted usb0 — RNS only picks ifaces at startup. S82rnsd left
++		# $LL_MARK; restart rnsd once, as soon as the address is there.
++		# (S82rnsd kick-restart re-evaluates and clears the marker, and
++		# does nothing after an explicit stop.)
++		if [ -f "$LL_MARK" ] && usb0_ll && rnsd_running; then
++			log "usb0 got its IPv6 link-local after rnsd started -> restarting rnsd (AutoInterface)"
++			rm -f "$LL_MARK"
++			/etc/init.d/S82rnsd kick-restart >> "$LOG" 2>&1
++		fi
++
++		# Step 5: eth0 carrier came back since the last tick (0 -> 1, or a
++		# higher carrier_up_count for a replug between ticks), once per edge:
++		# `S30eth renew` restarts udhcpc asking for its old address. Only
++		# while eth0 is the DHCP WAN (`S30eth dhcpwan`: not for static, a
++		# wlan0 WAN or /boot/eth.nodhcp); wan.conf is only parsed on a link
++		# event, not every tick.
++		eth0_link
++		if [ "$CARRIER" = 1 ] && { [ "$eth_carrier" != 1 ] || [ "$UPS" != "$eth_ups" ]; } \
++		   && [ -x /etc/init.d/S30eth ] && /etc/init.d/S30eth dhcpwan; then
++			log "eth0 carrier up (up count ${eth_ups:-?} -> ${UPS:-?}) -> S30eth renew"
++			/etc/init.d/S30eth renew >> "$LOG" 2>&1
++		fi
++		eth_carrier=$CARRIER; eth_ups=$UPS
 +	done
 +}
 +
